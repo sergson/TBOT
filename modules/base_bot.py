@@ -7,16 +7,16 @@
 from abc import ABC, abstractmethod
 
 class BaseBot(ABC):
-    """Базовый класс для всех ботов."""
+    """Base class for all bots."""
     def __init__(self, bot_id: int):
         self.bot_id = bot_id
 
     @abstractmethod
     async def start(self):
-        """Запуск бота."""
+        """Start the bot."""
         pass
 
     @abstractmethod
     async def stop(self):
-        """Остановка бота."""
+        """Stop the bot."""
         pass
