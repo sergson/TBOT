@@ -314,7 +314,7 @@ class AsyncExchangeFetcher:
                 pass
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 100) -> pd.DataFrame:
-        """Получает OHLCV свечи с биржи"""
+        """Receives OHLCV candles from the exchange"""
         await self.initialize()
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
