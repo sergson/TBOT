@@ -1,4 +1,4 @@
-# modules/database.py (updated version)
+# core/database.py
 # Copyright (c) 2026 sergson (https://github.com/sergson)
 # Licensed under GNU General Public License v3.0
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
@@ -8,17 +8,16 @@ import sqlite3
 import json
 from typing import Optional, List, Dict, Any
 from .logger import perf_logger
-from .bot_registry import bot_registry
+from .registry import bot_registry
 
 logger = perf_logger.get_logger('database', 'database')
 
 DB_CONFIG = 'config.db'
 
 def init_config_db():
-    """Creates common tables and configuration tables for all registered bot types."""
+    """Creates common tables and configuration tables for all registered types."""
     with sqlite3.connect(DB_CONFIG) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
-        # Common bots table
         conn.execute('''
             CREATE TABLE IF NOT EXISTS bots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,10 +26,9 @@ def init_config_db():
                 status TEXT DEFAULT 'stopped',
                 position INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                config_data TEXT  -- JSON with arbitrary configuration fields
+                config_data TEXT
             )
         ''')
-        # Settings table
         conn.execute('''
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -39,10 +37,12 @@ def init_config_db():
         ''')
         conn.commit()
 
-    # For each registered type, create its own configuration table if needed
-    for type_id, meta in bot_registry._types.items():
-        schema = meta.get('config_schema')
-        if schema:
+    # For each type that has metadata with config_schema, create a table
+    for model_name in bot_registry.list_models():
+        cls = bot_registry.get_model(model_name)
+        if hasattr(cls, 'config_schema'):
+            schema = cls.config_schema
+            type_id = cls._name.replace('.', '_')  # e.g., collector_type -> collector_type
             columns = ', '.join([f"{col} {typ}" for col, typ in schema.items()])
             with sqlite3.connect(DB_CONFIG) as conn:
                 conn.execute(f'''
@@ -55,7 +55,7 @@ def init_config_db():
                 conn.commit()
 
 def add_bot(bot_type: str, name: str = None, config: Dict[str, Any] = None) -> int:
-    """Adds a new bot. config – dictionary with configuration fields for the given type."""
+    """Adds a new bot."""
     with sqlite3.connect(DB_CONFIG) as conn:
         config_json = json.dumps(config) if config else None
         cursor = conn.execute(
@@ -64,14 +64,14 @@ def add_bot(bot_type: str, name: str = None, config: Dict[str, Any] = None) -> i
         )
         bot_id = cursor.lastrowid
 
-        # If the type has a separate configuration table, write to it
-        meta = bot_registry.get_type(bot_type)
-        if meta and meta.get('config_schema') and config:
+        # Write to type-specific configuration table
+        meta_cls = bot_registry.get_model(bot_type + ".type")
+        if meta_cls and hasattr(meta_cls, 'config_schema') and config:
             columns = ', '.join(config.keys())
             placeholders = ', '.join(['?' for _ in config])
             values = list(config.values())
             conn.execute(f'''
-                INSERT INTO config_{bot_type} (bot_id, {columns})
+                INSERT INTO config_{meta_cls._name.replace('.', '_')} (bot_id, {columns})
                 VALUES (?, {placeholders})
             ''', [bot_id] + values)
         conn.commit()
@@ -85,7 +85,6 @@ def update_bot_status(bot_id: int, status: str):
 def delete_bot(bot_id: int):
     with sqlite3.connect(DB_CONFIG) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
-        # Delete from common table (cascade will delete records in config_*)
         conn.execute('DELETE FROM bots WHERE id = ?', (bot_id,))
         conn.commit()
 
@@ -96,7 +95,6 @@ def get_all_bots() -> List[Dict[str, Any]]:
         bots = []
         for row in rows:
             bot = dict(row)
-            # Load config from JSON
             if bot.get('config_data'):
                 bot['config'] = json.loads(bot['config_data'])
             else:
@@ -105,7 +103,6 @@ def get_all_bots() -> List[Dict[str, Any]]:
         return bots
 
 def get_bot_config(bot_id: int) -> Optional[Dict]:
-    """Returns the full bot configuration (including fields from the specific table)."""
     with sqlite3.connect(DB_CONFIG) as conn:
         conn.row_factory = sqlite3.Row
         bot_row = conn.execute('SELECT type, config_data FROM bots WHERE id = ?', (bot_id,)).fetchone()
@@ -114,10 +111,9 @@ def get_bot_config(bot_id: int) -> Optional[Dict]:
         bot_type = bot_row['type']
         config = json.loads(bot_row['config_data']) if bot_row['config_data'] else {}
 
-        # If there is a separate configuration table, read from it
-        meta = bot_registry.get_type(bot_type)
-        if meta and meta.get('config_schema'):
-            row = conn.execute(f'SELECT * FROM config_{bot_type} WHERE bot_id = ?', (bot_id,)).fetchone()
+        meta_cls = bot_registry.get_model(bot_type + ".type")
+        if meta_cls and hasattr(meta_cls, 'config_schema'):
+            row = conn.execute(f'SELECT * FROM config_{meta_cls._name.replace(".", "_")} WHERE bot_id = ?', (bot_id,)).fetchone()
             if row:
                 config.update(dict(row))
         config['bot_type'] = bot_type

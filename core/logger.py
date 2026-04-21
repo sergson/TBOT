@@ -1,4 +1,4 @@
-# modules/logger.py
+# core/logger.py
 # Copyright (c) 2026 sergson (https://github.com/sergson)
 # Licensed under GNU General Public License v3.0
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
@@ -10,7 +10,6 @@ Logging module with configurable levels
 import logging
 import os
 from datetime import datetime
-from typing import Optional
 import json
 
 
@@ -59,7 +58,24 @@ class PerformanceLogger:
                 print(f"⚠ Logging settings not found in DB, using defaults")
         except Exception as e:
             print(f"❌ Error loading logging settings: {e}")
+        # Apply levels to all existing loggers
+        self._apply_levels_to_existing_loggers()
         return self
+
+    def _apply_levels_to_existing_loggers(self):
+        """Updates levels for all previously created loggers."""
+        for name, logger in self._loggers.items():
+            module_type = 'app'
+            for mt in ['app', 'collector', 'fetcher', 'database', 'analytics']:
+                if mt in name.lower():
+                    module_type = mt
+                    break
+            level_key = f'{module_type}_level'
+            level = self.settings.get(level_key, self._default_level)
+            log_level = logging.getLevelName(level)
+            logger.setLevel(log_level)
+            for handler in logger.handlers:
+                handler.setLevel(log_level)
 
     def setup_logger(self, name: str, log_file: str, level: str = 'INFO'):
         """Configure a logger"""

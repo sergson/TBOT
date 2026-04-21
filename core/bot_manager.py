@@ -1,4 +1,4 @@
-# modules/bot_manager.py (updated version)
+# core/bot_manager.py
 # Copyright (c) 2026 sergson (https://github.com/sergson)
 # Licensed under GNU General Public License v3.0
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
@@ -11,54 +11,57 @@ import gc
 import threading
 from .database import get_all_bots, get_bot_config, update_bot_status, delete_bot
 from .logger import perf_logger
-from .bot_registry import bot_registry
+from .registry import bot_registry
 
 logger = perf_logger.get_logger('bot_manager', 'app')
 
 class BotManager:
     def __init__(self):
         self.bots = {}          # bot_id -> bot instance
-        self.loop = asyncio.get_event_loop()
-        self.graph_hashes = {}  # for optimizing graph updates (optional)
+        self.loop = None
+        self.graph_hashes = {}
+
+    def set_loop(self, loop):
+        self.loop = loop
 
     def load_bots(self):
-        """Loads all bots with status 'running' from the database and starts them."""
+        """Load all bots with status 'running' from DB and start them."""
         bots_data = get_all_bots()
         for bot in bots_data:
             if bot['status'] == 'running':
                 self.add_bot(bot['id'])
 
     def add_bot(self, bot_id: int):
-        """Creates and starts a bot by its ID."""
         config = get_bot_config(bot_id)
         if not config:
             logger.error(f"Bot {bot_id} config not found")
             return
 
         bot_type = config['bot_type']
-        meta = bot_registry.get_type(bot_type)
-        if not meta:
-            logger.error(f"Unknown bot type: {bot_type}")
+        # Look for bot class by model registered in the registry
+        # Assume bot type corresponds to model name, e.g. "collector.bot"
+        bot_class = bot_registry.get_model(f"{bot_type}.bot")
+        if not bot_class:
+            logger.error(f"Unknown bot model: {bot_type}.bot")
             return
 
-        bot_class = meta['bot_class']
         bot_instance = bot_class(bot_id)
         self.bots[bot_id] = bot_instance
-        asyncio.run_coroutine_threadsafe(bot_instance.start(), self.loop)
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(bot_instance.start(), self.loop)
 
     def remove_bot(self, bot_id: int):
-        """Stops the bot and removes it from memory."""
         if bot_id in self.bots:
             bot = self.bots[bot_id]
-            future = asyncio.run_coroutine_threadsafe(bot.stop(), self.loop)
-            try:
-                future.result(timeout=5)
-            except Exception as e:
-                logger.error(f"Error stopping bot {bot_id}: {e}")
+            if self.loop:
+                future = asyncio.run_coroutine_threadsafe(bot.stop(), self.loop)
+                try:
+                    future.result(timeout=5)
+                except Exception as e:
+                    logger.error(f"Error stopping bot {bot_id}: {e}")
             del self.bots[bot_id]
         self.graph_hashes.pop(bot_id, None)
 
-        # Schedule deletion of the database file if path is specified in config
         config = get_bot_config(bot_id)
         if config and 'data_db_path' in config:
             db_path = config['data_db_path']
@@ -82,13 +85,14 @@ class BotManager:
                     time.sleep(1)
 
     def start_bot(self, bot_id: int):
-        if bot_id in self.bots:
+        if bot_id in self.bots and self.loop:
             asyncio.run_coroutine_threadsafe(self.bots[bot_id].start(), self.loop)
 
     def stop_bot(self, bot_id: int):
-        if bot_id in self.bots:
+        if bot_id in self.bots and self.loop:
             asyncio.run_coroutine_threadsafe(self.bots[bot_id].stop(), self.loop)
 
     def shutdown(self):
         for bot in self.bots.values():
-            asyncio.run_coroutine_threadsafe(bot.stop(), self.loop)
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(bot.stop(), self.loop)

@@ -1,4 +1,4 @@
-# modules/collector_module.py
+# modules/collector/components.py
 # Copyright (c) 2026 sergson (https://github.com/sergson)
 # Licensed under GNU General Public License v3.0
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
@@ -9,15 +9,13 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 from dash import dcc, html
-
-from .bot_registry import bot_registry
-from .collector_bot import CollectorBot
-from .database import get_bot_config
-from .logger import perf_logger
+from core import auto_reg, bot_registry
+from core.database import get_bot_config
+from core.logger import perf_logger
 
 logger = perf_logger.get_logger('collector_module', 'collector')
 
-# ----- Add form definition -----
+# ---------- Add form ----------
 def collector_form():
     return html.Div([
         dcc.Dropdown(
@@ -73,7 +71,7 @@ def collector_form():
         )
     ])
 
-# ----- Configuration table schema (will be created as config_collector) -----
+# ---------- Configuration schema ----------
 CONFIG_SCHEMA = {
     'exchange': 'TEXT NOT NULL',
     'market_type': 'TEXT NOT NULL',
@@ -83,43 +81,21 @@ CONFIG_SCHEMA = {
     'data_db_path': 'TEXT NOT NULL'
 }
 
-# ----- Bot block rendering function in UI -----
-def render_collector_block(bot_id: int, config: dict, relayout_store: dict):
-    """Returns a Dash component to display the collector bot."""
-    graph_id = {'type': 'graph', 'index': bot_id}
-    status_button_id = {'type': 'status-btn', 'index': bot_id}
-    delete_btn_id = {'type': 'delete', 'index': bot_id}
-
-    # Build figure
-    fig = build_figure(bot_id, config, relayout_store)
-
-    graph = dcc.Graph(
-        id=graph_id,
-        figure=fig,
-        config={
-            'scrollZoom': True,
-            'displayModeBar': True,
-            'modeBarButtonsToRemove': ['lasso2d', 'select2d']
-        },
-        style={'height': '400px'}
-    )
-
-    return html.Div([
-        html.H3(f"{config['exchange']} {config['symbol']} ({config['market_type']})"),
-        html.P(f"Timeframe: {config['timeframe']}, Storage: {config['candles_limit']} candles"),
-        html.Button("Stop" if config.get('status') == 'running' else "Start",
-                    id=status_button_id, n_clicks=0),
-        html.Button("Delete", id=delete_btn_id, n_clicks=0),
-        html.Hr(),
-        graph
-    ], id=f"bot-{bot_id}", style={'border': '1px solid black', 'padding': '10px', 'margin': '10px'})
-
+# ---------- Graph building function ----------
 def build_figure(bot_id: int, config: dict, relayout_store: dict):
-    """Builds a candlestick chart from the bot's database."""
     db_path = config['data_db_path']
     table_name = config['symbol'].replace('/', '_').replace('-', '_')
     try:
         with sqlite3.connect(db_path) as conn:
+            # Check if table exists
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,)
+            )
+            if cursor.fetchone() is None:
+                logger.info(f"Table {table_name} does not exist yet, returning empty figure")
+                return go.Figure()
+
             df = pd.read_sql_query(f'''
                 SELECT timestamp, open, high, low, close, volume
                 FROM {table_name}
@@ -150,12 +126,50 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict):
             logger.warning(f"Failed to apply relayout for bot {bot_id}: {e}")
     return fig
 
-# ----- Register the type in the registry -----
-bot_registry.register(
-    type_id='collector',
-    display_name='Data Collector',
-    form_component=collector_form,
-    config_schema=CONFIG_SCHEMA,
-    bot_class=CollectorBot,
-    render_block=render_collector_block
-)
+# ---------- Render bot block in UI ----------
+def render_collector_block(bot_id: int, config: dict, relayout_store: dict):
+    graph_id = {'type': 'graph', 'index': bot_id}
+    logger.debug(f"Render_collector_block: creating graph with id {graph_id}")
+    status_button_id = {'type': 'status-btn', 'index': bot_id}
+    delete_btn_id = {'type': 'delete', 'index': bot_id}
+
+    fig = build_figure(bot_id, config, relayout_store)
+
+    graph = dcc.Graph(
+        id=graph_id,
+        figure=fig,
+        config={
+            'scrollZoom': True,
+            'displayModeBar': True,
+            'modeBarButtonsToRemove': ['lasso2d', 'select2d']
+        },
+        style={'height': '400px'}
+    )
+
+    return html.Div([
+        html.H3(f"{config['exchange']} {config['symbol']} ({config['market_type']})"),
+        html.P(f"Timeframe: {config['timeframe']}, Storage: {config['candles_limit']} candles"),
+        html.Button("Stop" if config.get('status') == 'running' else "Start",
+                    id=status_button_id, n_clicks=0),
+        html.Button("Delete", id=delete_btn_id, n_clicks=0),
+        html.Hr(),
+        graph
+    ], id=f"bot-{bot_id}", style={'border': '1px solid black', 'padding': '10px', 'margin': '10px'})
+
+# ---------- Register bot type in registry (not in bot_registry, but in separate metadata storage) ----------
+# We can store type metadata in the class itself, but for Dash it's convenient to have a separate structure.
+
+logger.debug(f"Functions defined, about to define CollectorTypeMeta")
+
+
+@auto_reg
+class CollectorTypeMeta:
+    """Stub class for storing metadata of type 'collector'."""
+    _name = "collector.type"
+    display_name = "Data Collector"
+    form_component = staticmethod(collector_form)
+    config_schema = CONFIG_SCHEMA
+    bot_model = "collector.bot"  # reference to the bot model name
+    render_block = staticmethod(render_collector_block)
+
+logger.debug(f"CollectorTypeMeta defined")

@@ -1,31 +1,22 @@
-# app.py (universal version)
+# app.py
 # Copyright (c) 2026 sergson (https://github.com/sergson)
 # Licensed under GNU General Public License v3.0
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
 # This software is for educational purposes only. Use at your own risk.
 
 import dash
-from dash import dcc, html, callback, Input, Output, State, ALL, MATCH, no_update
-import plotly.graph_objects as go
-import hashlib
+from dash import dcc, html, Input, Output, State, ALL, MATCH, no_update
 import threading
 import asyncio
 import os
 import json
-import modules.logger
-from modules.database import DB_CONFIG
 
-logger = modules.logger.perf_logger.get_logger('app', 'app')
-
-from modules.database import (
-    init_config_db, add_bot, get_all_bots, get_bot_config,
-    update_bot_status, delete_bot, get_setting, save_setting
+# Import core, but do NOT create logger immediately
+from core import (
+    load_modules, init_config_db, add_bot, get_all_bots, get_bot_config,
+    update_bot_status, delete_bot, get_setting, save_setting,
+    BotManager, bot_registry, perf_logger
 )
-from modules.bot_manager import BotManager
-from modules.bot_registry import bot_registry
-
-# Import modules – they register themselves in bot_registry
-import modules.collector_module
 
 class SettingsStorage:
     @staticmethod
@@ -35,15 +26,24 @@ class SettingsStorage:
 
 os.makedirs('data', exist_ok=True)
 init_config_db()
-modules.logger.perf_logger.initialize_with_storage(SettingsStorage)
+
+# Load logger settings from DB BEFORE creating the first logger
+perf_logger.initialize_with_storage(SettingsStorage)
+
+# Now create logger
+logger = perf_logger.get_logger('app', 'app')
+logger.debug("Loading modules...")
+
+# Load modules (they will also get loggers with already applied settings)
+load_modules("modules")
+logger.debug(f"Registry models after load: {bot_registry._models}")
 
 loop = asyncio.new_event_loop()
 threading.Thread(target=loop.run_forever, daemon=True).start()
 
 bot_manager = BotManager()
-bot_manager.loop = loop
+bot_manager.set_loop(loop)
 bot_manager.load_bots()
-bot_manager.last_bots_hash = None
 
 app = dash.Dash(__name__, title='T.B.O.T')
 app.config.suppress_callback_exceptions = True
@@ -55,16 +55,15 @@ app.layout = html.Div([
         html.Button('➕', id='add-bot-btn', n_clicks=0, style={'marginRight': '10px'}),
         html.Button('⚙️', id='settings-btn', n_clicks=0),
 
-        # Add bot form container
         html.Div(id='add-bot-form-container', children=[
             html.Div(id='dynamic-bot-form-content'),
             html.Button('Save', id='save-bot-btn', style={'marginRight': '10px'}),
             html.Button('Cancel', id='cancel-add-btn')
         ], style={'display': 'none'}),
 
-        # Settings panel
         html.Div(id='settings-panel', children=[
             html.H3('Settings'),
+            html.Div(id='global-interval-debug'),
             html.Div([
                 html.Label('Debug mode'),
                 dcc.Checklist(id='debug-checkbox', options=[{'label': ' Enable', 'value': 'debug'}],
@@ -77,7 +76,7 @@ app.layout = html.Div([
                     html.Label(module),
                     dcc.Dropdown(id={'type': 'log-level-dropdown', 'module': module},
                                  options=[{'label': lvl, 'value': lvl} for lvl in ['DEBUG', 'INFO', 'WARNING', 'ERROR']],
-                                 value=modules.logger.perf_logger.settings.get(f'{module}_level', 'DEBUG'))
+                                 value=perf_logger.settings.get(f'{module}_level', 'DEBUG'))
                 ], style={'marginBottom': '10px'}) for module in ['app', 'collector', 'fetcher', 'database', 'analytics']
             ]),
             html.Button('Save Settings', id='save-settings-btn'),
@@ -124,15 +123,21 @@ def toggle_forms(add_clicks, settings_clicks, cancel_clicks, close_clicks, save_
             add_style = {'display': 'block'}
             settings_style = {'display': 'none'}
             new_settings = 0
-            # Build bot type selector
-            type_options = [{'label': bot_registry.get_display_name(t), 'value': t}
-                            for t in bot_registry.list_types()]
+            # Get list of available types from registry (classes with _name ending with ".type")
+            type_options = []
+            for model_name in bot_registry.list_models():
+                if model_name.endswith('.type'):
+                    cls = bot_registry.get_model(model_name)
+                    display = getattr(cls, 'display_name', model_name)
+                    type_id = model_name.split('.')[0]  # e.g., "collector"
+                    type_options.append({'label': display, 'value': type_id})
             form_content = html.Div([
                 html.H3('Add Bot'),
                 dcc.Dropdown(id='bot-type-selector', options=type_options,
                              value=type_options[0]['value'] if type_options else None),
                 html.Div(id='dynamic-bot-form')
             ])
+            logger.debug(f"Available types: {[opt['value'] for opt in type_options]}")
         else:
             add_style = {'display': 'none'}
         new_add = add_clicks
@@ -156,7 +161,6 @@ def toggle_forms(add_clicks, settings_clicks, cancel_clicks, close_clicks, save_
 
     return add_style, form_content, settings_style, new_add, new_settings
 
-# Dynamically update form when bot type is selected
 @app.callback(
     Output('dynamic-bot-form', 'children'),
     Input('bot-type-selector', 'value')
@@ -164,12 +168,11 @@ def toggle_forms(add_clicks, settings_clicks, cancel_clicks, close_clicks, save_
 def update_dynamic_form(bot_type):
     if not bot_type:
         return no_update
-    meta = bot_registry.get_type(bot_type)
-    if meta and meta.get('form_component'):
-        return meta['form_component']()
+    meta_cls = bot_registry.get_model(f"{bot_type}.type")
+    if meta_cls and hasattr(meta_cls, 'form_component'):
+        return meta_cls.form_component()
     return html.Div(f"Form for type '{bot_type}' not found")
 
-# Save new bot
 @app.callback(
     Output('bots-trigger', 'data', allow_duplicate=True),
     Input('save-bot-btn', 'n_clicks'),
@@ -183,34 +186,29 @@ def save_new_bot(n_clicks, bot_type, field_values, field_ids, trigger):
     if not n_clicks or not bot_type:
         return no_update
 
-    # Gather config from form fields
     config = {}
     for val, id_dict in zip(field_values, field_ids):
         field = id_dict.get('field')
         if field:
             config[field] = val
 
-    # For collector, automatically set data_db_path
     if bot_type == 'collector':
         bot_id_temp = add_bot(bot_type, f"{config.get('exchange', '')} {config.get('symbol', '')}")
         config['data_db_path'] = f"data/bot_{bot_id_temp}.db"
-        # Update record with correct path
-        from modules.database import DB_CONFIG
+        from core.database import DB_CONFIG
         import sqlite3
         with sqlite3.connect(DB_CONFIG) as conn:
             conn.execute('UPDATE bots SET config_data = ? WHERE id = ?',
                          (json.dumps(config), bot_id_temp))
-            conn.execute('UPDATE config_collector SET data_db_path = ? WHERE bot_id = ?',
+            conn.execute('UPDATE config_collector_type SET data_db_path = ? WHERE bot_id = ?',
                          (config['data_db_path'], bot_id_temp))
         bot_manager.add_bot(bot_id_temp)
         return trigger + 1
 
-    # General case
     bot_id = add_bot(bot_type, f"{bot_type} bot", config)
     bot_manager.add_bot(bot_id)
     return trigger + 1
 
-# Render bot list
 @app.callback(
     Output('bots-container', 'children'),
     [Input('bots-trigger', 'data'),
@@ -225,20 +223,18 @@ def render_bots(trigger, pathname, relayout_store):
     bot_blocks = []
     for bot in bots:
         bot_type = bot['type']
-        meta = bot_registry.get_type(bot_type)
-        if not meta:
+        meta_cls = bot_registry.get_model(f"{bot_type}.type")
+        if not meta_cls:
             continue
         config = get_bot_config(bot['id'])
         if not config:
             continue
-        config['status'] = bot['status']  # Add status for rendering
-        render_func = meta.get('render_block')
-        if render_func:
-            block = render_func(bot['id'], config, relayout_store)
+        config['status'] = bot['status']
+        if hasattr(meta_cls, 'render_block'):
+            block = meta_cls.render_block(bot['id'], config, relayout_store)
             bot_blocks.append(block)
     return bot_blocks
 
-# Save relayout
 @app.callback(
     Output('relayout-store', 'data'),
     Input({'type': 'graph', 'index': ALL}, 'relayoutData'),
@@ -264,7 +260,6 @@ def save_relayout(relayout_list, stored):
     stored[str(bot_id)] = new_relayout
     return stored
 
-# Start/stop bot
 @app.callback(
     Output({'type': 'status-btn', 'index': MATCH}, 'children'),
     Input({'type': 'status-btn', 'index': MATCH}, 'n_clicks'),
@@ -288,7 +283,6 @@ def toggle_bot(n_clicks, btn_id):
         update_bot_status(bot_id, 'running')
         return "Stop"
 
-# Delete bot
 @app.callback(
     Output('bots-trigger', 'data', allow_duplicate=True),
     Input({'type': 'delete', 'index': ALL}, 'n_clicks'),
@@ -310,7 +304,6 @@ def delete_bot_callback(n_clicks_list, ids_list, trigger):
             return trigger + 1
     return no_update
 
-# Update graph (for collector)
 @app.callback(
     Output({'type': 'graph', 'index': MATCH}, 'figure'),
     Input('global-interval', 'n_intervals'),
@@ -319,16 +312,29 @@ def delete_bot_callback(n_clicks_list, ids_list, trigger):
 )
 def update_graph(n, graph_id, relayout_store):
     bot_id = graph_id['index']
+    logger.debug(f"Update_graph: n={n}, bot_id={bot_id}")
+
     bots = get_all_bots()
     bot = next((b for b in bots if b['id'] == bot_id), None)
-    if not bot or bot['status'] != 'running':
+    if not bot:
+        logger.debug(f"Update_graph: bot {bot_id} not found in database")
         return no_update
+    if bot['status'] != 'running':
+        logger.debug(f"Update_graph: bot {bot_id} status is '{bot['status']}', not running")
+        return no_update
+
     config = get_bot_config(bot_id)
-    if not config or bot['type'] != 'collector':
+    if not config:
+        logger.debug(f"Update_graph: no config for bot {bot_id}")
         return no_update
-    # Use graph building function from collector module
-    from modules.collector_module import build_figure
-    return build_figure(bot_id, config, relayout_store)
+    if bot['type'] != 'collector':
+        logger.debug(f"Update_graph: bot {bot_id} is not collector (type={bot['type']})")
+        return no_update
+
+    from modules.collector.components import build_figure
+    fig = build_figure(bot_id, config, relayout_store)
+    logger.debug(f"Update_graph: built figure with {len(fig.data[0].x) if fig.data else 0} candles")
+    return fig
 
 @app.callback(
     Output('settings-panel', 'children', allow_duplicate=True),
@@ -347,9 +353,17 @@ def save_settings(n_clicks, debug_val, log_levels, level_ids):
     for level_val, id_dict in zip(log_levels, level_ids):
         module = id_dict['module']
         settings_update[f'{module}_level'] = level_val
-    modules.logger.perf_logger.update_settings(settings_update)
-    save_setting('logging_settings', json.dumps(modules.logger.perf_logger.settings))
+    perf_logger.update_settings(settings_update)
+    save_setting('logging_settings', json.dumps(perf_logger.settings))
     return no_update
+
+@app.callback(
+    Output('global-interval-debug', 'children'),
+    Input('global-interval', 'n_intervals')
+)
+def debug_interval(n):
+    logger.debug(f"Global-interval fired: {n}")
+    return f"Interval: {n}"
 
 if __name__ == '__main__':
     debug_mode = get_setting('debug_mode', 'False') == 'True'

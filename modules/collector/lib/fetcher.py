@@ -1,4 +1,9 @@
-# async_fetcher.py (updated - with currency filtering)
+# modules/collector/components/fetcher.py
+# Copyright (c) 2026 sergson (https://github.com/sergson)
+# Licensed under GNU General Public License v3.0
+# DISCLAIMER: Trading cryptocurrencies involves significant risk.
+# This software is for educational purposes only. Use at your own risk.
+
 """
 Asynchronous data fetcher from crypto exchanges
 """
@@ -9,7 +14,7 @@ import pandas as pd
 import ccxt.async_support as ccxt
 from datetime import datetime, timezone
 from .universal_resolver import create_aiohttp_session
-from .logger import perf_logger
+from core.logger import perf_logger
 
 # Windows specific setup
 if sys.platform.startswith('win'):
@@ -314,7 +319,7 @@ class AsyncExchangeFetcher:
                 pass
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 100) -> pd.DataFrame:
-        """Receives OHLCV candles from the exchange"""
+        """Fetch OHLCV candles from the exchange"""
         await self.initialize()
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)

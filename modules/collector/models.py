@@ -1,4 +1,4 @@
-# modules/collector_bot.py (updated)
+# modules/collector/models.py
 # Copyright (c) 2026 sergson (https://github.com/sergson)
 # Licensed under GNU General Public License v3.0
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
@@ -6,10 +6,10 @@
 
 import asyncio
 import sqlite3
-from .base_bot import BaseBot
-from .fetcher import AsyncExchangeFetcher
-from .database import get_bot_config, update_bot_status
-from .logger import perf_logger
+from core import auto_reg, BaseBot
+from core.database import get_bot_config, update_bot_status
+from core.logger import perf_logger
+from .lib.fetcher import AsyncExchangeFetcher
 
 def timeframe_to_seconds(tf: str) -> int:
     unit = tf[-1]
@@ -19,14 +19,33 @@ def timeframe_to_seconds(tf: str) -> int:
     elif unit == 'd': return value * 86400
     else: raise ValueError(f"Unsupported timeframe: {tf}")
 
+@auto_reg
 class CollectorBot(BaseBot):
+    _name = "collector.bot"
+    _inherit = "base.bot"
+
     def __init__(self, bot_id: int):
         super().__init__(bot_id)
         self.config = get_bot_config(bot_id)
-        self.running = False
-        self.task = None
         self.logger = perf_logger.get_logger(f'collector_{bot_id}', 'collector')
         self.fetcher = None
+        self._init_db()  # ← create table immediately
+
+    def _init_db(self):
+        """Creates a table in DB if it doesn't exist."""
+        db_path = self.config['data_db_path']
+        symbol = self.config['symbol']
+        table_name = symbol.replace('/', '_').replace('-', '_')
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(f'''
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        timestamp INTEGER PRIMARY KEY,
+                        open REAL, high REAL, low REAL, close REAL, volume REAL
+                    )
+                ''')
+        except Exception as e:
+            self.logger.error(f"Failed to create table {table_name}: {e}")
 
     async def start(self):
         if self.running:
@@ -34,7 +53,11 @@ class CollectorBot(BaseBot):
         self.running = True
         self.task = asyncio.create_task(self._run())
         update_bot_status(self.bot_id, 'running')
-        self.logger.info(f"Bot {self.bot_id} started")
+        self.logger.info(f"Bot {self.bot_id} started, status updated to 'running'")
+        # Verify that status actually updated
+        from core.database import get_bot_config
+        cfg = get_bot_config(self.bot_id)
+        self.logger.info(f"Status in DB after update: {cfg.get('status')}")
 
     async def stop(self):
         self.running = False
@@ -60,7 +83,6 @@ class CollectorBot(BaseBot):
         timeframe = self.config['timeframe']
         candles_limit = self.config['candles_limit']
 
-        # Create table
         with sqlite3.connect(db_path) as conn:
             conn.execute(f'''
                 CREATE TABLE IF NOT EXISTS {table_name} (
