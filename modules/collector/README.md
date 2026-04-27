@@ -12,19 +12,23 @@ It is part of the **T.B.O.T** framework and can be used as a standalone data sou
    - [Configuration Database (`config.db`)](#configuration-database-configdb)
    - [Market Data Database](#market-data-database)
 3. [Reading Collected Data](#reading-collected-data)
-4. [Managing Collector Bots Programmatically](#managing-collector-bots-programmatically)
+4. [Inter‑Bot Data Exchange (Recommended)](#inter-bot-data-exchange-recommended)
+   - [Exposing Capabilities](#exposing-capabilities)
+   - [Consuming Collector Data via ExchangeHandle](#consuming-collector-data-via-exchangehandle)
+   - [Data Flow Overview](#data-flow-overview)
+5. [Managing Collector Bots Programmatically](#managing-collector-bots-programmatically)
    - [Adding a New Collector Bot](#adding-a-new-collector-bot)
    - [Starting / Stopping a Bot](#starting--stopping-a-bot)
    - [Deleting a Bot and Cleaning Up](#deleting-a-bot-and-cleaning-up)
    - [Clearing Collected Data](#clearing-collected-data)
    - [Modifying Bot Parameters (e.g., timeframe)](#modifying-bot-parameters)
-5. [Extending CollectorBot via Registry Inheritance](#extending-collectorbot-via-registry-inheritance)
+6. [Extending CollectorBot via Registry Inheritance](#extending-collectorbot-via-registry-inheritance)
    - [Using `bot_registry.get_model`](#using-bot_registryget_model)
    - [Adding New Methods Through `_inherit`](#adding-new-methods-through-_inherit)
    - [Dynamic Extension (Monkey-Patching) Without Creating a Module](#dynamic-extension-monkey-patching-without-creating-a-module)
-6. [Using Collector Data Inside Other Bots](#using-collector-data-inside-other-bots)
-7. [UI Behaviour & Bot Naming](#ui-behaviour--bot-naming)
-8. [Troubleshooting & Logging](#troubleshooting--logging)
+7. [Using Collector Data Inside Other Bots (Direct SQLite)](#using-collector-data-inside-other-bots-direct-sqlite)
+8. [UI Behaviour & Bot Naming](#ui-behaviour--bot-naming)
+9. [Troubleshooting & Logging](#troubleshooting--logging)
 
 ---
 
@@ -118,9 +122,10 @@ CREATE TABLE IF NOT EXISTS BTC_USDT (
 
 ## Reading Collected Data
 
-Any other bot or script can read the collected OHLCV data directly from the market database using standard SQLite queries.
+Any other bot or script can read the collected OHLCV data directly from the market database using standard SQLite queries.  
+**However**, for a cleaner, loosely‑coupled approach that does not require knowledge of database paths or table names, prefer the **Inter‑Bot Data Exchange** mechanism described in the next section.
 
-### Example: Read all candles (using Pandas)
+### Example: Read all candles (using Pandas) – direct access
 
 ```python
 import sqlite3
@@ -148,7 +153,7 @@ def read_all_candles(bot_id: int) -> pd.DataFrame:
     return df
 ```
 
-### Example: Get latest candle (raw SQLite)
+### Example: Get latest candle (raw SQLite) – direct access
 
 ```python
 import sqlite3
@@ -183,6 +188,96 @@ def get_last_candle(bot_id: int):
 ```
 
 > **Note:** The bot writes data asynchronously. Always handle the case where the table may be empty or the bot is still starting.
+
+---
+
+## Inter‑Bot Data Exchange (Recommended)
+
+The T.B.O.T framework now includes a built‑in mechanism for bots to share data **without hard‑coded database paths or table names**. Every bot can declare what data it provides, and other bots can request that data through a central `BotManager` using a simple keyword‑based mapping. The collector bot already implements this interface.
+
+### Exposing Capabilities
+
+The `CollectorBot` class defines `get_capabilities()`, which returns a dictionary describing what data it can offer:
+
+```python
+def get_capabilities(self):
+    return {
+        "ohlcv_data": {
+            "keywords": ["candles", "ohlcv", "quotes", "market_data"],
+            "getter": self._get_ohlcv_data,
+            "setter": None,
+        },
+        "symbol": {
+            "keywords": ["symbol", "pair", "ticker"],
+            "getter": self._get_symbol,
+            "setter": None,
+        }
+    }
+```
+
+- **`keywords`** – a list of strings that other bots can use to request this particular dataset.
+- **`getter`** – an **asynchronous** callable (a bound method) that returns the data. It may accept extra arguments – for example, `_get_ohlcv_data(limit=500)` limits the number of candles returned.
+- **`setter`** – `None` because the collector does not allow external writing.
+
+The actual getter methods are:
+
+```python
+async def _get_ohlcv_data(self, limit=500):
+    # Reads the last `limit` candles from the SQLite database
+    # Returns a list of dicts: [{"timestamp": ..., "open": ..., ...}, ...]
+    ...
+
+async def _get_symbol(self):
+    return self.config['symbol']
+```
+
+These methods are asynchronous even though the database access is synchronous – they use `loop.run_in_executor()` to avoid blocking the event loop.
+
+### Consuming Collector Data via ExchangeHandle
+
+Any other bot that has a reference to the `BotManager` (available as `self.manager` if the bot passes `manager` to `BaseBot`) can securely access the collector’s data.
+
+**Step 1 – Obtain an `ExchangeHandle`**  
+Inside the consumer bot’s `start()` method (or later), call `self.setup_exchange()` with the target collector’s ID and a mapping from **your local names** to **the collector’s keywords**:
+
+```python
+async def start(self):
+    # My local names → collector's keywords
+    mapping = {
+        "prices": ["candles", "ohlcv"],
+        "ticker": ["symbol", "pair"]
+    }
+    await self.setup_exchange(target_bot_id=5, mapping=mapping)
+    # ... other startup logic
+```
+
+The handle is cached in `self.dynamics[5]`.
+
+**Step 2 – Fetch data**  
+Use the handle to call `get()` with your local name:
+
+```python
+handle = self.get_exchange(5)   # or directly self.dynamics[5]
+if handle:
+    # Get the last 100 candles
+    candles = await handle.get("prices", limit=100)
+    # Get the trading pair
+    symbol = await handle.get("ticker")
+```
+
+Extra keyword arguments passed to `handle.get()` (like `limit=100`) are forwarded directly to the getter method – here, to `_get_ohlcv_data(limit=100)`.
+
+The consumer bot **never touches SQLite, table names, or file paths**. If the collector is later moved to a different storage backend, the consumer remains unchanged.
+
+### Data Flow Overview
+
+1. Collector registers its capabilities (keywords + async methods).
+2. Consumer asks the `BotManager` for an exchange with the collector, specifying a keyword map.
+3. `BotManager` matches the keywords against the collector’s capabilities and creates an `ExchangeHandle` that holds references to the real getter methods.
+4. The consumer uses the handle to read data – the call is proxied to the collector’s async methods.
+5. When the collector is removed, all handles to it are automatically invalidated.
+
+This design keeps bots decoupled and makes the system easily extensible without modifying existing code.
 
 ---
 
@@ -286,7 +381,7 @@ bot_manager.remove_bot(bot_id)
 delete_bot(bot_id)               # cascades to config_collector_type
 ```
 
-The `BotManager.remove_bot()` method also removes the market database file after a 3‑second delay (to allow any pending reads to finish).
+The `BotManager.remove_bot()` method also removes the market database file after a 3‑second delay (to allow any pending reads to finish). **All other bots that had an `ExchangeHandle` to this collector will have that handle automatically removed.**
 
 ### Clearing Collected Data
 
@@ -409,21 +504,7 @@ class CollectorExtension:
             return row[0] if row else 0.0
 ```
 
-After this module is loaded (by `load_modules`), all existing and future collector bots will have the `get_last_price()` method available. You can call it programmatically:
-
-```python
-from core.bot_manager import bot_manager
-from core.registry import bot_registry
-
-bot_id = 1
-# Get the bot instance from BotManager (if it is running)
-if bot_id in bot_manager.bots:
-    bot_instance = bot_manager.bots[bot_id]
-    price = bot_instance.get_last_price()
-    print(f"Last price: {price}")
-```
-
-If the bot is not running, you can still instantiate the class using `bot_registry.get_model` and call the method – but be aware that `self.config` is only populated after `__init__`, which requires a `bot_id`.
+After this module is loaded (by `load_modules`), all existing and future collector bots will have the `get_last_price()` method available.
 
 ### Overriding Existing Methods
 
@@ -441,6 +522,7 @@ class LoggingCollector:
 ```
 
 > **Important:** Always call `super().method()` to preserve the original functionality.
+> **Capabilities & extensions:** If you override `get_capabilities()`, remember to call `super().get_capabilities()` if you want to keep the original entries and just add new ones.
 
 ### Dynamic Extension (Monkey-Patching) Without Creating a Module
 
@@ -452,17 +534,12 @@ The `bot_registry` stores the **final merged class** for each model name (e.g., 
 
 #### Example: Adding `get_avg_price()` Dynamically
 
-Assume you are inside another module (e.g., `modules/analytics/hooks.py`) and you want to add a helper method to every existing and future collector bot.
-
 ```python
 from core.registry import bot_registry
 
-# 1. Get the collector bot class (already merged with any static extensions)
 CollectorClass = bot_registry.get_model("collector.bot")
 
-# 2. Define the new method
 def get_avg_price(self, lookback: int = 10) -> float:
-    """Calculate average close price over last N candles."""
     import sqlite3
     config = self.config
     table = config['symbol'].replace('/', '_')
@@ -476,27 +553,10 @@ def get_avg_price(self, lookback: int = 10) -> float:
             return 0.0
         return sum(r[0] for r in rows) / len(rows)
 
-# 3. Attach it to the class
 CollectorClass.get_avg_price = get_avg_price
 ```
 
-After this code runs, **all collector bot instances** (including those already running) will have the `get_avg_price` method. However, existing instances do not automatically get the method attached to their own `__dict__` – they will still find it via the class because Python looks up methods on the class. So it works immediately.
-
-#### Applying to Already Running Instances
-
-If you want to explicitly ensure that already created instances also have the method (for safety), you can iterate over running bots:
-
-```python
-from core.bot_manager import bot_manager
-
-for bot_id, bot_instance in bot_manager.bots.items():
-    if isinstance(bot_instance, CollectorClass):  # or check bot_instance.__class__.__name__
-        # The method is already callable via the class, but you can also bind it directly:
-        # bot_instance.get_avg_price = get_avg_price.__get__(bot_instance, CollectorClass)
-        pass
-```
-
-Because Python’s method resolution looks at the class, no extra step is usually required.
+After this code runs, **all collector bot instances** will have the `get_avg_price` method. Because Python looks up methods on the class, existing instances see it immediately.
 
 #### Dynamic Override of Existing Methods
 
@@ -513,67 +573,21 @@ async def patched_start(self):
 CollectorClass.start = patched_start
 ```
 
-This will affect all collector bots the next time `start()` is called (including those already running if they are restarted).
-
-#### Use Cases
-
-- **Hot‑fixing** a bug in a running bot without restarting the whole application.
-- **Adding monitoring hooks** from a separate module that activates only under certain conditions.
-- **Testing** new features interactively (e.g., from a Jupyter notebook connected to the running process).
+This will affect all collector bots the next time `start()` is called.
 
 #### Important Considerations
 
-1. **Thread safety** – If the running event loop is active, modifying class methods while a bot is executing may lead to race conditions. Apply dynamic patches when bots are idle or stopped.
-2. **Persistence** – Dynamic changes are lost when the application restarts. For permanent extensions, prefer the module‑based `_inherit` approach.
-3. **Debugging** – Monkey‑patched methods can be harder to trace. Always log when dynamic patching occurs.
-
-#### Combining with Registry Lookup for Dynamic Extension
-
-If your dynamic extension code does not have direct access to the `bot_manager`, you can still obtain the collector class via the registry and patch it:
-
-```python
-from core.registry import bot_registry
-
-if "collector.bot" in bot_registry.list_models():
-    CollectorClass = bot_registry.get_model("collector.bot")
-    # ... patch as above
-```
-
-This technique leverages the same registry that powers the static inheritance system, but applies modifications at runtime without creating new module files.
-
-#### Example: Complete Dynamic Extension from Another Bot’s Code
-
-Imagine you are writing a strategy bot that needs a helper method on the collector. Inside your strategy bot’s `__init__` or `start()`:
-
-```python
-from core.registry import bot_registry
-
-class MyStrategyBot(BaseBot):
-    async def start(self):
-        # Dynamically add a method to all collector bots
-        CollectorClass = bot_registry.get_model("collector.bot")
-        if not hasattr(CollectorClass, "get_rsi"):
-            def get_rsi(self, period=14):
-                # implementation using self.config and DB
-                ...
-            CollectorClass.get_rsi = get_rsi
-            self.logger.info("Dynamically added get_rsi() to CollectorBot")
-        await super().start()
-```
-
-This way, your strategy bot “enhances” the collector as soon as it starts, without requiring a separate module.
-
-#### Conclusion
-
-While the declarative `_inherit` mechanism is the recommended way for permanent, well‑defined extensions, the registry‑based dynamic patching gives you ultimate flexibility for runtime adaptations, testing, and hot‑fixes – all within the existing architecture of T.B.O.T.
+1. **Thread safety** – Apply dynamic patches when bots are idle or stopped.
+2. **Persistence** – Dynamic changes are lost on restart. For permanent extensions, prefer the `_inherit` approach.
+3. **Capabilities** – You can also dynamically patch `get_capabilities()` to expose new data via the exchange system, but ensure the getters you add are async and properly bound.
 
 ---
 
-## Using Collector Data Inside Other Bots
+## Using Collector Data Inside Other Bots (Direct SQLite)
 
-Any other bot (e.g., a strategy bot, an analytics bot) can read the market database directly as shown in [Reading Collected Data](#reading-collected-data). Because all bots run in the same asyncio event loop, you can safely read SQLite from any task – SQLite supports concurrent reads.
+While the recommended approach is the `ExchangeHandle` mechanism, you can still access the SQLite database directly if needed. This section describes that legacy method.
 
-### Example: Strategy bot that uses the collector’s data
+### Example: Strategy bot that uses the collector’s data (direct SQLite)
 
 ```python
 # Inside another bot's _run() method
@@ -583,7 +597,7 @@ from core.database import get_bot_config
 
 class MyStrategyBot(BaseBot):
     async def _run(self):
-        collector_id = 1   # known ID of a collector bot
+        collector_id = 1
         while self.running:
             config = get_bot_config(collector_id)
             if config and config.get('bot_type') == 'collector':
@@ -606,8 +620,6 @@ collector_instance = bot_manager.bots.get(collector_id)
 if collector_instance and hasattr(collector_instance, 'get_last_price'):
     price = collector_instance.get_last_price()
 ```
-
-This is especially useful when you have added custom methods via `_inherit` or dynamic patching.
 
 ---
 
@@ -633,8 +645,6 @@ for bot in all_bots:
     print(bot['id'], bot['type'], bot['name'], bot['status'])
 ```
 
-This returns all bots regardless of type.
-
 ---
 
 ## Troubleshooting & Logging
@@ -655,6 +665,8 @@ All collector‑related logs are written to:
 | Duplicate timestamps                     | Rare – `INSERT OR IGNORE` prevents duplicates, but if primary key violated, check timezone handling. | Verify that timestamps from CCXT are in UTC. The bot converts ms to seconds. |
 | Bot does not auto‑start after reboot     | Only bots with `status='running'` are loaded by `BotManager.load_bots()`.    | Ensure you set `status='running'` before restarting `app.py`.            |
 | Custom extension methods not found       | The module containing the `_inherit` class was not loaded.                  | Check that your module is inside `modules/` and has `__init__.py`. Also verify that `load_modules` runs. |
+| `ExchangeHandle.get()` raises KeyError   | The local name used in `get()` does not match any name given during `setup_exchange()`, or the target bot has no matching capability. | Double‑check the keyword mapping and that the target bot is a collector with `get_capabilities()` implemented. |
+| Getter not returning data as expected    | The getter may be asynchronous, but the caller might be using it incorrectly. | Always `await` the `handle.get()` call. Check the collector’s logs for errors in `_get_ohlcv_data`. |
 
 ### Forcing a bot to re‑fetch historical data
 
@@ -670,8 +682,10 @@ clear_collector_data(bot_id)  # as defined above
 
 | Action                                   | Code / Function                                                                 |
 |------------------------------------------|---------------------------------------------------------------------------------|
-| Read all candles                         | Direct SQLite query (see example)                                               |
-| Read last candle                         | SQLite query with `ORDER BY timestamp DESC LIMIT 1`                             |
+| Read all candles (direct SQLite)         | Direct SQLite query (see example)                                               |
+| Read last candle (direct SQLite)         | SQLite query with `ORDER BY timestamp DESC LIMIT 1`                             |
+| **Expose data via capabilities**         | Implement `get_capabilities()` returning keywords & async getters               |
+| **Consume data via ExchangeHandle**      | `await self.setup_exchange(target_id, mapping)`, then `await handle.get(name)`  |
 | Create and start collector bot           | `create_and_start_collector(...)` (custom function) + `bot_manager.start_bot()` |
 | Start/stop a bot                         | `bot_manager.start_bot(bot_id)` / `bot_manager.stop_bot(bot_id)`                |
 | Delete a bot                             | `bot_manager.remove_bot(bot_id)` + `delete_bot(bot_id)`                         |
