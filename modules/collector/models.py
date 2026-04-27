@@ -24,12 +24,12 @@ class CollectorBot(BaseBot):
     _name = "collector.bot"
     _inherit = "base.bot"
 
-    def __init__(self, bot_id: int):
-        super().__init__(bot_id)
+    def __init__(self, bot_id: int, manager=None):
+        super().__init__(bot_id, manager)
         self.config = get_bot_config(bot_id)
         self.logger = perf_logger.get_logger(f'collector_{bot_id}', 'collector')
         self.fetcher = None
-        self._init_db()  # ← create table immediately
+        self._init_db()
 
     def _init_db(self):
         """Creates a table in DB if it doesn't exist."""
@@ -137,3 +137,37 @@ class CollectorBot(BaseBot):
             except Exception as e:
                 self.logger.error(f"Error in collector loop: {e}", exc_info=True)
             await asyncio.sleep(fetch_interval)
+
+    def get_capabilities(self):
+        return {
+            "ohlcv_data": {
+                "keywords": ["candles", "ohlcv", "quotes", "market_data", "stonks"],
+                "getter": self._get_ohlcv_data,
+                "setter": None,
+            },
+            "symbol": {
+                "keywords": ["symbol", "pair", "ticker"],
+                "getter": self._get_symbol,
+                "setter": None,
+            }
+        }
+
+    async def _get_ohlcv_data(self, limit: int = 500):
+        """Возвращает последние limit свечей в виде списка словарей."""
+        db_path = self.config['data_db_path']
+        table_name = self.config['symbol'].replace('/', '_').replace('-', '_')
+        loop = asyncio.get_running_loop()
+
+        def query():
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    f"SELECT * FROM {table_name} ORDER BY timestamp DESC LIMIT ?",
+                    (limit,)
+                )
+                return [dict(row) for row in cur.fetchall()]
+
+        return await loop.run_in_executor(None, query)
+
+    async def _get_symbol(self):
+        return self.config['symbol']
