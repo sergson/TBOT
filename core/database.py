@@ -129,3 +129,24 @@ def get_setting(key, default=None):
         cur = conn.execute('SELECT value FROM settings WHERE key = ?', (key,))
         row = cur.fetchone()
         return row[0] if row else default
+
+def ensure_type_tables():
+    """Create missing configuration tables for all registered bot types."""
+    from .registry import bot_registry
+    with sqlite3.connect(DB_CONFIG) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+    for model_name in bot_registry.list_models():
+        cls = bot_registry.get_model(model_name)
+        if hasattr(cls, 'config_schema'):
+            schema = cls.config_schema
+            type_id = cls._name.replace('.', '_')
+            columns = ', '.join([f"{col} {typ}" for col, typ in schema.items()])
+            with sqlite3.connect(DB_CONFIG) as conn:
+                conn.execute(f'''
+                    CREATE TABLE IF NOT EXISTS config_{type_id} (
+                        bot_id INTEGER PRIMARY KEY,
+                        {columns},
+                        FOREIGN KEY(bot_id) REFERENCES bots(id) ON DELETE CASCADE
+                    )
+                ''')
+                conn.commit()
