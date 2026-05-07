@@ -38,6 +38,9 @@ logger.debug("Loading modules...")
 load_modules("modules")
 logger.debug(f"Registry models after load: {bot_registry._models}")
 
+# Create missing tables for any newly registered bot types
+from core.database import ensure_type_tables
+ensure_type_tables()
 loop = asyncio.new_event_loop()
 threading.Thread(target=loop.run_forever, daemon=True).start()
 
