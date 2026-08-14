@@ -6,6 +6,7 @@
 
 from typing import Dict, Type, Optional, List
 from .logger import perf_logger
+import re
 
 logger = perf_logger.get_logger('registry', 'app')
 
@@ -24,6 +25,9 @@ class BotRegistry:
         name = getattr(cls, '_name', None)
         inherit = getattr(cls, '_inherit', None)
         logger.debug(f"Register: cls={cls.__name__}, name={name}, inherit={inherit}")
+
+        if name and not re.match(r'^[a-zA-Z0-9_.]+$', name):
+            raise ValueError(f"Invalid _name '{name}': must match [a-zA-Z0-9_.]+")
 
         if not name and not inherit:
             logger.debug(f"Register: {cls.__name__} does not participate in inheritance system")
