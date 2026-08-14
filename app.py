@@ -1,17 +1,19 @@
-# app.py
+# app.py (final version)
 # Copyright (c) 2026 sergson (https://github.com/sergson)
 # Licensed under GNU General Public License v3.0
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
 # This software is for educational purposes only. Use at your own risk.
 
 import dash
-from dash import dcc, html, Input, Output, State, ALL, MATCH, no_update
-import threading
-import asyncio
+from dash import dcc, html, Input, Output, State, ALL, MATCH, no_update, callback_context
 import os
 import json
+from core.database import DATA_DIR, cleanup_orphan_databases, update_bot_config
+import atexit
+import signal
+import logging
 
-# Import core, but do NOT create logger immediately
+
 from core import (
     load_modules, init_config_db, add_bot, get_all_bots, get_bot_config,
     update_bot_status, delete_bot, get_setting, save_setting,
@@ -24,32 +26,30 @@ class SettingsStorage:
     @staticmethod
     def save_setting(key, value): save_setting(key, value)
 
-os.makedirs('data', exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 init_config_db()
-
-# Load logger settings from DB BEFORE creating the first logger
+cleanup_orphan_databases()  # now the function is defined in core and imported
 perf_logger.initialize_with_storage(SettingsStorage)
-
-# Now create logger
 logger = perf_logger.get_logger('app', 'app')
-logger.debug("Loading modules...")
 
-# Load modules (they will also get loggers with already applied settings)
 load_modules("modules")
-logger.debug(f"Registry models after load: {bot_registry._models}")
-
-# Create missing tables for any newly registered bot types
-from core.database import ensure_type_tables
-ensure_type_tables()
-loop = asyncio.new_event_loop()
-threading.Thread(target=loop.run_forever, daemon=True).start()
 
 bot_manager = BotManager()
-bot_manager.set_loop(loop)
+bot_manager.start_loop_in_thread()
+atexit.register(bot_manager.shutdown)
+signal.signal(signal.SIGINT, lambda s, f: bot_manager.shutdown())
+signal.signal(signal.SIGTERM, lambda s, f: bot_manager.shutdown())
 bot_manager.load_bots()
 
 app = dash.Dash(__name__, title='T.B.O.T')
 app.config.suppress_callback_exceptions = True
+
+# Callback registration uses bot_manager.loop
+for model_name in bot_registry.list_models():
+    if model_name.endswith('.type'):
+        meta_cls = bot_registry.get_model(model_name)
+        if hasattr(meta_cls, 'register_callbacks'):
+            meta_cls.register_callbacks(app, bot_manager, bot_manager.loop)
 
 app.layout = html.Div([
     html.H1('T.B.O.T', style={'textAlign': 'center'}),
@@ -88,13 +88,16 @@ app.layout = html.Div([
 
         dcc.Store(id='bots-trigger', data=0),
         dcc.Store(id='relayout-store', data={}),
+        dcc.Store(id='editing-bots', data={}),
+        dcc.Store(id='prev-edit-clicks', data=[]),
         dcc.Location(id='url', refresh=False),
     ]),
     html.Div(id='bots-container'),
     dcc.Interval(id='global-interval', interval=5000, n_intervals=0)
 ])
 
-# ---------- Callbacks ----------
+# ---------- Common callbacks ----------
+
 @app.callback(
     [Output('add-bot-form-container', 'style'),
      Output('dynamic-bot-form-content', 'children'),
@@ -109,12 +112,11 @@ app.layout = html.Div([
     prevent_initial_call=True
 )
 def toggle_forms(add_clicks, settings_clicks, cancel_clicks, close_clicks, save_clicks):
-    ctx = dash.callback_context
+    ctx = callback_context
     if not ctx.triggered:
         return no_update, no_update, no_update, no_update, no_update
 
     triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
-
     add_style = {'display': 'none'}
     settings_style = {'display': 'none'}
     form_content = no_update
@@ -124,23 +126,22 @@ def toggle_forms(add_clicks, settings_clicks, cancel_clicks, close_clicks, save_
     if triggered_id == 'add-bot-btn':
         if add_clicks % 2 == 1:
             add_style = {'display': 'block'}
-            settings_style = {'display': 'none'}
             new_settings = 0
-            # Get list of available types from registry (classes with _name ending with ".type")
             type_options = []
             for model_name in bot_registry.list_models():
                 if model_name.endswith('.type'):
                     cls = bot_registry.get_model(model_name)
                     display = getattr(cls, 'display_name', model_name)
-                    type_id = model_name.split('.')[0]  # e.g., "collector"
+                    type_id = model_name.split('.')[0]
                     type_options.append({'label': display, 'value': type_id})
-            form_content = html.Div([
-                html.H3('Add Bot'),
-                dcc.Dropdown(id='bot-type-selector', options=type_options,
-                             value=type_options[0]['value'] if type_options else None),
-                html.Div(id='dynamic-bot-form')
-            ])
-            logger.debug(f"Available types: {[opt['value'] for opt in type_options]}")
+            if not type_options:
+                form_content = html.Div("No bot types registered. Check modules.")
+            else:
+                form_content = html.Div([
+                    html.H3('Add Bot'),
+                    dcc.Dropdown(id='bot-type-selector', options=type_options, value=type_options[0]['value']),
+                    html.Div(id='dynamic-bot-form')
+                ])
         else:
             add_style = {'display': 'none'}
         new_add = add_clicks
@@ -148,7 +149,6 @@ def toggle_forms(add_clicks, settings_clicks, cancel_clicks, close_clicks, save_
     elif triggered_id == 'settings-btn':
         if settings_clicks % 2 == 1:
             settings_style = {'display': 'block'}
-            add_style = {'display': 'none'}
             new_add = 0
         else:
             settings_style = {'display': 'none'}
@@ -164,20 +164,29 @@ def toggle_forms(add_clicks, settings_clicks, cancel_clicks, close_clicks, save_
 
     return add_style, form_content, settings_style, new_add, new_settings
 
+
 @app.callback(
     Output('dynamic-bot-form', 'children'),
     Input('bot-type-selector', 'value')
 )
 def update_dynamic_form(bot_type):
     if not bot_type:
-        return no_update
+        return html.Div("Select a bot type")
     meta_cls = bot_registry.get_model(f"{bot_type}.type")
-    if meta_cls and hasattr(meta_cls, 'form_component'):
+    if not meta_cls or not hasattr(meta_cls, 'form_component'):
+        return html.Div(f"Form for type '{bot_type}' not found")
+    try:
+        return meta_cls.form_component(current_bot_id=None)
+    except TypeError:
         return meta_cls.form_component()
-    return html.Div(f"Form for type '{bot_type}' not found")
+    except Exception as e:
+        logger.error(f"Error rendering form: {e}")
+        return html.Div(f"Error loading form: {e}")
+
 
 @app.callback(
-    Output('bots-trigger', 'data', allow_duplicate=True),
+    [Output('bots-trigger', 'data', allow_duplicate=True),
+     Output('editing-bots', 'data')],
     Input('save-bot-btn', 'n_clicks'),
     [State('bot-type-selector', 'value'),
      State({'type': ALL, 'field': ALL}, 'value'),
@@ -185,9 +194,9 @@ def update_dynamic_form(bot_type):
      State('bots-trigger', 'data')],
     prevent_initial_call=True
 )
-def save_new_bot(n_clicks, bot_type, field_values, field_ids, trigger):
+def save_bot(n_clicks, bot_type, field_values, field_ids, trigger):
     if not n_clicks or not bot_type:
-        return no_update
+        return no_update, no_update
 
     config = {}
     for val, id_dict in zip(field_values, field_ids):
@@ -195,48 +204,72 @@ def save_new_bot(n_clicks, bot_type, field_values, field_ids, trigger):
         if field:
             config[field] = val
 
-    if bot_type == 'collector':
-        bot_id_temp = add_bot(bot_type, f"{config.get('exchange', '')} {config.get('symbol', '')}")
-        config['data_db_path'] = f"data/bot_{bot_id_temp}.db"
-        from core.database import DB_CONFIG
-        import sqlite3
-        with sqlite3.connect(DB_CONFIG) as conn:
-            conn.execute('UPDATE bots SET config_data = ? WHERE id = ?',
-                         (json.dumps(config), bot_id_temp))
-            conn.execute('UPDATE config_collector_type SET data_db_path = ? WHERE bot_id = ?',
-                         (config['data_db_path'], bot_id_temp))
-        bot_manager.add_bot(bot_id_temp)
-        return trigger + 1
+    meta_cls = bot_registry.get_model(f"{bot_type}.type")
+    if meta_cls and hasattr(meta_cls, 'prepare_new_config'):
+        config = meta_cls.prepare_new_config(config)
 
     bot_id = add_bot(bot_type, f"{bot_type} bot", config)
     bot_manager.add_bot(bot_id)
-    return trigger + 1
+    return trigger + 1, {}
+
 
 @app.callback(
     Output('bots-container', 'children'),
     [Input('bots-trigger', 'data'),
+     Input('editing-bots', 'data'),
      Input('url', 'pathname')],
     [State('relayout-store', 'data')]
 )
-def render_bots(trigger, pathname, relayout_store):
+def render_bots(trigger, editing_bots, pathname, relayout_store):
     bots = get_all_bots()
     if not bots:
         return html.Div('No active bots. Click "+" to add one.')
 
+    editing_bots = editing_bots or {}
     bot_blocks = []
     for bot in bots:
+        bot_id = bot['id']
         bot_type = bot['type']
         meta_cls = bot_registry.get_model(f"{bot_type}.type")
         if not meta_cls:
             continue
-        config = get_bot_config(bot['id'])
+        config = get_bot_config(bot_id)
         if not config:
             continue
         config['status'] = bot['status']
-        if hasattr(meta_cls, 'render_block'):
-            block = meta_cls.render_block(bot['id'], config, relayout_store)
-            bot_blocks.append(block)
+
+        if editing_bots.get(str(bot_id)):
+            # Edit mode
+            if hasattr(meta_cls, 'form_component'):
+                try:
+                    form = meta_cls.form_component(current_bot_id=bot_id)
+                except TypeError:
+                    form = meta_cls.form_component()
+                except Exception as e:
+                    form = html.Div(f"Error loading form: {e}")
+            else:
+                form = html.Div("Edit form not available for this type.")
+
+            edit_block = html.Div([
+                html.H4(f"Editing {config.get('name', f'Bot {bot_id}')}"),
+                form,
+                html.Button('Save', id={'type': 'edit-save-btn', 'index': bot_id}, style={'marginRight': '10px'}),
+                html.Button('Cancel', id={'type': 'edit-cancel-btn', 'index': bot_id})
+            ], style={'border': '1px solid #aaa', 'padding': '10px', 'margin': '10px 0'})
+            bot_blocks.append(html.Div(edit_block, id={'type': 'bot-card', 'index': bot_id}, key=str(bot_id)))
+        else:
+            # Normal mode
+            if hasattr(meta_cls, 'render_block'):
+                block = meta_cls.render_block(bot_id, config, relayout_store)
+                bot_blocks.append(html.Div(block, id={'type': 'bot-card', 'index': bot_id}, key=str(bot_id)))
+            else:
+                bot_blocks.append(html.Div(
+                    f"Bot {bot_id} ({bot_type}) - no render_block",
+                    id={'type': 'bot-card', 'index': bot_id}, key=str(bot_id)
+                ))
+
     return bot_blocks
+
 
 @app.callback(
     Output('relayout-store', 'data'),
@@ -245,13 +278,12 @@ def render_bots(trigger, pathname, relayout_store):
     prevent_initial_call=True
 )
 def save_relayout(relayout_list, stored):
-    ctx = dash.callback_context
+    ctx = callback_context
     if not ctx.triggered:
         return no_update
     triggered = ctx.triggered[0]
-    prop_id = triggered['prop_id']
     try:
-        graph_id_str = prop_id.split('.')[0]
+        graph_id_str = triggered['prop_id'].split('.')[0]
         graph_id = json.loads(graph_id_str)
         bot_id = graph_id['index']
         new_relayout = triggered['value']
@@ -263,20 +295,36 @@ def save_relayout(relayout_list, stored):
     stored[str(bot_id)] = new_relayout
     return stored
 
+
 @app.callback(
     Output({'type': 'status-btn', 'index': MATCH}, 'children'),
-    Input({'type': 'status-btn', 'index': MATCH}, 'n_clicks'),
-    State({'type': 'status-btn', 'index': MATCH}, 'id'),
-    prevent_initial_call=True
+    [Input({'type': 'status-btn', 'index': MATCH}, 'n_clicks'),
+     Input('bots-trigger', 'data')],
+    [State({'type': 'status-btn', 'index': MATCH}, 'id')],
+    prevent_initial_call=False
 )
-def toggle_bot(n_clicks, btn_id):
-    if not n_clicks:
-        return no_update
+def toggle_bot(n_clicks, trigger, btn_id):
     bot_id = btn_id['index']
     bots = get_all_bots()
     bot = next((b for b in bots if b['id'] == bot_id), None)
     if not bot:
-        return no_update
+        return "Start"
+
+    ctx = callback_context
+    if not ctx.triggered:
+        return "Stop" if bot['status'] == 'running' else "Start"
+
+    prop_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    # If only the interval or bot list change triggered, just return current status
+    if prop_id == 'bots-trigger':
+        return "Stop" if bot['status'] == 'running' else "Start"
+
+    # If it's the button but no click occurred (e.g., button recreated), also return current status
+    if prop_id == 'status-btn' and (not n_clicks or n_clicks <= 0):
+        return "Stop" if bot['status'] == 'running' else "Start"
+
+    # Here we definitely have a real click
     if bot['status'] == 'running':
         bot_manager.stop_bot(bot_id)
         update_bot_status(bot_id, 'stopped')
@@ -286,6 +334,7 @@ def toggle_bot(n_clicks, btn_id):
         update_bot_status(bot_id, 'running')
         return "Stop"
 
+
 @app.callback(
     Output('bots-trigger', 'data', allow_duplicate=True),
     Input({'type': 'delete', 'index': ALL}, 'n_clicks'),
@@ -294,7 +343,7 @@ def toggle_bot(n_clicks, btn_id):
     prevent_initial_call=True
 )
 def delete_bot_callback(n_clicks_list, ids_list, trigger):
-    ctx = dash.callback_context
+    ctx = callback_context
     if not ctx.triggered:
         return no_update
     triggered = ctx.triggered[0]['prop_id'].split('.')[0]
@@ -307,37 +356,168 @@ def delete_bot_callback(n_clicks_list, ids_list, trigger):
             return trigger + 1
     return no_update
 
-@app.callback(
-    Output({'type': 'graph', 'index': MATCH}, 'figure'),
-    Input('global-interval', 'n_intervals'),
-    State({'type': 'graph', 'index': MATCH}, 'id'),
-    State('relayout-store', 'data')
-)
-def update_graph(n, graph_id, relayout_store):
-    bot_id = graph_id['index']
-    logger.debug(f"Update_graph: n={n}, bot_id={bot_id}")
 
+# ---------- Inline editing (fixed callbacks) ----------
+
+@app.callback(
+    [Output('editing-bots', 'data', allow_duplicate=True),
+     Output('prev-edit-clicks', 'data')],
+    Input({'type': 'edit-btn', 'index': ALL}, 'n_clicks'),
+    State('editing-bots', 'data'),
+    State('prev-edit-clicks', 'data'),
+    prevent_initial_call=True
+)
+def enter_edit_mode(n_clicks_list, editing, prev_clicks):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update, no_update
+
+    # Initialize previous state
+    if not prev_clicks or len(prev_clicks) != len(n_clicks_list):
+        # On first run or when number of bots changes, just save current
+        return no_update, n_clicks_list
+
+    # Find index where value increased (real click)
+    for i, (cur, prev) in enumerate(zip(n_clicks_list, prev_clicks)):
+        if cur > prev:
+            # Found clicked button. Need to know its bot_id.
+            # Unfortunately, we cannot directly link index to component id.
+            # But we can get the list of button ids from context: they are in inputs_list.
+            # Use callback_context.inputs_list to access id.
+            # Get the id of the component that generated this n_clicks.
+            # But simpler: in render_bots buttons are generated in order of bot_id,
+            # and in get_all_bots() they are sorted by position, id.
+            # So the index corresponds to the order of bots in this list.
+            bots = get_all_bots()
+            if i < len(bots):
+                bot_id = str(bots[i]['id'])
+                editing = editing or {}
+                editing[bot_id] = True
+                return editing, n_clicks_list
+    # If no increase found, just update saved state
+    return no_update, n_clicks_list
+
+
+@app.callback(
+    [Output('editing-bots', 'data', allow_duplicate=True),
+     Output('bots-trigger', 'data', allow_duplicate=True)],
+    Input({'type': 'edit-save-btn', 'index': ALL}, 'n_clicks'),
+    [State({'type': 'edit-save-btn', 'index': ALL}, 'id'),
+     State({'type': ALL, 'field': ALL}, 'value'),
+     State({'type': ALL, 'field': ALL}, 'id'),
+     State('editing-bots', 'data'),
+     State('bots-trigger', 'data')],
+    prevent_initial_call=True
+)
+def save_editing(n_clicks_list, btn_ids, field_values, field_ids, editing, trigger):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update, no_update
+    triggered = ctx.triggered[0]
+    dict_str = triggered['prop_id'].split('.')[0]
+    btn_id = json.loads(dict_str)
+    bot_id = btn_id['index']
+
+    idx = None
+    for i, id_dict in enumerate(btn_ids):
+        if id_dict['index'] == bot_id and n_clicks_list[i]:
+            idx = i
+            break
+    if idx is None:
+        return no_update, no_update
+
+    new_fields = {}
+    for val, id_dict in zip(field_values, field_ids):
+        field = id_dict.get('field')
+        if field:
+            new_fields[field] = val
+    new_fields.pop('data_db_path', None)
+
+    old_config = get_bot_config(bot_id) or {}
     bots = get_all_bots()
     bot = next((b for b in bots if b['id'] == bot_id), None)
     if not bot:
-        logger.debug(f"Update_graph: bot {bot_id} not found in database")
-        return no_update
-    if bot['status'] != 'running':
-        logger.debug(f"Update_graph: bot {bot_id} status is '{bot['status']}', not running")
+        return no_update, no_update
+    bot_type = bot['type']
+    meta_cls = bot_registry.get_model(f"{bot_type}.type")
+
+    if meta_cls and hasattr(meta_cls, 'process_edit_save'):
+        config = meta_cls.process_edit_save(bot_id, new_fields, old_config)
+    else:
+        config = old_config.copy()
+        config.update(new_fields)
+
+    # Save config to bot's local DB
+    update_bot_config(bot_id, config)
+
+    # Notify bot about config change
+    if bot_id in bot_manager.bots:
+        bot_instance = bot_manager.bots[bot_id]
+        # Mark config as "dirty", the bot's loop will call on_config_updated() itself
+        bot_instance.config_dirty = True
+        # If bot is not running, update its config in memory so it's current on start
+        if not bot_instance.running:
+            bot_instance.config = config
+
+    # Notify bot about config change (without restart)
+    '''if bot_id in bot_manager.bots:
+        bot_instance = bot_manager.bots[bot_id]
+        bot_instance.config_dirty = True
+        future = asyncio.run_coroutine_threadsafe(
+            bot_instance.on_config_updated(), bot_manager.loop
+        )
+        try:
+            future.result(timeout=5)
+            # Reset flag so the bot's loop does not call the method again
+            bot_instance.config_dirty = False
+        except Exception as e:
+            logger.error(f"Error in on_config_updated for bot {bot_id}: {e}")'''
+
+    editing = editing or {}
+    editing.pop(str(bot_id), None)
+    return editing, trigger + 1
+
+@app.callback(
+    Output('editing-bots', 'data', allow_duplicate=True),
+    Input('bots-trigger', 'data'),
+    State('editing-bots', 'data'),
+    prevent_initial_call=True
+)
+def cleanup_editing_on_list_change(trigger, editing):
+    """Remove from editing-bots bots that are no longer in the system."""
+    if not editing:
+        return {}
+    bots = get_all_bots()
+    active_ids = {str(b['id']) for b in bots}
+    return {bid: v for bid, v in editing.items() if bid in active_ids}
+
+
+@app.callback(
+    Output('editing-bots', 'data', allow_duplicate=True),
+    Input({'type': 'edit-cancel-btn', 'index': ALL}, 'n_clicks'),
+    State('editing-bots', 'data'),
+    prevent_initial_call=True
+)
+def cancel_editing(n_clicks_list, editing):
+    ctx = callback_context
+    if not ctx.triggered:
         return no_update
 
-    config = get_bot_config(bot_id)
-    if not config:
-        logger.debug(f"Update_graph: no config for bot {bot_id}")
-        return no_update
-    if bot['type'] != 'collector':
-        logger.debug(f"Update_graph: bot {bot_id} is not collector (type={bot['type']})")
+    triggered = ctx.triggered[0]
+    # Check that it was a real click
+    if not triggered.get('value') or triggered['value'] <= 0:
         return no_update
 
-    from modules.collector.components import build_figure
-    fig = build_figure(bot_id, config, relayout_store)
-    logger.debug(f"Update_graph: built figure with {len(fig.data[0].x) if fig.data else 0} candles")
-    return fig
+    dict_str = triggered['prop_id'].split('.')[0]
+    btn_id = json.loads(dict_str)
+    bot_id = str(btn_id['index'])
+
+    editing = editing or {}
+    editing.pop(bot_id, None)
+    return editing
+
+
+# ---------- Settings ----------
 
 @app.callback(
     Output('settings-panel', 'children', allow_duplicate=True),
@@ -360,14 +540,16 @@ def save_settings(n_clicks, debug_val, log_levels, level_ids):
     save_setting('logging_settings', json.dumps(perf_logger.settings))
     return no_update
 
+
 @app.callback(
     Output('global-interval-debug', 'children'),
     Input('global-interval', 'n_intervals')
 )
 def debug_interval(n):
-    logger.debug(f"Global-interval fired: {n}")
     return f"Interval: {n}"
+
 
 if __name__ == '__main__':
     debug_mode = get_setting('debug_mode', 'False') == 'True'
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
     app.run(debug=debug_mode)
