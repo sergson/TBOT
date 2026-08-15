@@ -38,11 +38,11 @@ class PerformanceLogger:
 
         # Default settings – keys correspond to module_type passed to get_logger
         self.settings = {
-            'app_level': 'ERROR',
-            'collector_level': 'ERROR',
-            'fetcher_level': 'ERROR',
-            'database_level': 'ERROR',
-            'analytics_level': 'ERROR',
+            'app_level': 'DEBUG',
+            'collector_level': 'DEBUG',
+            'fetcher_level': 'DEBUG',
+            'database_level': 'DEBUG',
+            'analytics_level': 'DEBUG',
             'performance_log': True
         }
 

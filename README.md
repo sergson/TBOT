@@ -13,207 +13,173 @@ The core (`core/`) provides foundational services (database, logging, bot lifecy
 - **Separation of Concerns** — each module contains its own bot logic (`models.py`), UI components (`components.py`), and optional internal libraries.
 - **Dynamic Inter‑Bot Communication** — bots can expose their data capabilities and other bots can access them through a central exchange mechanism, without direct coupling.
 
----
-
 ## Project Structure
 
-```
-tbot/
-├── app.py                     # Dash entry point (universal UI core)
-├── config.db                  # Settings database (SQLite)
-├── data/                      # Market data databases
-│   └── bot_*.db
-├── core/                      # Foundation layer
-│   ├── __init__.py
-│   ├── registry.py            # Model registry and registration decorator
-│   ├── base_bot.py            # Abstract base class for all bots
-│   ├── exchange.py            # ExchangeHandle for inter-bot data access
-│   ├── loader.py              # Dynamic module discovery
-│   ├── bot_manager.py         # Bot lifecycle management & exchange orchestration
-│   ├── database.py            # Common DB functions (bots, settings)
-│   └── logger.py              # Configurable logging
-├── modules/                   # Plug-in modules
-│   └── collector/             # Example collector bot module
-│       ├── __init__.py
-│       ├── __manifest__.py    # Module metadata (optional)
-│       ├── models.py          # Bot class definition (inherits BaseBot)
-│       ├── components.py      # UI form, renderer, and type metadata
-│       └── lib/               # Module-specific utilities
-│           ├── fetcher.py
-│           └── universal_resolver.py
-├── logs/                      # Log files
-└── requirements.txt
-```
-
----
+    tbot/
+    ├── app.py                     # Dash entry point (universal UI core)
+    ├── config.db                  # Settings database (SQLite)
+    ├── data/                      # Market data databases
+    │   └── bot_*.db               # Per-bot database (config + runtime data)
+    ├── core/                      # Foundation layer
+    │   ├── __init__.py
+    │   ├── registry.py            # Model registry and registration decorator
+    │   ├── base_bot.py            # Abstract base class for all bots
+    │   ├── exchange.py            # ExchangeHandle for inter-bot data access
+    │   ├── loader.py              # Dynamic module discovery
+    │   ├── bot_manager.py         # Bot lifecycle management & exchange orchestration
+    │   ├── database.py            # Common DB functions (bots, settings)
+    │   └── logger.py              # Configurable logging
+    ├── modules/                   # Plug-in modules
+    │   ├── collector/             # Data collector bot module
+    │   │   ├── __init__.py
+    │   │   ├── models.py          # Bot class definition (inherits BaseBot)
+    │   │   ├── components.py      # UI form, renderer, and type metadata
+    │   │   └── lib/               # Module-specific utilities
+    │   │       ├── fetcher.py
+    │   │       └── universal_resolver.py
+    │   └── grid/                  # Grid trading bot module
+    │       ├── __init__.py
+    │       ├── models.py          # Grid bot logic
+    │       ├── components.py      # UI form, charts, and type metadata
+    │       └── lib/               # Optional internal helpers
+    ├── logs/                      # Log files
+    └── requirements.txt
 
 ## Settings Database (`config.db`)
 
 ### Table `bots` (General Information)
 
-| Field         | Type        | Description                                      |
-|---------------|-------------|--------------------------------------------------|
-| `id`          | INTEGER PK  | Unique bot identifier                            |
-| `type`        | TEXT        | Bot type identifier (e.g., `'collector'`)        |
-| `name`        | TEXT        | Display name                                     |
-| `status`      | TEXT        | `'running'` / `'stopped'`                        |
-| `position`    | INTEGER     | Sorting order in UI                              |
-| `created_at`  | TIMESTAMP   | Creation timestamp                               |
-| `config_data` | TEXT        | **JSON** with arbitrary configuration fields     |
+| Field       | Type       | Description                         |
+|-------------|------------|-------------------------------------|
+| `id`        | INTEGER PK | Unique bot identifier               |
+| `type`      | TEXT       | Bot type identifier (e.g., `collector`, `grid`) |
+| `name`      | TEXT       | Display name                        |
+| `status`    | TEXT       | `'running'` / `'stopped'`           |
+| `position`  | INTEGER    | Sorting order in UI                 |
+| `created_at`| TIMESTAMP  | Creation timestamp                  |
 
-### Type Configuration Tables (`config_<type>_type`)
-
-For each registered bot type, a separate table is created based on the schema defined in its metadata class. Example for the `collector` type:
-
-```sql
-CREATE TABLE config_collector_type (
-    bot_id INTEGER PRIMARY KEY,
-    exchange TEXT NOT NULL,
-    market_type TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    timeframe TEXT NOT NULL,
-    candles_limit INTEGER NOT NULL,
-    data_db_path TEXT NOT NULL,
-    FOREIGN KEY(bot_id) REFERENCES bots(id) ON DELETE CASCADE
-);
-```
-
-The table name and columns are derived from the `config_schema` attribute of the type metadata class.
+Each bot’s configuration is **not** stored in a separate type‑specific table. Instead, it is kept as JSON key‑value pairs in the bot’s own local SQLite database (`data/bot_<id>.db`) inside a table named `bot_settings`. This design keeps all data related to a single bot isolated and easily removable.
 
 ### Table `settings`
 
-| Field   | Type    | Description                    |
-|---------|---------|--------------------------------|
-| `key`   | TEXT PK | Setting key                    |
-| `value` | TEXT    | Value (often in JSON format)   |
+| Field   | Type     | Description                       |
+|---------|----------|-----------------------------------|
+| `key`   | TEXT PK  | Setting key                       |
+| `value` | TEXT     | Value (often in JSON format)      |
 
----
+### Per‑Bot Database (`data/bot_<id>.db`)
+
+Each bot instance has its own SQLite file. The common structure includes:
+
+- `bot_settings` – key‑value storage for the bot’s configuration.
+- Additional tables created by the bot’s own logic (e.g., a collector bot creates a table for candles; a grid bot creates `levels_signals`, `price_history`, `deals_history`, etc.).
+
+The path to this database is stored in the bot’s configuration under the key `data_db_path`.
 
 ## How to Add a New Bot Type
 
 1. **Create a module folder** under `modules/`, e.g., `modules/trader/`.
-2. **Add an `__init__.py`** that imports the module's components:
 
-    ```python
-    from . import models
-    from . import components
-    ```
+2. **Add an `__init__.py`** that imports the module’s components:
+
+       from . import models
+       from . import components
 
 3. **Define the bot class** in `models.py` using the `@auto_reg` decorator:
 
-    ```python
-    from core import auto_reg, BaseBot
+       from core import auto_reg, BaseBot
 
-    @auto_reg
-    class TraderBot(BaseBot):
-        _name = "trader.bot"
-        _inherit = "base.bot"
+       @auto_reg
+       class TraderBot(BaseBot):
+           _name = "trader.bot"
+           _inherit = "base.bot"
 
-        def __init__(self, bot_id, manager=None):
-            super().__init__(bot_id, manager)
-            # custom initialisation
+           def __init__(self, bot_id, manager=None):
+               super().__init__(bot_id, manager)
+               # custom initialisation
 
-        async def start(self):
-            # custom start logic
+           async def start(self):
+               # custom start logic
 
-        async def stop(self):
-            # custom stop logic
-    ```
+           async def stop(self):
+               # custom stop logic
 
-   The `_name` uniquely identifies this model. `_inherit` tells the registry that this class extends `base.bot`.
+   - `_name` must end with `.bot` – this uniquely identifies the bot model.
+   - `_inherit` points to the base class (usually `"base.bot"`).
 
-   **For bots that will consume data from others:** always accept and pass `manager` to the parent constructor (as shown above). **For bots that provide data:** implement `get_capabilities()` (see [Inter‑Bot Data Exchange](#inter-bot-data-exchange)).
+   If your bot will **consume** data from others, always accept and pass the `manager` argument to the parent constructor.  
+   If your bot will **provide** data, implement `get_capabilities()` (see Inter‑Bot Data Exchange).
 
 4. **Define the type metadata** in `components.py`:
 
-    ```python
-    from core import auto_reg
-    from dash import dcc, html
+       from core import auto_reg
+       from dash import dcc, html
 
-    CONFIG_SCHEMA = {
-        'exchange': 'TEXT NOT NULL',
-        'api_key': 'TEXT',
-        ...
-    }
+       def trader_form(current_bot_id=None):
+           # Return a Dash component representing the add/edit form
+           return html.Div([ ... ])
 
-    def trader_form():
-        return html.Div([ ... ])
+       def render_trader_block(bot_id, config, relayout_store):
+           # Return a Dash component to display the bot in the main UI
+           return html.Div(...)
 
-    def render_trader_block(bot_id, config, relayout_store):
-        return html.Div(...)
+       @auto_reg
+       class TraderTypeMeta:
+           _name = "trader.type"
+           display_name = "Trading Bot"
+           form_component = staticmethod(trader_form)
+           bot_model = "trader.bot"
+           render_block = staticmethod(render_trader_block)
 
-    @auto_reg
-    class TraderTypeMeta:
-        _name = "trader.type"
-        display_name = "Trading Bot"
-        form_component = staticmethod(trader_form)
-        config_schema = CONFIG_SCHEMA
-        bot_model = "trader.bot"
-        render_block = staticmethod(render_trader_block)
-    ```
-
-   - `_name` must end with `.type` – this is how the UI discovers available bot types.
+   - `_name` **must** end with `.type` – this is how the UI discovers available bot types.
    - `bot_model` points to the bot class name defined above.
+   - Optional methods that can be added:
+     - `prepare_new_config(raw_config)` – normalise/validate configuration before a new bot is created.
+     - `process_edit_save(bot_id, new_fields, old_config)` – process configuration changes during editing.
+     - `register_callbacks(app, bot_manager, loop)` – register custom Dash callbacks specific to this bot type.
 
-5. **Optionally add a manifest** `__manifest__.py` (for future dependency resolution):
-
-    ```json
-    {
-        "name": "Trader",
-        "version": "1.0",
-        "depends": [],
-        "author": "Your Name"
-    }
-    ```
-
-That's it! The loader will find the module at startup, the registry will build the final bot class (with all extensions applied), and the UI will automatically show "Trading Bot" in the type dropdown.
-
----
+5. **That’s it!** The loader will find the module at startup, the registry will build the final bot class (with all extensions applied), and the UI will automatically show "Trading Bot" in the type dropdown.
 
 ## Inter‑Bot Data Exchange
 
 ### Concept
 
-Bots can share data without any hardcoded imports or direct database access. Each bot declares **what** data it can provide (and optionally receive) by implementing `get_capabilities()`. A consumer bot describes **which** data it needs using a simple keyword mapping. The core framework then dynamically binds the two, handing the consumer an `ExchangeHandle` that works like a local data access object.
+Bots can share data without any hardcoded imports or direct database access. Each bot declares what data it can provide (and optionally receive) by implementing `get_capabilities()`. A consumer bot describes which data it needs using a simple keyword mapping. The core framework then dynamically binds the two, handing the consumer an `ExchangeHandle` that works like a local data access object.
 
 ### 1. Exposing Data (Provider Bot)
 
 Implement `get_capabilities()` in your bot class. Return a dictionary where each key is an internal name and the value contains:
 
 - `keywords` – a list of strings that other bots can use to request this data (e.g., `"candles"`, `"market_data"`).
-- `getter` – an **async callable** (usually a bound method) that returns the data. It may accept arguments (e.g., `limit`).
+- `getter` – an async callable (usually a bound method) that returns the data. It may accept arguments (e.g., `limit`).
 - `setter` – (optional) an async callable that receives data and stores it. Set to `None` if the data is read‑only.
 
-**Example from `CollectorBot`:**
+Example from `CollectorBot`:
 
-```python
-def get_capabilities(self):
-    return {
-        "ohlcv_data": {
-            "keywords": ["candles", "ohlcv", "quotes", "market_data"],
-            "getter": self._get_ohlcv_data,
-            "setter": None,
-        },
-        "symbol": {
-            "keywords": ["symbol", "pair", "ticker"],
-            "getter": self._get_symbol,
-            "setter": None,
+    def get_capabilities(self):
+        return {
+            "ohlcv_data": {
+                "keywords": ["candles", "ohlcv", "quotes", "market_data"],
+                "getter": self._get_ohlcv_data,
+                "setter": None,
+            },
+            "symbol": {
+                "keywords": ["symbol", "pair", "ticker"],
+                "getter": self._get_symbol,
+                "setter": None,
+            }
         }
-    }
-```
 
 The corresponding getter methods are standard async functions that access the bot’s private database or configuration:
 
-```python
-async def _get_ohlcv_data(self, limit=500):
-    # reads from SQLite and returns a list of dicts
-    ...
+    async def _get_ohlcv_data(self, limit=500):
+        # reads from SQLite and returns a list of dicts
+        ...
 
-async def _get_symbol(self):
-    return self.config['symbol']
-```
+    async def _get_symbol(self):
+        return self.config['symbol']
 
-> **Note:** Getters and setters must be **asynchronous**, even if they do not perform I/O internally (you can just return a value directly). This keeps the interface uniform and non‑blocking.
+> **Note:** Getters and setters must be asynchronous, even if they do not perform I/O internally (you can just return a value directly). This keeps the interface uniform and non‑blocking.
 
 ### 2. Consuming Data (Consumer Bot)
 
@@ -221,47 +187,39 @@ A bot that needs data from another bot obtains an `ExchangeHandle` during its st
 
 First, ensure your bot’s `__init__` accepts and passes the `manager` argument to `BaseBot`:
 
-```python
-class AnalyticsBot(BaseBot):
-    def __init__(self, bot_id, manager=None):
-        super().__init__(bot_id, manager)
-        ...
-```
+    class AnalyticsBot(BaseBot):
+        def __init__(self, bot_id, manager=None):
+            super().__init__(bot_id, manager)
+            ...
 
 Then, request the exchange (typically inside `start()`):
 
-```python
-async def start(self):
-    # Map my local names to the target’s keywords
-    mapping = {
-        "prices": ["candles", "ohlcv"],   # any keyword that matches the target's capability
-        "ticker": ["symbol", "pair"]
-    }
-    # setup_exchange caches the handle in self.dynamics[target_id]
-    await self.setup_exchange(target_bot_id=5, mapping=mapping)
-    self.running = True
-    # ... remaining start logic
-```
+    async def start(self):
+        # Map my local names to the target’s keywords
+        mapping = {
+            "prices": ["candles", "ohlcv"],   # any keyword that matches the target's capability
+            "ticker": ["symbol", "pair"]
+        }
+        # setup_exchange caches the handle in self.dynamics[target_id]
+        await self.setup_exchange(target_bot_id=5, mapping=mapping)
+        self.running = True
+        # ... remaining start logic
 
 Later, in your processing loop, use the handle to fetch data:
 
-```python
-handle = self.get_exchange(5)
-if handle:
-    candles = await handle.get("prices", limit=100)  # extra args are forwarded to the getter
-    symbol = await handle.get("ticker")
-    # ... perform analysis ...
-```
+    handle = self.get_exchange(5)
+    if handle:
+        candles = await handle.get("prices", limit=100)  # extra args are forwarded to the getter
+        symbol = await handle.get("ticker")
+        # ... perform analysis ...
 
 You can also pass arguments to `get()` if the provider’s getter accepts them. The `ExchangeHandle` will transparently call the provider’s method with those arguments.
 
 ### 3. Writing Data (Optional)
 
-If the target bot declares a `setter` for a capability, you can write data back:
+If the target bot declares a setter for a capability, you can write data back:
 
-```python
-await handle.set("local_name", new_data)
-```
+    await handle.set("local_name", new_data)
 
 The framework does not impose any structure on the data being written – it is up to the provider’s setter to validate and store it appropriately.
 
@@ -269,8 +227,6 @@ The framework does not impose any structure on the data being written – it is 
 
 - When a bot is stopped or removed, the `BotManager` automatically removes all `ExchangeHandle` references to that bot from other bots’ `dynamics`. You do not need to manually clean them.
 - In your own `stop()` method, always call `super().stop()` (or `self._cleanup_dynamics()`) to clear your own outgoing handles. This is not strictly required but considered good practice.
-
----
 
 ## Core Components
 
@@ -297,12 +253,12 @@ The framework does not impose any structure on the data being written – it is 
 - `ExchangeHandle` – a generic mediator object that holds references to getter and setter functions of a specific target bot.
 - Created by `BotManager.request_exchange()` and stored in the requester’s `dynamics`.
 - Usage by a consumer bot:
-  ```python
-  handle = self.get_exchange(target_bot_id)
-  data = await handle.get("local_name", optional_args...)
-  # if a setter was provided:
-  await handle.set("local_name", new_value)
-  ```
+
+      handle = self.get_exchange(target_bot_id)
+      data = await handle.get("local_name", optional_args...)
+      # if a setter was provided:
+      await handle.set("local_name", new_value)
+
 - The handle completely hides the data location and access details; the consumer only works with friendly local names defined during the exchange setup.
 
 ### `core/bot_manager.py`
@@ -320,8 +276,9 @@ The framework does not impose any structure on the data being written – it is 
 - Imports each package, triggering the registration of all decorated classes inside.
 
 ### `core/database.py`
-- Initialises `config.db` and creates tables for bots, settings, and type‑specific configuration (using schemas from registered type metadata).
-- Provides functions: `add_bot`, `get_all_bots`, `get_bot_config`, `update_bot_status`, `delete_bot`, `save_setting`, `get_setting`.
+- Initialises `config.db` and creates tables for `bots` and `settings`.
+- Provides functions: `add_bot`, `get_all_bots`, `get_bot_config`, `update_bot_status`, `delete_bot`, `save_setting`, `get_setting`, `cleanup_orphan_databases`.
+- Configuration is stored in each bot’s own SQLite database (`data/bot_<id>.db`) rather than in a centralised table.
 
 ### `core/logger.py`
 - Singleton `PerformanceLogger` with per‑module log levels.
@@ -333,25 +290,21 @@ The framework does not impose any structure on the data being written – it is 
 - Dynamically renders add forms and bot blocks using the functions provided by each type's metadata.
 - Manages global callbacks for adding, deleting, starting/stopping bots, and updating graphs.
 
----
-
 ## Extending Existing Bots
 
 To modify or add functionality to an existing bot (e.g., adding logging to all collectors), create a new module and define an extension class:
 
-```python
-# modules/collector_logger/models.py
-from core import auto_reg
+    # modules/collector_logger/models.py
+    from core import auto_reg
 
-@auto_reg
-class CollectorLoggerExtension:
-    _inherit = "collector.bot"
+    @auto_reg
+    class CollectorLoggerExtension:
+        _inherit = "collector.bot"
 
-    async def start(self):
-        print(f"[LOG] Starting collector {self.bot_id}")
-        await super().start()  # Calls the original collector.bot start() method
-        print(f"[LOG] Collector {self.bot_id} started")
-```
+        async def start(self):
+            print(f"[LOG] Starting collector {self.bot_id}")
+            await super().start()  # Calls the original collector.bot start() method
+            print(f"[LOG] Collector {self.bot_id} started")
 
 Because the registry merges this class with the original `collector.bot`, the final class will have the combined behaviour. The `super()` call works correctly, walking up the inheritance chain, so the original bot logic is preserved and extended.
 
@@ -359,58 +312,42 @@ Because the registry merges this class with the original `collector.bot`, the fi
 
 > **Note on capabilities in extensions:** If you extend a provider bot, your extension can override `get_capabilities()` to add, modify, or remove entries. Remember to call `super().get_capabilities()` if you want to preserve the original capabilities and just extend them.
 
----
-
 ## Installation and Running
 
 ### Using Conda (recommended)
 
-```bash
-conda create -n tbot python=3.10
-conda activate tbot
-pip install -r requirements.txt
-```
+    conda create -n tbot python=3.10
+    conda activate tbot
+    pip install -r requirements.txt
 
 ### Running
 
-```bash
-python app.py
-```
+    python app.py
 
 The application will be available at `http://127.0.0.1:8050`.
 
-### Configuration
+## Configuration
 
 - Click the ⚙️ button to toggle debug mode or change logging levels for different components.
 - Click ➕ to add a new bot — choose the type from the dropdown and fill in the generated form.
-
----
 
 ## Requirements
 
 The `requirements.txt` file should include:
 
-```
-dash
-plotly
-pandas
-ccxt
-aiohttp
-```
-
----
+    dash
+    plotly
+    pandas
+    ccxt
+    aiohttp
 
 ## Disclaimer
 
 **Risk Warning:** Trading cryptocurrencies and other digital assets involves significant risk and may result in the loss of your invested capital. This software is provided for educational and research purposes only. The author assumes no responsibility for any financial losses or damages incurred through the use of this software. Use at your own risk.
 
----
-
 ## Author
 
 Created and maintained by [sergson](https://github.com/sergson)
-
----
 
 ## License
 

@@ -20,6 +20,7 @@ class BaseBot(ABC):
         self.task = None
         self.manager = manager
         self.dynamics: Dict[int, Any] = {}
+        self.config_dirty = False
         # self.dynamics[target_bot_id] = ExchangeHandle
 
     @abstractmethod
@@ -56,3 +57,8 @@ class BaseBot(ABC):
 
     def _cleanup_dynamics(self):
         self.dynamics.clear()
+
+    async def on_config_updated(self):
+        """Called after configuration changes via the web interface.
+        Bots can override this method to immediately apply new settings."""
+        pass
