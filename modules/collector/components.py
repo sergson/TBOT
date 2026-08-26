@@ -4,14 +4,13 @@
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
 # This software is for educational purposes only. Use at your own risk.
 
-import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
-from core import auto_reg, bot_registry
-from core.database import get_bot_config, get_all_bots
+from plotly.subplots import make_subplots
+from core import auto_reg, bot_registry, colors, styles, graphics
+from core.database import get_bot_config, get_all_bots, DBSQLite3
 from core.logger import perf_logger
 from dash import dcc, html, Output, Input, State, MATCH, ALL, no_update, callback_context
-from plotly.subplots import make_subplots
 
 logger = perf_logger.get_logger('collector_module', 'collector')
 
@@ -93,63 +92,55 @@ def collector_form(current_bot_id=None):
 def build_figure(bot_id: int, config: dict, relayout_store: dict):
     db_path = config['data_db_path']
     table_name = config['symbol'].replace('/', '_').replace('-', '_')
-    try:
-        with sqlite3.connect(db_path) as conn:
-            cursor = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                (table_name,)
-            )
-            if cursor.fetchone() is None:
-                return go.Figure()
 
-            df = pd.read_sql_query(f'''
-                SELECT timestamp, open, high, low, close, volume
-                FROM {table_name}
-                ORDER BY timestamp ASC
-            ''', conn)
+    env = DBSQLite3(db_path)
+    try:
+        candle_manager = env.get_model_manager('collector.candle', table_name)
+        records = candle_manager.search([], order='timestamp ASC')
+        if not records:
+            return go.Figure()
+        data = records.read()
+        df = pd.DataFrame(data)
     except Exception as e:
         logger.error(f"build_figure: error reading DB for bot {bot_id}: {e}")
         return go.Figure()
+    finally:
+        env.close()
 
     if df.empty:
         return go.Figure()
 
-    df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ns', utc=True)
 
-    # Subplots: 2 rows, shared x-axis, top 70% height, bottom 30%
+    # Subplots: 2 rows, shared x-axis
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         vertical_spacing=0.02,
                         row_heights=[0.7, 0.3])
 
     # Candlestick (row 1)
-    fig.add_trace(go.Candlestick(
-        x=df['datetime'],
-        open=df['open'], high=df['high'], low=df['low'], close=df['close'],
-        name='Price'
-    ), row=1, col=1)
+    fig.add_trace(graphics.candlestick_trace(df), row=1, col=1)
 
     # Volume bars (row 2)
-    fig.add_trace(go.Bar(
-        x=df['datetime'], y=df['volume'],
-        name='Volume',
-        marker_color='lightblue'
-    ), row=2, col=1)
+    fig.add_trace(graphics.volume_bar_trace(df, color=colors.BLUE), row=2, col=1)
 
-    # Layout – remove range slider, enable uirevision to preserve zoom
-    fig.update_layout(
+    # Apply universal layout
+    graphics.apply_layout(
+        fig,
         title=f"Bot {bot_id}: {config['exchange']} {config['symbol']} ({config['market_type']})",
-        xaxis_rangeslider_visible=False,
-        uirevision='collector',          # key for preserving UI state
-        hovermode='x unified'
+        uirevision='collector',
+        show_rangeslider=False,
+        hovermode='x unified',
+        legend_bordercolor=None,
+        title_font_size=styles.FONT_SIZE_BOTHEADER
     )
 
-    # Axis labels
-    fig.update_xaxes(title_text="", row=1, col=1)        # hide on upper plot
+    # Override axis labels for subplots
+    fig.update_xaxes(title_text="", row=1, col=1)
     fig.update_xaxes(title_text="Time", row=2, col=1)
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
 
-    # Restore saved user changes (ranges, sizes)
+    # Restore saved user changes
     stored = relayout_store.get(str(bot_id))
     if stored and isinstance(stored, dict):
         try:
@@ -159,9 +150,10 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict):
 
     return fig
 
+
 # ---------- Render bot block in UI ----------
 def render_collector_block(bot_id: int, config: dict, relayout_store: dict):
-    graph_id = {'type': 'collector-graph', 'index': bot_id}   # unique type
+    graph_id = {'type': 'collector-graph', 'index': bot_id}
     status_button_id = {'type': 'status-btn', 'index': bot_id}
     delete_btn_id = {'type': 'delete', 'index': bot_id}
     edit_btn_id = {'type': 'edit-btn', 'index': bot_id}
@@ -175,22 +167,25 @@ def render_collector_block(bot_id: int, config: dict, relayout_store: dict):
         style={'height': '400px'}
     )
 
-    return html.Div([
+    title_text = f"#{bot_id} Collector Bot  ←  {config['exchange']} {config['symbol']} ({config['market_type']})"
+
+    return html.Details([
+        html.Summary(title_text,
+                     id={'type': 'collector-bot-header', 'index': bot_id},
+                     style=styles.bot_card_header_style(config.get('status'))),
         html.Div([
-            html.H3(f"{config['exchange']} {config['symbol']} ({config['market_type']})"),
             html.P(f"Timeframe: {config['timeframe']}, Storage: {config['candles_limit']} candles"),
             html.Button("Stop" if config.get('status') == 'running' else "Start",
                         id=status_button_id, n_clicks=0),
             html.Button("Edit", id=edit_btn_id, n_clicks=0),
             html.Button("Delete", id=delete_btn_id, n_clicks=0),
-        ]),
-        html.Hr(),
-        graph
-    ], id=f"bot-{bot_id}", style={'border': '1px solid black', 'padding': '10px', 'margin': '10px'})
+            html.Hr(),
+            graph
+        ])
+    ], open=True, style=styles.STYLE_BOTCARD)
 
-# ---------- Register bot type in registry (not in bot_registry, but in separate metadata storage) ----------
-# We can store type metadata in the class itself, but for Dash it's convenient to have a separate structure.
 
+# ---------- Register bot type in registry ----------
 logger.debug(f"Functions defined, about to define CollectorTypeMeta")
 
 @auto_reg
@@ -224,14 +219,25 @@ class CollectorTypeMeta:
                 return no_update
             return build_figure(bot_id, config, relayout_store)
 
+        @app.callback(
+            Output({'type': 'collector-bot-header', 'index': MATCH}, 'style'),
+            Input('global-interval', 'n_intervals'),
+            State({'type': 'collector-bot-header', 'index': MATCH}, 'id')
+        )
+        def update_header_style(n, header_id):
+            bot_id = header_id['index']
+            bots = get_all_bots()
+            bot = next((b for b in bots if b['id'] == bot_id), None)
+            if not bot:
+                return no_update
+            status = bot['status']
+            return styles.bot_card_header_style(status)
+
     @staticmethod
     def process_edit_save(bot_id, new_fields, old_config):
-        # Protection against path change
         new_fields.pop('data_db_path', None)
-        # Take only valid collector fields
         config = {k: v for k, v in old_config.items() if k in COLLECTOR_FIELDS}
         config.update(new_fields)
-        # Ensure data_db_path is present
         if 'data_db_path' not in config:
             config['data_db_path'] = f"data/bot_{bot_id}.db"
         config.pop('bot_type', None)

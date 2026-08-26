@@ -1,0 +1,114 @@
+/* Base styles for summary */
+#sticky-header summary {
+    font-size: 22px;
+    font-weight: bold;
+    text-align: center;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    line-height: 1.4;
+    transition: all 0.3s ease;
+    cursor: pointer;
+}
+
+/* Bot title */
+.bot-title {
+    display: inline-block;       /* MANDATORY */
+    transition: all 0.3s ease;
+}
+
+/* Collapsed state */
+#sticky-header details:not([open]) .bot-title {
+    transform: scaleY(0.5);
+    line-height: 1;
+}
+
+/* Do not compress summary itself, only change line-height */
+#sticky-header details:not([open]) summary {
+    line-height: 1;
+    transition: all 0.3s ease;
+}
+
+/* Indicator inherits styles */
+.header-indicator {
+    font: inherit;
+    font-size: 10px;
+    color: inherit;
+    margin-left: 0px;
+    display: inline-flex; /* Helps perfectly align the emoji vertically */
+    align-items: center;
+}
+
+/* Base CSS settings — STRICTLY fix grid width */
+.header-indicator::before {
+    font-family: ui-monospace, monospace; /* Monospace font required */
+    display: inline-block;
+    width: 4.5ch;          /* Strictly reserve space for 5 characters */
+    text-align: center;    /* Center the face within this space */
+    letter-spacing: -0.5px; /* Slightly tighten so special characters don't break */
+    white-space: nowrap;   /* Prevents line breaks inside this element */
+    display: inline-block; /* Ensures nowrap works correctly in some browsers */
+}
+
+/* When details is open */
+details[open] .header-indicator::before {
+    content: "[☉.☉]";
+}
+
+/* When details is closed */
+details:not([open]) .header-indicator::before {
+    content: "[◡.◡]";
+}
+
+
+/* Moods */
+details.mood-debug .header-indicator::before {
+    content: "[⚙.⚙]";
+}
+details.mood-info .header-indicator::before {
+    content: "[🛈.🛈]";
+}
+details.mood-warning .header-indicator::before {
+    content: "[⚠.⚠]";
+}
+details.mood-error .header-indicator::before {
+    content: "[✖.✖]";
+}
+details.mood-critical .header-indicator::before {
+    content: "[🗲.🗲]";
+}
+details.mood-happy .header-indicator::before {
+    content: "[★.★]";
+}
+details.mood-blink .header-indicator::before {
+    content: "[☉.—]";
+}
+details.mood-cancel .header-indicator::before {
+    content: "[⊘.⊘]";
+}
+details.mood-normal .header-indicator::before {
+    content: "[☉.☉]";
+}
+/* Add other moods as desired */
+
+/* Common styles for bot card summaries */
+#bots-container details > summary {
+    transition: all 0.3s ease;
+}
+
+/* Collapsed state of card */
+#bots-container details:not([open]) > summary {
+    line-height: 1;
+    transition: all 0.3s ease;
+    transform: scaleY(0.7);
+}
+
+/* Light green background */
+.bot-header-running {
+    background-color: #e8f5e9;
+}
+
+/* Light red background */
+.bot-header-stopped {
+    background-color: #ffebee;
+}

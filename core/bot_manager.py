@@ -148,6 +148,7 @@ class BotManager:
             if not bot.running:  # additional protection against double start
                 future = asyncio.run_coroutine_threadsafe(bot.start(), self.loop)
                 future.add_done_callback(self._on_bot_start_done)
+                perf_logger.set_mood('happy')
         else:
             logger.warning(f"Bot {bot_id} not found in manager or event loop not ready")
 
@@ -158,6 +159,7 @@ class BotManager:
                 future = asyncio.run_coroutine_threadsafe(bot.stop(), self.loop)
                 try:
                     future.result(timeout=5)
+                    perf_logger.set_mood('happy')
                 except Exception as e:
                     logger.error(f"Error stopping bot {bot_id}: {e}")
 

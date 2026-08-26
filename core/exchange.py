@@ -13,12 +13,6 @@ class ExchangeHandle:
         self._getters: Dict[str, Callable] = {}
         self._setters: Dict[str, Callable] = {}
 
-    def add_data_access(self, local_name: str, getter: Optional[Callable], setter: Optional[Callable]):
-        if getter is not None:
-            self._getters[local_name] = getter
-        if setter is not None:
-            self._setters[local_name] = setter
-
     async def get(self, data_name: str, *args, **kwargs) -> Any:
         if data_name not in self._getters:
             raise KeyError(f"No getter for '{data_name}' in exchange with bot {self.target_id}")
@@ -28,3 +22,10 @@ class ExchangeHandle:
         if data_name not in self._setters:
             raise KeyError(f"No setter for '{data_name}' in exchange with bot {self.target_id}")
         await self._setters[data_name](value)
+
+    # Helper method for add data getter or data setter into ExchangeHandle used in bot_manager_request_exchange
+    def add_data_access(self, local_name: str, getter: Optional[Callable], setter: Optional[Callable]):
+        if getter is not None:
+            self._getters[local_name] = getter
+        if setter is not None:
+            self._setters[local_name] = setter

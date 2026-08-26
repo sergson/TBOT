@@ -11,10 +11,28 @@ import logging
 import os
 from datetime import datetime
 import json
-
+import queue
+import time
 
 class PerformanceLogger:
     """Performance logger with configurable levels"""
+
+    class MoodLogHandler(logging.Handler):
+        def __init__(self, perf_logger_instance):
+            super().__init__()
+            self.perf_logger_instance = perf_logger_instance
+            self.level_mood_map = {
+                logging.DEBUG: 'debug',
+                logging.INFO: 'info',
+                logging.WARNING: 'warning',
+                logging.ERROR: 'error',
+                logging.CRITICAL: 'critical',
+            }
+
+        def emit(self, record):
+            mood = self.level_mood_map.get(record.levelno)
+            if mood:
+                self.perf_logger_instance.set_mood(mood)
 
     _instance = None
 
@@ -32,17 +50,21 @@ class PerformanceLogger:
         self._loggers = {}
         self._log_dir = "logs"
         self._default_level = logging.DEBUG
+        self.mood_queue = queue.Queue()
+        self._last_mood = None
+        self._last_mood_time = 0
+        self.mood_handler = self.MoodLogHandler(self)
 
         # Create logs directory
         os.makedirs(self._log_dir, exist_ok=True)
 
         # Default settings – keys correspond to module_type passed to get_logger
         self.settings = {
-            'app_level': 'DEBUG',
-            'collector_level': 'DEBUG',
-            'fetcher_level': 'DEBUG',
-            'database_level': 'DEBUG',
-            'analytics_level': 'DEBUG',
+            'app_level': 'ERROR',
+            'collector_level': 'ERROR',
+            'fetcher_level': 'ERROR',
+            'database_level': 'ERROR',
+            'analytics_level': 'ERROR',
             'performance_log': True
         }
 
@@ -76,6 +98,8 @@ class PerformanceLogger:
             logger.setLevel(log_level)
             for handler in logger.handlers:
                 handler.setLevel(log_level)
+            if self.mood_handler not in logger.handlers:
+                logger.addHandler(self.mood_handler)
 
     def setup_logger(self, name: str, log_file: str, level: str = 'INFO'):
         """Configure a logger"""
@@ -108,6 +132,7 @@ class PerformanceLogger:
 
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
+        logger.addHandler(self.mood_handler)
 
         self._loggers[name] = logger
         return logger
@@ -164,6 +189,56 @@ class PerformanceLogger:
         except Exception as e:
             print(f"⚠ Error loading logging settings: {e}")
 
+    def set_mood(self, mood: str):
+        """Places a mood into the queue, ignoring consecutive duplicates."""
+        current_time = time.time()
+        # Ignore if the same mood was added less than 1 second ago
+        if mood == self._last_mood and (current_time - self._last_mood_time) < 1.0:
+            return
+        self.mood_queue.put(mood)
+        self._last_mood = mood
+        self._last_mood_time = current_time
+
+    def get_pending_mood(self) -> str | None:
+        """Retrieves one mood from the queue (if any)."""
+        try:
+            return self.mood_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def get_recent_logs(self, module_type: str = 'app', n_lines: int = 20) -> list:
+        """
+        Returns the last n_lines lines from the log file(s).
+        If module_type == 'all', reads all files *_YYYYMMDD.log in the logs directory.
+        """
+        if module_type == 'all':
+            today_str = datetime.now().strftime('%Y%m%d')
+            all_lines = []
+            for filename in os.listdir(self._log_dir):
+                if filename.endswith(f'_{today_str}.log'):
+                    filepath = os.path.join(self._log_dir, filename)
+                    try:
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            all_lines.extend([line.rstrip('\n') for line in f.readlines()])
+                    except Exception:
+                        continue
+            # sort by time (if needed)
+            import re
+            def extract_time(line):
+                m = re.match(r'(\d{2}:\d{2}:\d{2}\.\d{3})', line)
+                return m.group(1) if m else ''
+
+            all_lines.sort(key=extract_time)
+            return all_lines[-n_lines:] if all_lines else ["No log entries yet"]
+        else:
+            log_file = f"{module_type}_{datetime.now().strftime('%Y%m%d')}.log"
+            log_path = os.path.join(self._log_dir, log_file)
+            try:
+                with open(log_path, 'r', encoding='utf-8') as f:
+                    lines = [line.rstrip('\n') for line in f.readlines()]
+                return lines[-n_lines:] if lines else ["No log entries yet"]
+            except FileNotFoundError:
+                return [f"Log file {log_file} not found"]
 
 # Singleton instance
 perf_logger = PerformanceLogger()
