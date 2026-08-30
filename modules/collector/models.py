@@ -5,9 +5,14 @@
 # This software is for educational purposes only. Use at your own risk.
 
 import asyncio
-import sqlite3
+import time
+from typing import Dict, Any
+
 from core import auto_reg, BaseBot
-from core.database import get_bot_config, update_bot_status
+from core.database import (
+    Model, Integer, Float, Char,
+    get_bot_config, update_bot_status
+)
 from core.logger import perf_logger
 from .lib.fetcher import AsyncExchangeFetcher
 
@@ -19,6 +24,22 @@ def timeframe_to_seconds(tf: str) -> int:
     elif unit == 'd': return value * 86400
     else: raise ValueError(f"Unsupported timeframe: {tf}")
 
+# ----------------------------------------------------------------------
+# Dynamic model for OHLCV candles
+# ----------------------------------------------------------------------
+class Candle(Model):
+    _name = 'collector.candle'
+    _table = None          # table name is dynamic, based on symbol
+    _dynamic = True        # instruct the metaclass not to auto-generate table name
+
+    timestamp = Integer(primary_key=True, required=True)
+    open = Float()
+    high = Float()
+    low = Float()
+    close = Float()
+    volume = Float()
+
+# ----------------------------------------------------------------------
 @auto_reg
 class CollectorBot(BaseBot):
     _name = "collector.bot"
@@ -29,24 +50,21 @@ class CollectorBot(BaseBot):
         self.config = get_bot_config(bot_id)
         self.logger = perf_logger.get_logger(f'collector_{bot_id}', 'collector')
         self.fetcher = None
-        self._init_db()
         self.initial_load_done = False
 
-    def _init_db(self):
-        """Creates a table in DB if it doesn't exist."""
-        db_path = self.config['data_db_path']
-        symbol = self.config['symbol']
-        table_name = symbol.replace('/', '_').replace('-', '_')
         try:
-            with sqlite3.connect(db_path) as conn:
-                conn.execute(f'''
-                    CREATE TABLE IF NOT EXISTS {table_name} (
-                        timestamp INTEGER PRIMARY KEY,
-                        open REAL, high REAL, low REAL, close REAL, volume REAL
-                    )
-                ''')
+            self._get_candle_manager()
         except Exception as e:
-            self.logger.error(f"Failed to create table {table_name}: {e}")
+            # The table will be created at startup if it failed now
+            self.logger.warning(f"Could not create candle table on init: {e}")
+
+    def _get_candle_manager(self):
+        """Return ORM manager for the current symbol's candle table."""
+        symbol = self.config.get('symbol')
+        if not symbol:
+            raise ValueError("Symbol not set")
+        table_name = symbol.replace('/', '_').replace('-', '_')
+        return self.env.get_model_manager('collector.candle', table_name)
 
     async def start(self):
         if self.running:
@@ -55,10 +73,6 @@ class CollectorBot(BaseBot):
         self.task = asyncio.create_task(self._run())
         update_bot_status(self.bot_id, 'running')
         self.logger.info(f"Bot {self.bot_id} started, status updated to 'running'")
-        # Verify that status actually updated
-        from core.database import get_bot_config
-        cfg = get_bot_config(self.bot_id, include_status=True)
-        self.logger.info(f"Status in DB after update: {cfg.get('status')}")
 
     async def stop(self):
         self.running = False
@@ -77,14 +91,11 @@ class CollectorBot(BaseBot):
         self.logger.info(f"Collector bot {self.bot_id} starting with config: {self.config}")
 
         while self.running:
-            # If config changed, on_config_updated already reset everything
             if self.config_dirty:
                 await self.on_config_updated()
                 self.config_dirty = False
-                # After config update, continue the loop – new parameters are already in self.config
                 continue
 
-            # Initialize fetcher if absent (first run or after reset)
             if not self.fetcher:
                 try:
                     self.fetcher = AsyncExchangeFetcher(self.config['exchange'], self.config['market_type'])
@@ -94,36 +105,23 @@ class CollectorBot(BaseBot):
                     await self.stop()
                     return
 
-            # Current working parameters (always taken from self.config)
-            db_path = self.config['data_db_path']
             symbol = self.config['symbol']
-            table_name = symbol.replace('/', '_').replace('-', '_')
             timeframe = self.config['timeframe']
             candles_limit = self.config['candles_limit']
             fetch_interval = timeframe_to_seconds(timeframe)
 
-            # Ensure the table exists (in case it wasn't created)
-            with sqlite3.connect(db_path) as conn:
-                conn.execute(f'''
-                    CREATE TABLE IF NOT EXISTS {table_name} (
-                        timestamp INTEGER PRIMARY KEY,
-                        open REAL, high REAL, low REAL, close REAL, volume REAL
-                    )
-                ''')
+            candle_manager = self._get_candle_manager()
 
             try:
-                # Initial history load if not done yet
+                # Initial history load
                 if not self.initial_load_done:
-                    with sqlite3.connect(db_path) as conn:
-                        cur = conn.execute(f'SELECT COUNT(*) FROM {table_name}')
-                        count = cur.fetchone()[0]
+                    count = candle_manager.search_count([])
                     if count < candles_limit:
                         self.logger.info(f"Initial history load: {candles_limit} candles")
                         df = await self.fetcher.fetch_ohlcv(symbol, timeframe=timeframe, limit=candles_limit)
-                        self.initial_load_done = True
                     else:
-                        self.initial_load_done = True
                         df = await self.fetcher.fetch_ohlcv(symbol, timeframe=timeframe, limit=5)
+                    self.initial_load_done = True
                 else:
                     df = await self.fetcher.fetch_ohlcv(symbol, timeframe=timeframe, limit=5)
 
@@ -131,31 +129,40 @@ class CollectorBot(BaseBot):
                     await asyncio.sleep(fetch_interval)
                     continue
 
-                with sqlite3.connect(db_path) as conn:
-                    cur = conn.execute(f'SELECT MAX(timestamp) FROM {table_name}')
-                    last_ts = cur.fetchone()[0] or 0
-                    ts_sec = (df['timestamp'].astype('int64') // 10 ** 9).astype(int)
-                    new_mask = ts_sec > last_ts
-                    new_candles = df[new_mask].copy()
-                    if not new_candles.empty:
-                        new_candles['timestamp_sec'] = ts_sec[new_mask]
-                        data = new_candles[['timestamp_sec', 'open', 'high', 'low', 'close', 'volume']].values.tolist()
-                        conn.executemany(
-                            f'INSERT OR IGNORE INTO {table_name} (timestamp, open, high, low, close, volume) VALUES (?,?,?,?,?,?)',
-                            data
-                        )
-                        cur = conn.execute(f'SELECT COUNT(*) FROM {table_name}')
-                        count = cur.fetchone()[0]
-                        if count > candles_limit * 1.1:
-                            conn.execute(f'''
-                                DELETE FROM {table_name} WHERE timestamp < (
-                                    SELECT MIN(timestamp) FROM (
-                                        SELECT timestamp FROM {table_name} ORDER BY timestamp DESC LIMIT ?
-                                    )
-                                )
-                            ''', (candles_limit,))
-                        conn.commit()
-                        self.logger.info(f"Inserted {len(data)} new candles")
+                # Precompute nanosecond array for all rows
+                ts_ns = df['timestamp'].astype('int64')  # int64 nanoseconds
+                for idx, row in df.iterrows():
+                    ts = int(ts_ns[idx])  # nanoseconds
+                    existing = candle_manager.search([('timestamp', '=', ts)], limit=1)
+                    if existing:
+                        existing[0].write({
+                            'open': row['open'],
+                            'high': row['high'],
+                            'low': row['low'],
+                            'close': row['close'],
+                            'volume': row['volume']
+                        })
+                    else:
+                        candle_manager.create([{
+                            'timestamp': ts,
+                            'open': row['open'],
+                            'high': row['high'],
+                            'low': row['low'],
+                            'close': row['close'],
+                            'volume': row['volume']
+                        }])
+
+                # Enforce candle limit
+                count = candle_manager.search_count([])
+                if count > candles_limit * 1.1:
+                    # Get oldest timestamp to keep
+                    last_records = candle_manager.search([], order='timestamp DESC', limit=candles_limit)
+                    if last_records:
+                        min_ts = last_records[-1].timestamp
+                        old_records = candle_manager.search([('timestamp', '<', min_ts)])
+                        old_records.unlink()
+
+                self.logger.info(f"Processed candles for {symbol}")
             except Exception as e:
                 self.logger.error(f"Error in collector loop: {e}", exc_info=True)
 
@@ -177,6 +184,9 @@ class CollectorBot(BaseBot):
 
     async def on_config_updated(self):
         """Reload history and parameters after settings change."""
+        old_symbol = self.config.get('symbol')
+        old_table_name = old_symbol.replace('/', '_').replace('-', '_') if old_symbol else None
+
         # Update config from DB
         self.config = get_bot_config(self.bot_id)
 
@@ -186,39 +196,25 @@ class CollectorBot(BaseBot):
             self.fetcher = None
 
         # Reset initial load flag
-        self.initial_load_done = False  # need to add this attribute in __init__
+        self.initial_load_done = False
 
-        # Delete table with old candles
-        db_path = self.config.get('data_db_path')
-        symbol = self.config.get('symbol')
-        if db_path and symbol:
-            table_name = symbol.replace('/', '_').replace('-', '_')
-            try:
-                with sqlite3.connect(db_path) as conn:
-                    conn.execute(f'DROP TABLE IF EXISTS {table_name}')
-                self.logger.info(f"Table {table_name} dropped for fresh history reload")
-            except Exception as e:
-                self.logger.error(f"Failed to drop table: {e}")
+        # Drop old candle table if symbol changed
+        if old_table_name:
+            self.env.drop_table(old_table_name)
+            self.logger.info(f"Dropped old table {old_table_name}")
 
-    async def _get_ohlcv_data(self, limit: int = 500):
+        # The new table will be created when _get_candle_manager is called in _run
+
+    async def _get_ohlcv_data(self, limit=500):
         """Returns the last limit candles as a list of dictionaries."""
-        db_path = self.config['data_db_path']
-        table_name = self.config['symbol'].replace('/', '_').replace('-', '_')
-        loop = asyncio.get_running_loop()
-
-        def query():
-            with sqlite3.connect(db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                cur = conn.execute(
-                    f"SELECT * FROM {table_name} ORDER BY timestamp DESC LIMIT ?",
-                    (limit,)
-                )
-                return [dict(row) for row in cur.fetchall()]
-
-        return await loop.run_in_executor(None, query)
+        candle_manager = self._get_candle_manager()
+        records = candle_manager.search([], order='timestamp DESC', limit=limit)
+        # Convert records to list of dicts
+        return records.read()
 
     async def _get_symbol(self):
         return self.config['symbol']
 
     def _close_db(self):
-        pass
+        if hasattr(self, 'env'):
+            self.env.close()

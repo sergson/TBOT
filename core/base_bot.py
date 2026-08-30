@@ -6,8 +6,9 @@
 
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
-from .registry import auto_reg
 import asyncio
+from .registry import auto_reg
+from .database import DBSQLite3, MODEL_REGISTRY
 
 @auto_reg
 class BaseBot(ABC):
@@ -21,7 +22,13 @@ class BaseBot(ABC):
         self.manager = manager
         self.dynamics: Dict[int, Any] = {}
         self.config_dirty = False
-        # self.dynamics[target_bot_id] = ExchangeHandle
+        self.db_path = f"data/bot_{bot_id}.db"
+
+        # Initialize ORM environment
+        self.env = DBSQLite3(self.db_path, registry=MODEL_REGISTRY)
+
+        # Explicitly initialize the settings table (created on first access)
+        _ = self.env['bot.settings']
 
     @abstractmethod
     async def start(self):
@@ -35,16 +42,7 @@ class BaseBot(ABC):
 
     @abstractmethod
     def get_capabilities(self) -> Dict[str, Dict]:
-        """
-        Returns a description of the available data.:
-        {
-            "internal_name": {
-                "keywords": ["list", "key", "words"],
-                "getter": callable,   # async callable
-                "setter": callable,   # async callable (or None)
-            }
-        }
-        """
+        """Return capabilities."""
         pass
 
     async def setup_exchange(self, target_bot_id: int, mapping: dict) -> 'ExchangeHandle':
@@ -59,6 +57,5 @@ class BaseBot(ABC):
         self.dynamics.clear()
 
     async def on_config_updated(self):
-        """Called after configuration changes via the web interface.
-        Bots can override this method to immediately apply new settings."""
+        """Called after configuration changes via the web interface."""
         pass
