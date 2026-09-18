@@ -1,4 +1,8 @@
 # core/graphics.py
+# Copyright (c) 2026 sergson (https://github.com/sergson)
+# Licensed under GNU General Public License v3.0
+# DISCLAIMER: Trading cryptocurrencies involves significant risk.
+# This software is for educational purposes only. Use at your own risk.
 """
 Atomic Plotly graphic element factories.
 Uses colors from core.colors and styles from core.styles.

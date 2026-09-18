@@ -70,6 +70,15 @@ def prepare_config_for_save(raw_config: dict) -> dict:
     if cleaned.get('smart_averaging_count') > cleaned.get('max_averaging_count'):
         cleaned['smart_averaging_count'] = cleaned['max_averaging_count']
 
+    if 'execution_reserve_ratio' in cleaned:
+        ratio = float(cleaned.pop('execution_reserve_ratio'))
+        timeout = int(cleaned.get('execution_timeout_sec', 0))
+        if timeout > 0:
+            # rounding to whole seconds
+            cleaned['execution_reserve_sec'] = int(timeout * ratio)
+        else:
+            cleaned['execution_reserve_sec'] = 0
+
     cleaned.pop('bot_type', None)
     return cleaned
 
@@ -103,6 +112,7 @@ def form_component(current_bot_id=None):
     execution_timeout_sec = 0
     recalc_strategy = "recalc_grid"
     execution_reserve_sec = 30
+    execution_reserve_ratio = 0.1
 
     editing = current_bot_id is not None
     cfg = {}
@@ -124,7 +134,14 @@ def form_component(current_bot_id=None):
             poll_interval_sec = cfg.get('poll_interval_sec', poll_interval_sec)
             execution_timeout_sec = cfg.get('execution_timeout_sec', execution_timeout_sec)
             recalc_strategy = cfg.get('recalc_strategy', recalc_strategy)
-            execution_reserve_sec = cfg.get('execution_reserve_sec', execution_reserve_sec)
+            execution_reserve_sec = cfg.get('execution_reserve_sec', 0)
+            if execution_timeout_sec > 0:
+                ratio = execution_reserve_sec / execution_timeout_sec
+                # choose the closest allowed fraction
+                available_ratios = [0.1, 1 / 7, 1 / 3, 0.5]
+                execution_reserve_ratio = min(available_ratios, key=lambda x: abs(x - ratio))
+            else:
+                execution_reserve_ratio = 0.1
 
     if editing:
         liquidation_order_type = cfg.get('liquidation_order_type', 'market')
@@ -195,7 +212,7 @@ def form_component(current_bot_id=None):
             ],
             value=liquidation_order_type,
         ),
-        html.Label("Interval between signal condition checks (seconds)"),
+        html.Label("Interval between checks of signal generation conditions, main cycle pause (seconds)"),
         dcc.Input(id={"type": "grid-field", "field": "poll_interval_sec"}, type="number", value=poll_interval_sec, min=10, max=3600),
         html.Label("Signal lifetime; after this time unexecuted signal triggers recalculation strategy (seconds)"),
         dcc.Input(id={"type": "grid-field", "field": "execution_timeout_sec"}, type="number", value=execution_timeout_sec, min=0, max=3600),
@@ -209,8 +226,18 @@ def form_component(current_bot_id=None):
             ],
             value=recalc_strategy,
         ),
-        html.Label("Seconds to anticipate the level crossing (price extrapolation)"),
-        dcc.Input(id={"type": "grid-field", "field": "execution_reserve_sec"}, type="number", value=execution_reserve_sec, min=0, max=3600),
+        html.Label("Anticipation ratio (fraction of execution_timeout_sec)"),
+        dcc.Dropdown(
+            id={"type": "grid-field", "field": "execution_reserve_ratio"},
+            options=[
+                {"label": "1/10", "value": 1 / 10},
+                {"label": "1/7", "value": 1 / 7},
+                {"label": "1/3", "value": 1 / 3},
+                {"label": "1/2", "value": 1 / 2},
+            ],
+            value=execution_reserve_ratio,
+            clearable=False,
+        ),
     ])
 
 # ----------------------------------------------------------------------

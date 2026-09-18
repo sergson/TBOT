@@ -241,6 +241,9 @@ class Record:
         self._manager.unlink_records([self])
     def read(self, fields=None):
         return self._manager.read_records([self], fields)[0]
+    def refresh(self):
+        new_data = self._manager.read_records([self])[0]
+        self._data.update(new_data)
 
 
 class Recordset:

@@ -5,12 +5,8 @@
 # This software is for educational purposes only. Use at your own risk.
 
 import asyncio
-import time
-import math
-import os
 import uuid
-import json
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, List
 
 from core import auto_reg, BaseBot
 from core.database import (
@@ -22,7 +18,7 @@ from core.logger import perf_logger
 logger = perf_logger.get_logger('grid_bot', 'analytics')
 
 # ----------------------------------------------------------------------
-# Helper functions (unchanged)
+# Helper functions
 # ----------------------------------------------------------------------
 def timeframe_to_seconds(tf: str) -> int:
     unit = tf[-1]
@@ -35,7 +31,7 @@ def timeframe_to_seconds(tf: str) -> int:
 def linear_extrapolate_price(prices: List[float], timestamps: List[float], future_sec: float) -> float:
     if len(prices) < 2:
         return prices[-1] if prices else 0.0
-    dt = timestamps[-1] - timestamps[-2]
+    dt = (timestamps[-1] - timestamps[-2])/ 1_000_000_000
     if dt == 0:
         return prices[-1]
     slope = (prices[-1] - prices[-2]) / dt
@@ -67,7 +63,7 @@ class LevelsSignals(Model):
     position_id = Char(required=True, index=True)
     signal_number = Integer(required=True)
     current_price = Float()
-    current_timestamp = Float()
+    current_timestamp = Integer()
     signal_volume_rates = Json()
     signal_direction = Selection([('buy','Buy'),('sell','Sell'),('close','Close'),('liquidation','Liquidation')])
     signal_vol_rate = Float()
@@ -80,10 +76,10 @@ class LevelsSignals(Model):
     position_cost = Float()
     signal_pnl = Float()
     signal_flag = Boolean(default=False)
-    signal_timestamp = Float()
+    signal_timestamp = Integer()
     signal_smart = Boolean(default=False)
     signal_smart_reversed = Integer(default=0)
-    real_timestamp = Float()
+    real_timestamp = Integer()
     real_vol_rate = Float()
     real_price = Float()
     real_pnl = Float()
@@ -100,7 +96,7 @@ class DealsHistory(Model):
     position_id = Char(index=True)
     signal_number = Integer()
     current_price = Float()
-    current_timestamp = Float()
+    current_timestamp = Integer()
     signal_volume_rates = Json()
     signal_direction = Selection([('buy','Buy'),('sell','Sell'),('close','Close'),('liquidation','Liquidation')])
     signal_vol_rate = Float()
@@ -113,17 +109,17 @@ class DealsHistory(Model):
     position_cost = Float()
     signal_pnl = Float()
     signal_flag = Boolean(default=False)
-    signal_timestamp = Float()
+    signal_timestamp = Integer()
     signal_smart = Boolean(default=False)
     signal_smart_reversed = Integer(default=0)
-    real_timestamp = Float()
+    real_timestamp = Integer()
     real_vol_rate = Float()
     real_price = Float()
     real_pnl = Float()
     real_position_volume = Float()
     real_flag = Boolean(default=False)
     real_avg_entry_price = Float()
-    moved_to_history_at = Float()
+    moved_to_history_at =Integer()
     created_at = Char(default="CURRENT_TIMESTAMP")
 
 class PriceHistory(Model):
@@ -188,6 +184,11 @@ class GridBot(BaseBot):
                 "getter": self._get_signals_by_position,
                 "setter": None,
             },
+            "timeout": {
+                "keywords": ["execution_timeout"],
+                "getter": self._get_timeout,
+                "setter": None,
+            },
         }
 
     # ------------------------------------------------------------------
@@ -204,7 +205,7 @@ class GridBot(BaseBot):
         signal_number = data.get("signal_number")
         signal_ts = data.get("signal_timestamp")
         real_price = data.get("real_price", 0.0)
-        real_timestamp = data.get("real_timestamp", time.time())
+        real_timestamp = data.get("real_timestamp", self.get_time_ns())
 
         if signal_number is None or signal_ts is None:
             return
@@ -264,6 +265,8 @@ class GridBot(BaseBot):
         historical = self.env['deals.history'].search([('position_id', '=', position_id)]).read()
         return active + historical
 
+    async def _get_timeout(self):
+        return self.config.get('execution_timeout_sec', 0)
     # ------------------------------------------------------------------
     # Price history update (converted)
     # ------------------------------------------------------------------
@@ -497,7 +500,7 @@ class GridBot(BaseBot):
                 'position_id': self._position_id,
                 'signal_number': n,
                 'current_price': self._last_price or None,
-                'current_timestamp': time.time(),
+                'current_timestamp': self.get_time_ns(),
                 'signal_volume_rates': volumes[:n],
                 'signal_direction': direction_str,
                 'signal_vol_rate': vol,
@@ -533,17 +536,38 @@ class GridBot(BaseBot):
         if not self._price_history:
             return
         current_price = self._price_history[-1][1]
-        current_ts = self._price_history[-1][0]
         cfg = self.config
         lev = cfg['leverage']
         reserve_sec = cfg['execution_reserve_sec']
         timeout_sec = cfg['execution_timeout_sec']
         recalc_strategy = cfg['recalc_strategy']
 
-        Level = self.env['levels.signals']
+        # --- Adaptive selection of reference time ---
+        candle_ts = self._price_history[-1][0]
+        try:
+            precise_now = self.get_time_ns()
+        except Exception as e:
+            precise_now = None
+            self.logger.warning(f"Error retrieving the bot kernel's precise time: {e}")
+        if precise_now  is not None:
+            poll_ns = int(self.config.get('poll_interval_sec', 60) * 1_000_000_000)
+            timeout_ns = int(timeout_sec * 1_000_000_000) if timeout_sec > 0 else poll_ns
+            min_interval_ns = min(poll_ns, timeout_ns)
+            threshold_ns = max(min_interval_ns // 100, 1)  # 1/100 of the minimum interval
+
+            diff_ns = precise_now   - candle_ts
+            if 0 <= diff_ns <= threshold_ns:
+                current_ts = candle_ts  # fresh candle — use its time
+            else:
+                current_ts = precise_now  # candle is stale — take precise time
+        else:
+            current_ts = candle_ts  # fallback to candle time
+        # ---------------------------------------------------
+
+        level = self.env['levels.signals']
 
         # entry check
-        entry_rec = Level.search([('position_id', '=', self._position_id), ('signal_number', '=', 0)], limit=1)
+        entry_rec = level.search([('position_id', '=', self._position_id), ('signal_number', '=', 0)], limit=1)
         if not entry_rec:
             self._need_new_position = True
             return
@@ -562,7 +586,7 @@ class GridBot(BaseBot):
         pnl = sign * (current_price / effective_avg - 1) * lev * 100
 
         # Liquidation
-        existing_liq = Level.search([
+        existing_liq = level.search([
             ('position_id', '=', self._position_id),
             ('signal_number', '=', -1),
             ('signal_flag', '=', True),
@@ -570,7 +594,7 @@ class GridBot(BaseBot):
         ], limit=1)
         if not existing_liq and pnl <= -cfg['liquidation_pnl']:
             total_vol = effective_vol
-            vol_rates_row = Level.search([
+            vol_rates_row = level.search([
                 ('position_id', '=', self._position_id),
                 ('real_flag', '=', True)
             ], order='signal_number DESC', limit=1)
@@ -600,7 +624,7 @@ class GridBot(BaseBot):
             return
 
         # Close
-        existing_close = Level.search([
+        existing_close = level.search([
             ('position_id', '=', self._position_id),
             ('signal_number', '=', -2),
             ('signal_flag', '=', True),
@@ -614,7 +638,7 @@ class GridBot(BaseBot):
                     return
             if pnl >= cfg['close_pnl']:
                 total_vol = effective_vol
-                vol_rates_row = Level.search([
+                vol_rates_row = level.search([
                     ('position_id', '=', self._position_id),
                     ('real_flag', '=', True)
                 ], order='signal_number DESC', limit=1)
@@ -645,7 +669,7 @@ class GridBot(BaseBot):
                 return
 
         # Averaging levels
-        levels = Level.search([
+        levels = level.search([
             ('position_id', '=', self._position_id),
             ('signal_number', '>=', 1),
             ('real_flag', '=', False),
@@ -690,7 +714,7 @@ class GridBot(BaseBot):
                     else:
                         time_to_cross = 0.0
                     if time_to_cross <= reserve_sec:
-                        signal_ts = current_ts + time_to_cross
+                        signal_ts = current_ts + time_to_cross * 1_000_000_000
                         self._create_signal(
                             signal_number=level.signal_number,
                             direction=level.signal_direction,
@@ -706,15 +730,15 @@ class GridBot(BaseBot):
 
         # Timeout of pending signals
         if timeout_sec > 0:
-            pending = Level.search([
+            pending = level.search([
                 ('position_id', '=', self._position_id),
                 ('signal_flag', '=', True),
                 ('real_flag', '=', False),
                 ('signal_timestamp', '!=', None)
             ])
-            now = time.time()
+            timeout_ns = timeout_sec * 1_000_000_000
             for sig in pending:
-                if now - (sig.signal_timestamp or 0) > timeout_sec:
+                if (current_ts - sig.signal_timestamp) > timeout_ns:
                     if sig.signal_number < 0:
                         if recalc_strategy == 'recalc_grid':
                             self._create_signal(
@@ -877,7 +901,7 @@ class GridBot(BaseBot):
                 'position_id': self._position_id,
                 'signal_number': n,
                 'current_price': self._last_price or rec.current_price,
-                'current_timestamp': time.time(),
+                'current_timestamp': self.get_time_ns(),
                 'signal_volume_rates': volumes[:n],
                 'signal_direction': direction,
                 'signal_vol_rate': vol,
@@ -948,7 +972,7 @@ class GridBot(BaseBot):
                 'position_id': self._position_id,
                 'signal_number': n,
                 'current_price': self._last_price or None,
-                'current_timestamp': time.time(),
+                'current_timestamp': self.get_time_ns(),
                 'signal_volume_rates': volumes[:n],
                 'signal_direction': 'buy' if sign == 1 else 'sell',
                 'signal_vol_rate': vol,
@@ -1091,7 +1115,7 @@ class GridBot(BaseBot):
             'position_id': self._position_id,
             'signal_number': new_signal_number,
             'current_price': self._last_price or parent_real_price,
-            'current_timestamp': time.time(),
+            'current_timestamp': self.get_time_ns(),
             'signal_volume_rates': [parent_vol],
             'signal_direction': reverse_dir,
             'signal_vol_rate': parent_vol,
@@ -1104,7 +1128,7 @@ class GridBot(BaseBot):
             'position_cost': 0,
             'signal_pnl': 0,
             'signal_flag': True,
-            'signal_timestamp': time.time(),
+            'signal_timestamp': self.get_time_ns(),
             'signal_smart': True,
             'signal_smart_reversed': parent_number,
             'real_flag': False,
@@ -1131,7 +1155,7 @@ class GridBot(BaseBot):
                     total_pnl = 0.0
             vals.update({
                 'real_flag': True,
-                'real_timestamp': time.time(),
+                'real_timestamp': self.get_time_ns(),
                 'real_vol_rate': parent_vol,
                 'real_price': reverse_price,
                 'real_pnl': total_pnl,
@@ -1162,7 +1186,7 @@ class GridBot(BaseBot):
                 data = rec.read()
                 data.pop('id', None)
                 data.pop('created_at', None)
-                data['moved_to_history_at'] = time.time()
+                data['moved_to_history_at'] = self.get_time_ns()
                 history_vals.append(data)
             History.create(history_vals)
             records.unlink()

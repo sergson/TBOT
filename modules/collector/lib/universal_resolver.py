@@ -1,5 +1,4 @@
-# universal_resolver.py
-
+# modules/collector/lib/universal_resolver.py
 # Copyright (c) 2026 sergson (https://github.com/sergson)
 # Licensed under GNU General Public License v3.0
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
@@ -32,7 +31,7 @@ class UniversalDNSResolver(aiohttp.resolver.AbstractResolver):
         infos = await self._loop.run_in_executor(
             None,
             socket.getaddrinfo,
-            hostname, port, family, socket.SOCK_STREAM, socket.IPPROTO_TCP
+            hostname, port, family, socket.SOCK_STREAM, socket.IPPROTO_TCP, 0
         )
 
         # Format the result for aiohttp

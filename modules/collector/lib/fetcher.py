@@ -1,4 +1,4 @@
-# modules/collector/components/fetcher.py
+# modules/collector/lib/fetcher.py
 # Copyright (c) 2026 sergson (https://github.com/sergson)
 # Licensed under GNU General Public License v3.0
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
@@ -128,14 +128,45 @@ class AsyncExchangeFetcher:
                     # This method might be async, but we can't call it here
                     # Instead return None and handle below
                     pass
-            except:
-                pass
+            except Exception as e:
+                self.logger.warning(f"⚠ exchange time via API not available: {e}")
 
         except Exception as e:
             self.logger.warning(f"⚠ Could not get exchange time: {e}")
 
         # 4. Fallback: return system time with a note
         return datetime.now(tz=timezone.utc).isoformat()
+
+    async def get_supported_market_types(self) -> list:
+        """Returns the list of market types supported by the exchange."""
+        await self.initialize()
+        types = set()
+        for market in self.exchange.markets.values():
+            t = market.get('type', '').lower()
+            if t:
+                types.add(t)
+        # Map ccxt types to our unified 'spot' / 'futures'
+        unified = set()
+        for t in types:
+            if t == 'spot':
+                unified.add('spot')
+            elif t in ('future', 'swap', 'linear', 'delivery'):
+                unified.add('futures')
+            # other ones can also be added, e.g. 'option'
+        return sorted(unified)
+
+    async def get_symbols(self) -> list:
+        """
+        Returns the list of trading pairs (symbols) for the given exchange and market type.
+        The list is sorted alphabetically.
+        """
+        await self.initialize()
+        symbols = []
+        for symbol, market in self.exchange.markets.items():
+            if market.get('type', '').lower() == self.ccxt_market_type:
+                symbols.append(symbol)
+        symbols.sort()
+        return symbols
 
     async def fetch_ranked_pairs(self, limit: int = 50, quote_currency: Optional[str] = None) -> pd.DataFrame:
         """
@@ -309,14 +340,14 @@ class AsyncExchangeFetcher:
         if self.exchange:
             try:
                 await self.exchange.close()
-            except:
-                pass
+            except Exception as e:
+                self.logger.error(f"Close connections error: {e}")
 
         if self.session:
             try:
                 await self.session.close()
-            except:
-                pass
+            except Exception as e:
+                self.logger.error(f"Close session error: {e}")
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 100) -> pd.DataFrame:
         """Fetch OHLCV candles from the exchange"""

@@ -2,11 +2,12 @@
 
 ## Architecture
 
-The project is built on a modular, plugin-based architecture with a central model registry.  
-The core (`core/`) provides foundational services (ORM database access, logging, bot lifecycle), while all business logic resides in independent modules inside the `modules/` folder. The core has no hardcoded knowledge of any specific bot type — everything is discovered and assembled at runtime.
+The project is built on a modular, plugin-based architecture with a central model registry.
+The core (`core/`) provides foundational services (precise time synchronization, ORM database access, logging, bot lifecycle), while all business logic resides in independent modules inside the `modules/` folder. The core has no hardcoded knowledge of any specific bot type — everything is discovered and assembled at runtime.
 
 ### Key Principles
 
+- **Precise Time as a Foundation** — `TimeSyncService` (`core/time_sync.py`) is started **before** `BotManager` and provides a synchronized, drift-compensated UTC clock to every bot via `self.get_time_ns()`. No bot operates on raw OS system time.
 - **Model Registry** (`core/registry.py`) — a singleton that holds all model classes and their metadata. Classes are registered via the `@auto_reg` decorator. Extensions through `_inherit` are supported: child classes add or modify existing behavior, and `super()` continues to work through the entire inheritance chain.
 - **Dynamic Module Loading** — at startup, the system scans the `modules/` directory and imports all valid packages. Registration occurs automatically.
 - **Extension by Inheritance** — modules can add or override behavior of existing bot classes by specifying `_inherit` and using `@auto_reg`. The final class combines the original and extension, preserving the original name.
@@ -28,6 +29,7 @@ The core (`core/`) provides foundational services (ORM database access, logging,
     │   ├── loader.py              # Dynamic module discovery
     │   ├── bot_manager.py         # Bot lifecycle management
     │   ├── database.py            # ORM layer, declarative models, DB utilities
+    │   ├── time_sync.py           # Precise time service (colony of NTP filters + PLL)
     │   ├── logger.py              # Configurable logger with moods
     │   ├── colors.py              # Color palette (reference)
     │   ├── styles.py              # Standard styles, fonts, margins
@@ -39,6 +41,7 @@ The core (`core/`) provides foundational services (ORM database access, logging,
     │   │   ├── components.py      # UI form, renderer, type metadata
     │   │   └── lib/               # Helper modules
     │   │       ├── fetcher.py
+    │   │       ├── exchange_directory.py
     │   │       └── universal_resolver.py
     │   └── grid/                  # Grid bot module
     │       ├── __init__.py
@@ -47,12 +50,65 @@ The core (`core/`) provides foundational services (ORM database access, logging,
     │       └── lib/               # Optional internal helpers
     ├── assets/                    # CSS and other static files
     │   └── custom.css             # Styles for custom UI elements
-    ├── logs/                      # Log files
+    ├── logs/                      # Log files (grouped by module_type)
     └── requirements.txt
+
+## Precise Time Service (`core/time_sync.py`)
+
+Every bot in T.B.O.T uses a synchronized, drift-compensated UTC clock provided by `TimeSyncService`. The service is a module-level singleton (`time_sync_service = TimeSyncService.get_instance()`) and is started in `app.py` **before** `BotManager`:
+
+```python
+time_sync_service.start()
+if not time_sync_service.wait_for_first_sync(timeout=5):
+    logger.error("Failed to restore initial time synchronization.")
+else:
+    perf_logger.set_clock(time_sync_service.get_utc_ns)
+```
+
+All bots access precise time via `self.get_time_ns()` (inherited from `BaseBot`), which returns `time_sync_service.get_utc_ns()`.
+
+### Architecture
+
+- **Colony of filter instances** — NTP servers are polled by a colony of autonomous filter instances. Each instance has its own reference offset, threshold, history, and favorite server. Instances reproduce, die, and inherit experience (a genetic-like algorithm).
+- **Consensus** — the observer of the colony; combines votes from live instances, applies pre-gate / post-gate / spread-gate protection, and picks the current best `(best_mono, best_utc)` for the PLL.
+- **PLL (PI controller)** — models the local clock drift as `utc(mono) = anchor_offset + rate · (mono − anchor_mono)`. Each consensus round updates `anchor_offset` (P-correction) and `rate` (I-correction).
+- **Colony bias integrator** — compensates the permanent shift of individual servers by tracking raw proposed timestamps.
+- **ClockSnapshot API** — external consumers receive a consistent `(anchor_mono, anchor_offset, rate, ttl, accuracy)` snapshot, valid within a declared `ttl_ns`, with a guaranteed error bound in `accuracy_ns`.
+- **Watchdog** — restarts dead sync threads, diagnoses stalled networks.
+- **Keep-awake** — on Windows, disables Power Throttling and requests `ES_SYSTEM_REQUIRED` to block Modern Standby; on Linux, verifies that systemd sleep targets are masked.
+
+### Public API
+
+```python
+svc = time_sync_service
+
+svc.get_utc_ns()                                # lock-free, precise UTC in nanoseconds
+svc.get_clock_snapshot()                        # ClockSnapshot or None
+svc.get_clock_snapshot(precision_ns=500_000)    # TTL for the given precision
+svc.utc_from_snapshot(snap, now_mono)           # pure function, None if expired
+svc.get_sync_telemetry()                        # full diagnostics (see below)
+svc.wait_for_first_sync(timeout=30)             # Event, set on first successful round
+```
+
+### Telemetry (used by the "⏱" UI panel)
+
+`get_sync_telemetry()` returns consensus state, per-instance slices, colony bias, per-server delay stats, PLL rate, phase error, and the current spread of slew corrections.
+
+### Modern Standby / Sleep Control
+
+`TimeSyncService.start()` with `TIME_SYNC_KEEP_AWAKE=1` (the default) requests the OS to keep the system awake:
+
+- **Windows desktop**: disables Power Throttling (`SetProcessInformation(ProcessPowerThrottling)`), raises priority to `ABOVE_NORMAL`, and re-asserts `ES_SYSTEM_REQUIRED` every 30 s to block Modern Standby. Recommended to also disable OS-level Modern Standby (`powercfg -h off`, `PlatformAoAcOverride=0`).
+- **Laptops**: not recommended — the battery drains quickly. Set `TIME_SYNC_KEEP_AWAKE=0` to disable.
+- **Linux / VPS**: preferred environment; keep-awake becomes a no-op. Verify that systemd sleep targets are masked:
+  `systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target`.
+
+Without keep-awake, all application threads (including the asyncio event loop of `BotManager` and all trading bots) freeze for hours when the host enters Modern Standby.
 
 ## ORM Layer and Declarative Models
 
 The core includes a simple ORM:
+
 - **Declarative models** — tables are described as classes with field attributes (`Field` and its subclasses: `Char`, `Text`, `Integer`, `Boolean`, `Float`, `Selection`, `Json`).
 - **Automatic registry** — `ModelMeta` metaclass registers models in `MODEL_REGISTRY`.
 - **Extension via `_inherit`** — a child class adds fields to an existing model without creating a new table.
@@ -60,6 +116,7 @@ The core includes a simple ORM:
 - **ORM methods** — `search`, `search_count`, `browse`, `read`, `create`, `write`, `unlink`, `filtered`, `mapped`, `sorted`.
 - **Domains** — filtering using Polish notation (`&`, `|`, `!`), supporting operators `=`, `!=`, `>`, `<`, `>=`, `<=`, `in`, `not in`, `like`, `ilike`, `between`.
 - **Transactions and locking** — WAL mode, `threading.RLock`, `transaction()` context manager.
+- **Dynamic tables** — models with `_dynamic = True` and no `_table` are instantiated per-table via `env.get_model_manager(model_name, table_name)`. Used by the collector for per-symbol candle tables.
 
 ### Example model definition (inside a bot module)
 
@@ -78,8 +135,6 @@ class LevelsSignals(Model):
     signal_volume_rates = Json()
     # ... other fields
 ```
-
-For dynamic tables (e.g., collector candles) the flag `_dynamic = True` and the method `env.get_model_manager()` are used.
 
 ## Style and Graphics References
 
@@ -102,6 +157,8 @@ For dynamic tables (e.g., collector candles) the flag `_dynamic = True` and the 
 
 Each bot's configuration is **not** stored in a separate table. Instead, it is kept as JSON key-value pairs in the bot's local database (`data/bot_<id>.db`) inside the `bot_settings` table. This isolates each bot's data and simplifies removal.
 
+The runtime state that bots persist across restarts (e.g., `current_position_id` and `max_averaging_count` for the grid bot) is stored **in the same `bot_settings` table**, written directly by the bot through the ORM. `update_bot_config()` only merges keys — it never deletes unrelated keys — so configuration and runtime state coexist safely.
+
 ### Table `settings`
 
 | Field   | Type   | Description                          |
@@ -111,8 +168,8 @@ Each bot's configuration is **not** stored in a separate table. Instead, it is k
 
 ### Per-Bot Database (`data/bot_<id>.db`)
 
-- `bot_settings` — key-value storage for configuration and internal state.
-- Additional tables created by the bot's logic (e.g., collector creates a candle table, Grid bot creates `levels_signals`, `price_history`, `deals_history`, etc.).
+- `bot_settings` — key-value storage for configuration **and** runtime state.
+- Additional tables created by the bot's logic (e.g., the collector creates a candle table per symbol; the grid bot creates `levels_signals`, `price_history`, `deals_history`, etc.).
 
 The path to this database is stored in the config under the key `data_db_path`.
 
@@ -149,6 +206,8 @@ The path to this database is stored in the config under the key `data_db_path`.
 
    If your bot **consumes** data from others, always pass `manager` to the parent constructor. If it **provides** data, implement `get_capabilities()`.
 
+   Use `self.get_time_ns()` for any timestamping — this returns precise, drift-compensated UTC in nanoseconds.
+
 4. **Define the type metadata** in `components.py`:
 
        from core import auto_reg
@@ -171,7 +230,7 @@ The path to this database is stored in the config under the key `data_db_path`.
    - `_name` must end with `.type`.
    - Additional methods: `prepare_new_config`, `process_edit_save`, `register_callbacks`.
 
-5. **That’s it!** The loader will find the module, the registry will build the final class, and the UI will show the new type in the dropdown.
+5. **That's it!** The loader will find the module, the registry will build the final class, and the UI will show the new type in the dropdown.
 
 ## Inter-Bot Data Exchange
 
@@ -229,6 +288,14 @@ When a bot is stopped or removed, `BotManager` automatically removes references 
 
 ## Core Components
 
+### `core/time_sync.py`
+- Singleton `TimeSyncService` providing precise, drift-compensated UTC.
+- Colony of filter instances + Consensus + PLL model (anchor + rate).
+- `get_utc_ns()`, `get_clock_snapshot(precision_ns=None)`, `utc_from_snapshot()`, `get_sync_telemetry()`, `wait_for_first_sync()`.
+- Keep-awake: Windows Power Throttling + Modern Standby block; Linux systemd sleep-target verification.
+- Watchdog for sync threads; diagnostics via `_last_stalled_servers`.
+- Started in `app.py` **before** `BotManager`; its clock is installed into `perf_logger` via `set_clock()`.
+
 ### `core/registry.py`
 - Singleton model registry.
 - `@auto_reg` registers classes; `_name` creates a new model, `_inherit` extends an existing one.
@@ -239,6 +306,7 @@ When a bot is stopped or removed, `BotManager` automatically removes references 
 - Attributes: `bot_id`, `running`, `task`, `manager`, `dynamics`, `env` (ORM environment).
 - Abstract methods: `start()`, `stop()`, `get_capabilities()`.
 - `setup_exchange()` and `get_exchange()` for inter-bot communication.
+- `get_time_ns()` — precise UTC from `TimeSyncService`, available to every bot.
 - `_cleanup_dynamics()`.
 
 ### `core/exchange.py`
@@ -255,22 +323,27 @@ When a bot is stopped or removed, `BotManager` automatically removes references 
 ### `core/database.py`
 - Initializes `config.db`, provides functions: `add_bot`, `get_all_bots`, `get_bot_config`, `update_bot_status`, `delete_bot`, `save_setting`, `get_setting`, `cleanup_orphan_databases`.
 - Implements the ORM layer: fields, metaclass, model managers, `DBSQLite3` environment, domains, transactions.
-- `_save_config_to_local_db()` updates only the given keys without deleting others (preserves `current_position_id`, etc.).
+- `_save_config_to_local_db()` updates only the given keys without deleting others (preserves `current_position_id`, `max_averaging_count`, etc.).
 
 ### `core/logger.py`
-- `PerformanceLogger` — singleton with support for module log levels (`app`, `collector`, `fetcher`, `database`, `analytics`).
+- `PerformanceLogger` — singleton with support for module log levels (`app`, `time`, `collector`, `fetcher`, `database`, `analytics`, `execution`).
+- Non-blocking producer path: `QueueHandler` with drop-oldest + one listener thread per module type.
+- Watchdog thread restarts dead listeners; reports drops via `stderr`.
 - Allows loading and saving settings to the database.
 - Contains a mood queue and `get_pending_mood()` method for UI indication.
 - `get_recent_logs()` returns the last lines from log files.
+- Log files are grouped by **module_type** (`logs/collector_YYYYMMDD.log`, etc.), not by logger name.
 
 ### `core/colors.py` / `core/styles.py` / `core/graphics.py`
 - Centralized references for colors, styles, and graphic element factories.
 
 ### `app.py`
 - Universal Dash UI.
-- Sticky panel with buttons ➕ (add bot), ⚙️ (settings), 📋 (logs).
+- Sticky panel with buttons ➕ (add bot), ⚙️ (settings), 📋 (logs), ⏱ (time sync telemetry).
+- Starts `TimeSyncService` **before** `BotManager`; wires `perf_logger.set_clock()`.
+- Registers bot-type callbacks from the registry (dynamic).
 - Supports header moods via Store and callbacks.
-- Log panel updates every 1 sec if open.
+- Log panel updates every 1 sec if open; time panel updates on the same tick when open.
 - Dynamically discovers bot types and renders their cards.
 - Bot cards use `html.Details`/`html.Summary` for collapsing; header color reflects status (green — running, red — stopped).
 
@@ -307,11 +380,20 @@ The application will be available at `http://127.0.0.1:8050`.
 
 ## Configuration
 
-- The ⚙️ button opens the settings panel: debug mode, logging levels for different modules.
 - The ➕ button adds a new bot; choose the type from the dropdown and fill out the form.
+- The ⚙️ button opens the settings panel: debug mode, logging levels for different modules, log retention.
 - The 📋 button shows recent log entries.
+- The ⏱ button shows live time-synchronization telemetry: consensus state, per-instance slices, colony bias, per-server delay stats, PLL rate, phase error.
 - The T.B.O.T header collapses/expands on click; when collapsed, it shrinks and compresses.
 - Bot cards collapse by clicking the header; header color indicates status.
+
+## Environment Variables
+
+| Variable                     | Default   | Effect                                                                                                   |
+|------------------------------|-----------|----------------------------------------------------------------------------------------------------------|
+| `TIME_SYNC_KEEP_AWAKE`       | `1`       | `1` — block Modern Standby and disable Power Throttling (Windows). `0` — disable keep-awake (laptops).    |
+| `TBOT_LOG_QUEUE_SIZE`        | `10000`   | Per-module queue size for the non-blocking logger.                                                        |
+| `TBOT_LOG_DROP_ALERT`        | `100`     | Threshold of dropped records per watchdog interval before the logger shouts to `stderr`.                  |
 
 ## Requirements
 
@@ -320,6 +402,7 @@ The application will be available at `http://127.0.0.1:8050`.
     pandas
     ccxt
     aiohttp
+    ntplib
 
 ## Disclaimer
 

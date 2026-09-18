@@ -5,8 +5,6 @@
 # This software is for educational purposes only. Use at your own risk.
 
 import asyncio
-import time
-from typing import Dict, Any
 
 from core import auto_reg, BaseBot
 from core.database import (
@@ -15,6 +13,7 @@ from core.database import (
 )
 from core.logger import perf_logger
 from .lib.fetcher import AsyncExchangeFetcher
+from .lib.utils import safe_table_name
 
 def timeframe_to_seconds(tf: str) -> int:
     unit = tf[-1]
@@ -63,7 +62,7 @@ class CollectorBot(BaseBot):
         symbol = self.config.get('symbol')
         if not symbol:
             raise ValueError("Symbol not set")
-        table_name = symbol.replace('/', '_').replace('-', '_')
+        table_name = safe_table_name(symbol)
         return self.env.get_model_manager('collector.candle', table_name)
 
     async def start(self):
@@ -185,7 +184,7 @@ class CollectorBot(BaseBot):
     async def on_config_updated(self):
         """Reload history and parameters after settings change."""
         old_symbol = self.config.get('symbol')
-        old_table_name = old_symbol.replace('/', '_').replace('-', '_') if old_symbol else None
+        old_table_name = safe_table_name(old_symbol) if old_symbol else None
 
         # Update config from DB
         self.config = get_bot_config(self.bot_id)
