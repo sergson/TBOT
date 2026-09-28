@@ -7,10 +7,13 @@
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from core import auto_reg, bot_registry, colors, styles, graphics
+from core import auto_reg, colors, styles, graphics
 from core.database import get_bot_config, get_all_bots, DBSQLite3
 from core.logger import perf_logger
 from dash import dcc, html, Output, Input, State, MATCH, ALL, no_update, callback_context
+from .lib.exchange_directory import EXCHANGES, MARKETS, get_exchange_options, get_default_exchange_value
+from .lib.fetcher import AsyncExchangeFetcher
+from .lib.utils import safe_table_name
 
 logger = perf_logger.get_logger('collector_module', 'collector')
 
@@ -18,15 +21,20 @@ COLLECTOR_FIELDS = ['exchange', 'market_type', 'symbol', 'timeframe', 'candles_l
 
 # ---------- Add/Edit form ----------
 def collector_form(current_bot_id=None):
-    # default values
-    exchange = 'binance'
-    market_type = 'spot'
-    symbol = 'BTC/USDT'
+    # Получаем динамический список бирж (ccxt + статические настройки)
+    exchange_options = get_exchange_options()
+    # Значение по умолчанию из статического EXCHANGES или первая доступная
+    default_exchange = get_default_exchange_value()
+
+    # Определяем начальные значения
+    exchange = default_exchange
+    market_type = None
+    symbol = None
     timeframe = '1m'
     candles_limit = 100
-    editing = current_bot_id is not None
 
-    if editing:
+    # Если редактируем существующего бота, берём его конфигурацию
+    if current_bot_id is not None:
         cfg = get_bot_config(current_bot_id)
         if cfg:
             exchange = cfg.get('exchange', exchange)
@@ -35,29 +43,38 @@ def collector_form(current_bot_id=None):
             timeframe = cfg.get('timeframe', timeframe)
             candles_limit = cfg.get('candles_limit', candles_limit)
 
+    # Если биржа из конфига отсутствует в списке (например, была удалена из ccxt), берём значение по умолчанию
+    if exchange not in [opt['value'] for opt in exchange_options]:
+        exchange = default_exchange
+
+    # Дефолтные значения для market_type и symbol берём из статической записи выбранной биржи, если они есть
+    exchange_entry = next((item for item in EXCHANGES if item.get('value') == exchange), {})
+    defaults = exchange_entry.get('defaults') or {}
+    if market_type is None:
+        market_type = defaults.get('market')
+    if symbol is None:
+        symbol = defaults.get('symbol')
+    if not symbol:
+        symbol = 'BTC/USDT'
+
     fields = [
         dcc.Dropdown(
             id={'type': 'collector-field', 'field': 'exchange'},
-            options=[
-                {'label': 'Binance', 'value': 'binance'},
-                {'label': 'KuCoin', 'value': 'kucoin'},
-                {'label': 'MEXC', 'value': 'mexc'},
-                {'label': 'OKX', 'value': 'okx'},
-                {'label': 'Bybit', 'value': 'bybit'}
-            ],
+            options=exchange_options,
             value=exchange
         ),
         dcc.Dropdown(
             id={'type': 'collector-field', 'field': 'market_type'},
-            options=[
-                {'label': 'Spot', 'value': 'spot'},
-                {'label': 'Futures', 'value': 'futures'}
-            ],
+            options=MARKETS,  # статический список, будет обновляться колбэком при смене биржи
             value=market_type
         ),
-        dcc.Input(
-            id={'type': 'collector-field', 'field': 'symbol'},
-            type='text', placeholder='BTC/USDT', value=symbol
+        html.Label("Pair"),
+        dcc.Dropdown(
+            id={"type": "collector-field", "field": "symbol"},
+            options=[],  # заполняется колбэком
+            value=symbol,
+            placeholder="BTC/USDT",
+            disabled=current_bot_id is not None  # при редактировании символ не меняем
         ),
         dcc.Dropdown(
             id={'type': 'collector-field', 'field': 'timeframe'},
@@ -91,7 +108,7 @@ def collector_form(current_bot_id=None):
 # ---------- Graph building function ----------
 def build_figure(bot_id: int, config: dict, relayout_store: dict):
     db_path = config['data_db_path']
-    table_name = config['symbol'].replace('/', '_').replace('-', '_')
+    table_name = safe_table_name(config['symbol'])
 
     env = DBSQLite3(db_path)
     try:
@@ -198,7 +215,10 @@ class CollectorTypeMeta:
 
     @staticmethod
     def prepare_new_config(raw_config: dict) -> dict:
-        return raw_config
+        config = raw_config.copy()
+        if not config.get('symbol'):
+            config['symbol'] = 'BTC/USDT'  # значение по умолчанию
+        return config
 
     @staticmethod
     def register_callbacks(app, bot_manager, loop):
@@ -233,11 +253,51 @@ class CollectorTypeMeta:
             status = bot['status']
             return styles.bot_card_header_style(status)
 
+        @app.callback(
+            Output({'type': 'collector-field', 'field': 'market_type'}, 'options'),
+            Output({'type': 'collector-field', 'field': 'market_type'}, 'value'),
+            Input({'type': 'collector-field', 'field': 'exchange'}, 'value'),
+            prevent_initial_call=True
+        )
+        async def update_market_types(exchange_id):
+            if not exchange_id:
+                return [], None
+            try:
+                async with AsyncExchangeFetcher(exchange_id,
+                                                'spot') as fetcher:  # market_type не важен для загрузки рынков
+                    types = await fetcher.get_supported_market_types()
+                options = [{'label': t.capitalize(), 'value': t} for t in types]
+                # Если есть spot, выбираем его по умолчанию, иначе первый
+                default_value = 'spot' if 'spot' in types else (types[0] if types else None)
+                return options, default_value
+            except Exception as e:
+                logger.error(f"Ошибка получения типов рынков для {exchange_id}: {e}")
+                # Возвращаем стандартные варианты
+                return MARKETS, 'spot'
+
+        @app.callback(
+            Output({'type': 'collector-field', 'field': 'symbol'}, 'options'),
+            Input({'type': 'collector-field', 'field': 'exchange'}, 'value'),
+            Input({'type': 'collector-field', 'field': 'market_type'}, 'value')
+        )
+        async def update_symbols(exchange_id, market_type):
+            if not exchange_id or not market_type:
+                return []
+            try:
+                async with AsyncExchangeFetcher(exchange_id, market_type) as fetcher:
+                    symbols = await fetcher.get_symbols()
+                return [{'label': s, 'value': s} for s in symbols]
+            except Exception as e:
+                logger.error(f"Ошибка загрузки списка пар для {exchange_id} ({market_type}): {e}")
+                return []
+
     @staticmethod
     def process_edit_save(bot_id, new_fields, old_config):
         new_fields.pop('data_db_path', None)
         config = {k: v for k, v in old_config.items() if k in COLLECTOR_FIELDS}
         config.update(new_fields)
+        if not config.get('symbol'):
+            config['symbol'] = 'BTC/USDT'
         if 'data_db_path' not in config:
             config['data_db_path'] = f"data/bot_{bot_id}.db"
         config.pop('bot_type', None)

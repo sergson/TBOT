@@ -76,6 +76,14 @@ class BotManager:
         if bot_id in self.bots:
             self.stop_bot(bot_id)
             bot = self.bots[bot_id]
+            if bot.running:
+                logger.warning(f"Bot {bot_id} did not stop cleanly, force cancelling tasks")
+                if self.loop and self.loop.is_running():
+                    for task in asyncio.all_tasks(self.loop):
+                        if task.get_name().startswith(f"execution_{bot_id}") or getattr(task, 'bot_id', None) == bot_id:
+                            task.cancel()
+                    # time to cancelling
+                    time.sleep(3)
             if hasattr(bot, '_close_db'):
                 bot._close_db()
             del self.bots[bot_id]

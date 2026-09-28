@@ -12,6 +12,8 @@ from core.database import DATA_DIR, cleanup_orphan_databases, update_bot_config
 import atexit
 import signal
 import logging
+import statistics
+from datetime import datetime, timezone
 
 from core import (
     load_modules, init_config_db, add_bot, get_all_bots, get_bot_config,
@@ -19,11 +21,18 @@ from core import (
     BotManager, bot_registry, perf_logger, colors
 )
 
+from core.logger import LOGGER_OBJS, LOGGER_LEVELS, LOG_RETENTION_DAYS_DEFAULT
+from core.time_sync import (time_sync_service, build_short_telemetry_content, build_full_telemetry_content,
+                            DEFAULT_INITIAL_INTERVAL_SEC, KEEP_AWAKE_REFRESH_SEC)
+
 class SettingsStorage:
     @staticmethod
-    def get_setting(key): return get_setting(key)
+    def get_setting(key, default=None):
+        return get_setting(key, default)
+
     @staticmethod
-    def save_setting(key, value): save_setting(key, value)
+    def save_setting(key, value):
+        save_setting(key, value)
 
 os.makedirs(DATA_DIR, exist_ok=True)
 init_config_db()
@@ -31,7 +40,64 @@ cleanup_orphan_databases()
 perf_logger.initialize_with_storage(SettingsStorage)
 logger = perf_logger.get_logger('app', 'app')
 
+# ---------------------------------------------------------------------------
+# WARNING: sleep / Modern Standby control
+# ---------------------------------------------------------------------------
+# TimeSyncService.start() with KEEP_AWAKE_ENABLED=1 (default) calls
+# the Windows API SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED).
+# This affects the whole process and prevents the system from entering
+# Modern Standby while the service is alive. Without this, all application
+# threads — including the asyncio-loop of BotManager and trading bots — are
+# frozen for hours.
+#
+# OPERATING ENVIRONMENT REQUIREMENTS:
+#
+#   * Windows (desktop): Modern Standby should preferably be disabled at the OS
+#     level to guarantee that keep-awake is not ignored by drivers:
+#         powercfg -h off
+#         powercfg -change -standby-timeout-ac 0
+#         powercfg -change -monitor-timeout-ac 0
+#         powercfg -change -disk-timeout-ac 0
+#     and in the registry HKLM\SYSTEM\CurrentControlSet\Control\Power:
+#         PlatformAoAcOverride = 0 (DWORD, reboot required)
+#
+#   * Laptops: NOT RECOMMENDED. SetThreadExecutionState keeps the system
+#     in working state around the clock — the battery drains in a matter
+#     of hours. For a laptop, either use TIME_SYNC_KEEP_AWAKE=0 (accepting
+#     the consequences in the form of nightly sync pauses).
+#
+#   * Linux / VPS: preferred environment. Modern Standby as a class does not
+#     exist, suspend is disabled via systemd (`systemctl mask sleep.target
+#     suspend.target hibernate.target hybrid-sleep.target`). keep-awake
+#     becomes a no-op.
+#
+# T.B.O.T FACTORY (plan):
+#   When TimeSyncService is moved to a separate process/service on the node
+#   (single for all applications), sleep control should move together with it.
+#   This app.py will stop calling SetThreadExecutionState directly —
+#   the factory will take over:
+#       - keep-awake for the entire node;
+#       - healthcheck of the time process;
+#       - automatic restart after long pauses;
+#       - graceful shutdown with state preservation (bias, applied_offsets,
+#         anchor/rate) before restart.
+#   Until then, app.py remains the sleep control point for the entire node.
+#   Ensure that time_sync_service.start() is called BEFORE starting
+#   BotManager and any trading modules, otherwise bots may manage
+#   to execute in the window before ES_SYSTEM_REQUIRED is set.
+# ---------------------------------------------------------------------------
+time_sync_service.start()
+if not time_sync_service.wait_for_first_sync(timeout=(DEFAULT_INITIAL_INTERVAL_SEC+KEEP_AWAKE_REFRESH_SEC)):
+    logger.error("Failed to restore initial time synchronization.")
+else:
+    logger.info(f"Precise time synchronization completed ts={time_sync_service.get_utc_ns}.")
+    perf_logger.set_clock(time_sync_service.get_utc_ns)
+
 load_modules("modules")
+
+def shutdown_time_sync():
+    time_sync_service.stop()
+atexit.register(shutdown_time_sync)
 
 bot_manager = BotManager()
 bot_manager.start_loop_in_thread()
@@ -40,7 +106,7 @@ signal.signal(signal.SIGINT, lambda s, f: bot_manager.shutdown())
 signal.signal(signal.SIGTERM, lambda s, f: bot_manager.shutdown())
 bot_manager.load_bots()
 
-app = dash.Dash(__name__, title='T.B.O.T')
+app = dash.Dash(__name__, title='T.B.O.T', update_title = '')
 app.config.suppress_callback_exceptions = True
 
 # Callback registration uses bot_manager.loop
@@ -65,6 +131,7 @@ app.layout = html.Div([
                     html.Button('➕', id='add-bot-btn', n_clicks=0, style={'marginRight': '10px'}),
                     html.Button('⚙️', id='settings-btn', n_clicks=0, style={'marginRight': '10px'}),
                     html.Button('📋', id='logs-btn', n_clicks=0, style={'marginRight': '10px'}),
+                    html.Button('⏱', id='time-btn', n_clicks=0, style={'marginRight': '10px'}),
                 ], style={'display': 'flex', 'flexDirection': 'row', 'justifyContent': 'flex-start'}),
 
                 # Add bot form
@@ -77,21 +144,28 @@ app.layout = html.Div([
                 # Settings panel
                 html.Div(id='settings-panel', children=[
                     html.H3('Settings'),
-                    html.Div(id='global-interval-debug'),
                     html.Div([
                         html.Label('Debug mode'),
                         dcc.Checklist(id='debug-checkbox', options=[{'label': ' Enable', 'value': 'debug'}],
                                       value=['debug'] if get_setting('debug_mode', 'False') == 'True' else []),
                         html.Div('* Changes will take effect after restart', style={'fontSize': 'small', 'color': colors.GRAY})
                     ], style={'marginBottom': '20px'}),
+                    html.H4('Delete Old Logs'),
+                    html.Div([
+                        html.Label('Delete logs older than (days):'),
+                        dcc.Input(id='log-retention-days', type='number', min=0, max=365,
+                                  value=int(get_setting('log_retention_days', LOG_RETENTION_DAYS_DEFAULT))),
+                        html.Div('0 = disable automatic deletion',
+                                 style={'fontSize': 'small', 'color': colors.GRAY, 'marginTop': '5px'}),
+                    ], style={'marginBottom': '20px'}),
                     html.H4('Logging levels'),
                     html.Div(id='logging-levels-container', children=[
                         html.Div([
                             html.Label(module),
                             dcc.Dropdown(id={'type': 'log-level-dropdown', 'module': module},
-                                         options=[{'label': lvl, 'value': lvl} for lvl in ['DEBUG', 'INFO', 'WARNING', 'ERROR']],
-                                         value=perf_logger.settings.get(f'{module}_level', 'DEBUG'))
-                        ], style={'marginBottom': '10px'}) for module in ['app', 'collector', 'fetcher', 'database', 'analytics']
+                                         options=[{'label': lvl, 'value': lvl} for lvl in LOGGER_LEVELS],
+                                         value=perf_logger.get_level(module))
+                        ], style={'marginBottom': '10px'}) for module in LOGGER_OBJS
                     ]),
                     html.Button('Save Settings', id='save-settings-btn'),
                     html.Button('Close', id='close-settings-btn')
@@ -101,7 +175,7 @@ app.layout = html.Div([
                 html.Div(id='logs-panel', children=[
                     html.H4('Recent Logs', style={'margin': '0 0 5px 0'}),  # reduce margin under heading
                     html.Pre(id='logs-content', children='', style={
-                        'maxHeight': '200px',
+                        'maxHeight': '700px',
                         'overflowY': 'auto',
                         'backgroundColor': '#f8f8f8',
                         'padding': '5px',  # was 10px
@@ -117,6 +191,26 @@ app.layout = html.Div([
                     'margin': '5px 0',  # top/bottom margins to adjacent blocks 5px
                 }),
 
+                # Time info panel
+                html.Div(id='time-panel', children=[
+                    html.H4('Time Information', style={'margin': '0 0 5px 0'}),
+                    html.Pre(id='time-content', children='', style={
+                        'maxHeight': '700px',
+                        'overflowY': 'auto',
+                        'backgroundColor': '#f8f8f8',
+                        'padding': '5px',
+                        'fontSize': '12px',
+                        'whiteSpace': 'pre-wrap',
+                        'lineHeight': '1.2',
+                    }),
+                ], style={
+                    'display': 'none',
+                    'textAlign': 'left',
+                    'border': f'1px solid {colors.GRAY}',
+                    'padding': '5px',
+                    'margin': '5px 0',
+                }),
+
                 # Stores and Location
                 dcc.Store(id='header-mood-command', data=None),   # logo command
                 dcc.Store(id='header-mood', data='normal'),
@@ -124,6 +218,7 @@ app.layout = html.Div([
                 dcc.Store(id='relayout-store', data={}),
                 dcc.Store(id='editing-bots', data={}),
                 dcc.Store(id='prev-edit-clicks', data=[]),
+                dcc.Store(id='time-panel-mode', data='closed'),
                 dcc.Location(id='url', refresh=False),
             ])
         ], id='sticky-header-details', open=True, className='', style={
@@ -139,10 +234,9 @@ app.layout = html.Div([
     }),
 
     html.Div(id='bots-container'),
+    dcc.Interval(id='tick-1s', interval=1000, n_intervals=0),
     dcc.Interval(id='global-interval', interval=5000, n_intervals=0),
     dcc.Interval(id='header-mood-reset-interval', interval=1000, max_intervals=1, disabled=True),
-    dcc.Interval(id='mood-poll-interval', interval=500, n_intervals=0),
-    dcc.Interval(id='logs-refresh-interval', interval=1000, n_intervals=0),
 ])
 
 # ------------ header mood and log callbacks --------
@@ -181,79 +275,63 @@ def process_mood_command(command):
     return command, False, 0, None
 
 @app.callback(
-    Output('header-mood-command', 'data', allow_duplicate=True),
-    Input('mood-poll-interval', 'n_intervals'),
-    State('header-mood', 'data'),
-    prevent_initial_call=True
-)
-def poll_mood_queue(n, current_mood):
-    if current_mood != 'normal':
-        return no_update  # wait for previous display to finish
-    mood = perf_logger.get_pending_mood()
-    if mood:
-        return mood
-    return no_update
-
-@app.callback(
-    Output('logs-content', 'children', allow_duplicate=True),
-    Input('logs-refresh-interval', 'n_intervals'),
-    State('logs-panel', 'style'),
-    prevent_initial_call=True
-)
-def update_logs_content(n, logs_style):
-    # If logs panel is open (display not 'none'), load fresh logs
-    if logs_style and logs_style.get('display') != 'none':
-        return '\n'.join(perf_logger.get_recent_logs('all', 20))
-    return no_update
-
-# ---------- Common callbacks ----------
-@app.callback(
     [Output('add-bot-form-container', 'style'),
      Output('dynamic-bot-form-content', 'children'),
      Output('settings-panel', 'style'),
      Output('add-bot-btn', 'n_clicks'),
      Output('settings-btn', 'n_clicks'),
-     Output('logs-panel', 'style'),               # ← new
-     Output('logs-content', 'children', allow_duplicate=True),          # ← new
-     Output('logs-btn', 'n_clicks')],             # ← new
+     Output('logs-panel', 'style'),
+     Output('logs-content', 'children', allow_duplicate=True),
+     Output('logs-btn', 'n_clicks'),
+     Output('time-panel', 'style'),
+     Output('time-btn', 'n_clicks'),
+     Output('time-content', 'children', allow_duplicate=True),
+     Output('time-panel-mode', 'data')],
     [Input('add-bot-btn', 'n_clicks'),
      Input('settings-btn', 'n_clicks'),
-     Input('logs-btn', 'n_clicks'),               # ← new
+     Input('logs-btn', 'n_clicks'),
+     Input('time-btn', 'n_clicks'),               # new
      Input('cancel-add-btn', 'n_clicks'),
      Input('close-settings-btn', 'n_clicks'),
      Input('save-bot-btn', 'n_clicks')],
     prevent_initial_call=True
 )
-def toggle_forms(add_clicks, settings_clicks, logs_clicks,
+def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
                  cancel_clicks, close_clicks, save_clicks):
     ctx = callback_context
     if not ctx.triggered:
-        return no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update
+        return (no_update,) * 11
 
     triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
-    # Initialize default values
+    # Initialize all values
     add_style = {'display': 'none'}
     settings_style = {'display': 'none'}
     logs_style = {'display': 'none'}
+    time_style = {'display': 'none'}
     form_content = no_update
     logs_content = no_update
+    time_content = no_update
+    time_mode = 'closed'
     new_add = add_clicks
     new_settings = settings_clicks
     new_logs = logs_clicks
+    new_time = time_clicks
 
-    # --- Handling Add Bot button ---
+    # Button handling
     if triggered_id == 'add-bot-btn':
-        if add_clicks % 2 == 1:  # open
+        if add_clicks % 2 == 1:
             add_style = {'display': 'block'}
             new_settings = 0
             new_logs = 0
+            new_time = 0
+            time_mode = 'closed'
             type_options = []
-            for model_name in bot_registry.list_models():
-                if model_name.endswith('.type'):
-                    cls = bot_registry.get_model(model_name)
-                    display = getattr(cls, 'display_name', model_name)
-                    type_id = model_name.split('.')[0]
+            for _model_name in bot_registry.list_models():
+                if _model_name.endswith('.type'):
+                    cls = bot_registry.get_model(_model_name)
+                    display = getattr(cls, 'display_name', _model_name)
+                    type_id = _model_name.split('.')[0]
                     type_options.append({'label': display, 'value': type_id})
             if not type_options:
                 form_content = html.Div("No bot types registered. Check modules.")
@@ -263,33 +341,56 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks,
                     dcc.Dropdown(id='bot-type-selector', options=type_options, value=type_options[0]['value']),
                     html.Div(id='dynamic-bot-form')
                 ])
-        else:  # close
+        else:
             add_style = {'display': 'none'}
         new_add = add_clicks
 
-    # --- Handling Settings button ---
     elif triggered_id == 'settings-btn':
-        if settings_clicks % 2 == 1:  # open
+        if settings_clicks % 2 == 1:
             settings_style = {'display': 'block'}
             new_add = 0
             new_logs = 0
-        else:  # close
+            new_time = 0
+        else:
             settings_style = {'display': 'none'}
         new_settings = settings_clicks
 
-    # --- Handling Logs button ---
     elif triggered_id == 'logs-btn':
-        if logs_clicks % 2 == 1:  # open
+        if logs_clicks % 2 == 1:
             logs_style = {'display': 'block'}
             new_add = 0
             new_settings = 0
-            # Load last 20 lines of app log
+            new_time = 0
             logs_content = '\n'.join(perf_logger.get_recent_logs('all', 20))
-        else:  # close
+        else:
             logs_style = {'display': 'none'}
         new_logs = logs_clicks
 
-    # --- Handling form close buttons ---
+    elif triggered_id == 'time-btn':
+        phase = time_clicks % 3  # ← was % 2
+        if phase == 1:
+            # First click → short
+            time_style = {'display': 'block'}
+            new_add = 0
+            new_settings = 0
+            new_logs = 0
+            time_content = build_short_telemetry_content()
+            time_mode = 'short'
+        elif phase == 2:
+            # Second click → full
+            time_style = {'display': 'block'}
+            new_add = 0
+            new_settings = 0
+            new_logs = 0
+            time_content = build_full_telemetry_content()
+            time_mode = 'full'
+        else:
+            # phase == 0 → close
+            time_style = {'display': 'none'}
+            time_mode = 'closed'
+        new_time = time_clicks
+
+    # Closing forms
     elif triggered_id in ['cancel-add-btn', 'save-bot-btn']:
         add_style = {'display': 'none'}
         new_add = 0
@@ -298,9 +399,9 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks,
         settings_style = {'display': 'none'}
         new_settings = 0
 
-    # Return tuple of 8 values (order strictly matches Outputs)
     return (add_style, form_content, settings_style, new_add, new_settings,
-            logs_style, logs_content, new_logs)
+            logs_style, logs_content, new_logs,
+            time_style, new_time, time_content, time_mode)
 
 @app.callback(
     Output('dynamic-bot-form', 'children'),
@@ -309,13 +410,13 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks,
 def update_dynamic_form(bot_type):
     if not bot_type:
         return html.Div("Select a bot type")
-    meta_cls = bot_registry.get_model(f"{bot_type}.type")
-    if not meta_cls or not hasattr(meta_cls, 'form_component'):
+    _meta_cls = bot_registry.get_model(f"{bot_type}.type")
+    if not _meta_cls or not hasattr(_meta_cls, 'form_component'):
         return html.Div(f"Form for type '{bot_type}' not found")
     try:
-        return meta_cls.form_component(current_bot_id=None)
+        return _meta_cls.form_component(current_bot_id=None)
     except TypeError:
-        return meta_cls.form_component()
+        return _meta_cls.form_component()
     except Exception as e:
         logger.error(f"Error rendering form: {e}")
         return html.Div(f"Error loading form: {e}")
@@ -340,9 +441,9 @@ def save_bot(n_clicks, bot_type, field_values, field_ids, trigger):
         if field:
             config[field] = val
 
-    meta_cls = bot_registry.get_model(f"{bot_type}.type")
-    if meta_cls and hasattr(meta_cls, 'prepare_new_config'):
-        config = meta_cls.prepare_new_config(config)
+    _meta_cls = bot_registry.get_model(f"{bot_type}.type")
+    if _meta_cls and hasattr(_meta_cls, 'prepare_new_config'):
+        config = _meta_cls.prepare_new_config(config)
 
     bot_id = add_bot(bot_type, f"{bot_type} bot", config)
     bot_manager.add_bot(bot_id)
@@ -366,8 +467,8 @@ def render_bots(trigger, editing_bots, pathname, relayout_store):
     for bot in bots:
         bot_id = bot['id']
         bot_type = bot['type']
-        meta_cls = bot_registry.get_model(f"{bot_type}.type")
-        if not meta_cls:
+        _meta_cls = bot_registry.get_model(f"{bot_type}.type")
+        if not _meta_cls:
             continue
         config = get_bot_config(bot_id)
         if not config:
@@ -376,11 +477,11 @@ def render_bots(trigger, editing_bots, pathname, relayout_store):
 
         if editing_bots.get(str(bot_id)):
             # Edit mode
-            if hasattr(meta_cls, 'form_component'):
+            if hasattr(_meta_cls, 'form_component'):
                 try:
-                    form = meta_cls.form_component(current_bot_id=bot_id)
+                    form = _meta_cls.form_component(current_bot_id=bot_id)
                 except TypeError:
-                    form = meta_cls.form_component()
+                    form = _meta_cls.form_component()
                 except Exception as e:
                     form = html.Div(f"Error loading form: {e}")
             else:
@@ -395,8 +496,8 @@ def render_bots(trigger, editing_bots, pathname, relayout_store):
             bot_blocks.append(html.Div(edit_block, id={'type': 'bot-card', 'index': bot_id}, key=str(bot_id)))
         else:
             # Normal mode
-            if hasattr(meta_cls, 'render_block'):
-                block = meta_cls.render_block(bot_id, config, relayout_store)
+            if hasattr(_meta_cls, 'render_block'):
+                block = _meta_cls.render_block(bot_id, config, relayout_store)
                 bot_blocks.append(html.Div(block, id={'type': 'bot-card', 'index': bot_id}, key=str(bot_id)))
             else:
                 bot_blocks.append(html.Div(
@@ -501,7 +602,6 @@ def delete_bot_callback(n_clicks_list, ids_list, trigger):
 
     # If no suitable click found (e.g., n_clicks=0)
     return no_update
-# ---------- Inline editing (fixed callbacks) ----------
 
 @app.callback(
     [Output('editing-bots', 'data', allow_duplicate=True),
@@ -570,10 +670,10 @@ def save_editing(n_clicks_list, btn_ids, field_values, field_ids, editing, trigg
     if not bot:
         return no_update, no_update
     bot_type = bot['type']
-    meta_cls = bot_registry.get_model(f"{bot_type}.type")
+    _meta_cls = bot_registry.get_model(f"{bot_type}.type")
 
-    if meta_cls and hasattr(meta_cls, 'process_edit_save'):
-        config = meta_cls.process_edit_save(bot_id, new_fields, old_config)
+    if _meta_cls and hasattr(_meta_cls, 'process_edit_save'):
+        config = _meta_cls.process_edit_save(bot_id, new_fields, old_config)
     else:
         config = old_config.copy()
         config.update(new_fields)
@@ -628,40 +728,72 @@ def cancel_editing(n_clicks_list, editing):
     perf_logger.set_mood('cancel')
     return editing
 
-# ---------- Settings ----------
-
 @app.callback(
-    Output('settings-panel', 'children', allow_duplicate=True),
+    [Output('settings-panel', 'style', allow_duplicate=True),
+     Output('settings-btn', 'n_clicks', allow_duplicate=True)],
     Input('save-settings-btn', 'n_clicks'),
     [State('debug-checkbox', 'value'),
      State({'type': 'log-level-dropdown', 'module': ALL}, 'value'),
-     State({'type': 'log-level-dropdown', 'module': ALL}, 'id')],
+     State({'type': 'log-level-dropdown', 'module': ALL}, 'id'),
+     State('log-retention-days', 'value')],
     prevent_initial_call=True
 )
-def save_settings(n_clicks, debug_val, log_levels, level_ids):
+def save_settings(n_clicks, debug_val, log_levels, level_ids, retention_days):
     if not n_clicks:
-        return no_update
+        return no_update, no_update
     try:
-        debug_mode = 'True' if debug_val and 'debug' in debug_val else 'False'
-        save_setting('debug_mode', debug_mode)
+        _debug_mode = 'True' if debug_val and 'debug' in debug_val else 'False'
+        save_setting('debug_mode', _debug_mode)
+        save_setting('log_retention_days',
+                     str(int(retention_days or LOG_RETENTION_DAYS_DEFAULT)))
+
         settings_update = {}
         for level_val, id_dict in zip(log_levels, level_ids):
             module = id_dict['module']
             settings_update[f'{module}_level'] = level_val
         perf_logger.update_settings(settings_update)
         save_setting('logging_settings', json.dumps(perf_logger.settings))
+        perf_logger.cleanup_old_logs(int(retention_days or 0))
     except Exception as e:
         logger.error(f"Error saving settings: {e}")
+        return no_update, no_update   # panel remains open
 
     perf_logger.set_mood('happy')
-    return no_update  # children not changed, only trigger command
+    # close panel + reset the settings button counter,
+    # so that the next opening works again (toggle by %2)
+    return {'display': 'none'}, 0
 
 @app.callback(
-    Output('global-interval-debug', 'children'),
-    Input('global-interval', 'n_intervals')
+    [Output('header-mood-command', 'data', allow_duplicate=True),
+     Output('logs-content', 'children', allow_duplicate=True),
+     Output('time-content', 'children', allow_duplicate=True)],
+    Input('tick-1s', 'n_intervals'),
+    [State('header-mood', 'data'),
+     State('logs-panel', 'style'),
+     State('time-panel-mode', 'data')],
+    prevent_initial_call=True
 )
-def debug_interval(n):
-    return f"Interval: {n}"
+def on_tick_1s(n, current_mood, logs_style, time_mode):
+    # 1) Mood polling — only when the previous "mood" has already played out
+    mood_out = no_update
+    if current_mood == 'normal':
+        mood = perf_logger.get_pending_mood()
+        if mood:
+            mood_out = mood
+
+    # 2) Logs — only if the panel is open
+    logs_out = no_update
+    if logs_style and logs_style.get('display') != 'none':
+        logs_out = '\n'.join(perf_logger.get_recent_logs('all', 20))
+
+    # 3) Time — only if the panel is open
+    time_out = no_update
+    if time_mode == 'short':
+        time_out = build_short_telemetry_content()
+    elif time_mode == 'full':
+        time_out = build_full_telemetry_content()
+
+    return mood_out, logs_out, time_out
 
 if __name__ == '__main__':
     debug_mode = get_setting('debug_mode', 'False') == 'True'
