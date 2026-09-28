@@ -5,6 +5,9 @@
 # This software is for educational purposes only. Use at your own risk.
 
 from typing import Dict, Callable, Optional, Any
+from .logger import perf_logger
+
+logger = perf_logger.get_logger('exchange', 'app')
 
 class ExchangeHandle:
     """An intermediary for accessing another bot's data."""

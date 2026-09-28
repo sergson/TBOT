@@ -1,5 +1,5 @@
 # requirements.txt
-dash>=2.0.0
+dash[async]>=2.0.0
 plotly>=5.0.0
 pandas>=1.3.0
 ccxt>=4.0.0

@@ -9,6 +9,9 @@ from typing import Dict, Any, Optional
 import asyncio
 from .registry import auto_reg
 from .database import DBSQLite3, MODEL_REGISTRY
+from core.time_sync import time_sync_service
+import time
+from .logger import perf_logger
 
 @auto_reg
 class BaseBot(ABC):
@@ -17,12 +20,14 @@ class BaseBot(ABC):
 
     def __init__(self, bot_id: int, manager=None):
         self.bot_id = bot_id
+        self.logger = perf_logger.get_logger(f"base_bot_{bot_id}", "app")
         self.running = False
         self.task = None
         self.manager = manager
         self.dynamics: Dict[int, Any] = {}
         self.config_dirty = False
         self.db_path = f"data/bot_{bot_id}.db"
+        self.time_sync = time_sync_service
 
         # Initialize ORM environment
         self.env = DBSQLite3(self.db_path, registry=MODEL_REGISTRY)
@@ -59,3 +64,12 @@ class BaseBot(ABC):
     async def on_config_updated(self):
         """Called after configuration changes via the web interface."""
         pass
+
+    def get_time_ns(self) -> int:
+        """
+Returns the exact UTC time if the service is available; otherwise, returns the system time."""
+        try:
+            return self.time_sync.get_utc_ns()
+        except Exception as e:
+            self.logger.Error(f"Time core synchronization error: {e}")
+            return time.time_ns()

@@ -7,15 +7,24 @@
 import sqlite3
 import json
 import os
+import time
 import threading
-from typing import Optional, List, Dict, Any, Union, Tuple, Callable
+from typing import Optional, List, Dict, Any, Union, Tuple
 from .logger import perf_logger
-from .registry import bot_registry
 
 logger = perf_logger.get_logger('database', 'database')
 
 DB_CONFIG = 'config.db'
 DATA_DIR = 'data'
+
+# ----------------------------------------------------------------------
+# TimeSync persistent state (separate DB from config.db)
+# ----------------------------------------------------------------------
+TIMESYNC_DB = 'timesync_config.db'
+TIMESYNC_DB_LOCK = threading.RLock()
+_TIMESYNC_DB_READY = False
+
+DRIFT_HISTORY_MAX = 100          # ~10 days at 10 samples/day
 
 # ----------------------------------------------------------------------
 # Field classes
@@ -37,7 +46,6 @@ class Field:
 
     def from_db(self, value):
         return value
-
 
 class Char(Field):
     def sql_type(self):
@@ -93,7 +101,6 @@ class Json(Field):
         except (json.JSONDecodeError, TypeError):
             return value
 
-
 # ----------------------------------------------------------------------
 # Model registry and metaclass
 # ----------------------------------------------------------------------
@@ -142,12 +149,10 @@ class ModelMeta(type):
                 logger.debug(f"Registered model '{_name}' -> table '{cls._table}' with fields: {list(fields.keys())}")
         return cls
 
-
 class Model(metaclass=ModelMeta):
     _name = None
     _table = None
     _fields = {}
-
 
 # ----------------------------------------------------------------------
 # Domain parser
@@ -176,7 +181,6 @@ def _parse_condition(token):
         return f"{field} {op} ?", [value]
     else:
         raise ValueError(f"Unsupported operator '{op}'")
-
 
 def _domain_to_sql(domain: list) -> Tuple[str, list]:
     if not domain:
@@ -219,7 +223,6 @@ def _domain_to_sql(domain: list) -> Tuple[str, list]:
             return "1=1", []
         return " AND ".join(conditions), params
 
-
 # ----------------------------------------------------------------------
 # Record and Recordset
 # ----------------------------------------------------------------------
@@ -241,7 +244,9 @@ class Record:
         self._manager.unlink_records([self])
     def read(self, fields=None):
         return self._manager.read_records([self], fields)[0]
-
+    def refresh(self):
+        new_data = self._manager.read_records([self])[0]
+        self._data.update(new_data)
 
 class Recordset:
     def __init__(self, manager, records: List[Record]):
@@ -275,7 +280,6 @@ class Recordset:
             key_func = key
         new_records = sorted(self._records, key=key_func, reverse=reverse)
         return Recordset(self._manager, new_records)
-
 
 # ----------------------------------------------------------------------
 # ModelManager
@@ -482,7 +486,6 @@ class ModelManager:
             col_names = [desc[0] for desc in cur.description]
             return [dict(zip(col_names, row)) for row in rows]
 
-
 # ----------------------------------------------------------------------
 # DBSQLite3 environment
 # ----------------------------------------------------------------------
@@ -535,7 +538,6 @@ class DBSQLite3:
     def close(self):
         self.conn.close()
 
-
     def drop_table(self, table_name: str):
         with self.lock:
             self.conn.execute(f"DROP TABLE IF EXISTS {table_name}")
@@ -547,8 +549,6 @@ class DBSQLite3:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             )
             return [row[0] for row in cur.fetchall()]
-
-
 
 class _TransactionContext:
     def __init__(self, env: DBSQLite3):
@@ -568,7 +568,6 @@ class _TransactionContext:
         finally:
             self.env.lock.release()      # release lock
         return False
-
 
 # ----------------------------------------------------------------------
 # Original core database functions (preserved)
@@ -710,6 +709,77 @@ def cleanup_orphan_databases():
                 logger.info(f"Removed orphan database {f}")
             except Exception as e:
                 logger.error(f"Failed to remove {f}: {e}")
+
+# ----------------------------------------------------------------------
+# TimeSync config DB
+# ----------------------------------------------------------------------
+
+def init_timesync_db():
+    """Idempotent. Creates timesync_config.db + drift_history."""
+    global _TIMESYNC_DB_READY
+    if _TIMESYNC_DB_READY:
+        return
+    with TIMESYNC_DB_LOCK:
+        if _TIMESYNC_DB_READY:
+            return
+        with sqlite3.connect(TIMESYNC_DB, timeout=30) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS drift_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_ns INTEGER NOT NULL,
+                    drift_slope_ppm REAL NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_drift_history_ts
+                ON drift_history (timestamp_ns)
+            ''')
+            conn.commit()
+        _TIMESYNC_DB_READY = True
+
+def append_drift_sample(drift_slope_ppm: float,
+                        timestamp_ns: Optional[int] = None,
+                        max_rows: int = DRIFT_HISTORY_MAX) -> None:
+    """Insert one rate sample and rotate oldest rows beyond max_rows."""
+    init_timesync_db()
+    if timestamp_ns is None:
+        timestamp_ns = time.time_ns()
+    with TIMESYNC_DB_LOCK:
+        with sqlite3.connect(TIMESYNC_DB, timeout=30) as conn:
+            conn.execute(
+                'INSERT INTO drift_history (timestamp_ns, drift_slope_ppm) VALUES (?, ?)',
+                (int(timestamp_ns), float(drift_slope_ppm))
+            )
+            conn.execute('''
+                DELETE FROM drift_history
+                WHERE id NOT IN (
+                    SELECT id FROM drift_history ORDER BY id DESC LIMIT ?
+                )
+            ''', (int(max_rows),))
+            conn.commit()
+
+def load_drift_history(limit: Optional[int] = None) -> List[Tuple[int, float]]:
+    """Oldest-first list of (timestamp_ns, drift_slope_ppm)."""
+    init_timesync_db()
+    with TIMESYNC_DB_LOCK:
+        with sqlite3.connect(TIMESYNC_DB, timeout=30) as conn:
+            if limit is not None:
+                cur = conn.execute(
+                    'SELECT timestamp_ns, drift_slope_ppm FROM drift_history '
+                    'ORDER BY id DESC LIMIT ?', (int(limit),)
+                )
+                rows = cur.fetchall()
+                rows.reverse()
+            else:
+                cur = conn.execute(
+                    'SELECT timestamp_ns, drift_slope_ppm FROM drift_history '
+                    'ORDER BY id ASC'
+                )
+                rows = cur.fetchall()
+    return [(int(t), float(v)) for t, v in rows]
 
 # ----------------------------------------------------------------------
 # Base model(s) for bot settings (shared across bots)
