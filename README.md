@@ -3,7 +3,7 @@
 ## Architecture
 
 The project is built on a modular, plugin-based architecture with a central model registry.  
-The core (`core/`) provides foundational services (ORM database access, logging, bot lifecycle), while all business logic resides in independent modules inside the `modules/` folder. The core has no hardcoded knowledge of any specific bot type — everything is discovered and assembled at runtime.
+The core (`core/`) provides foundational services (ORM database access, logging, bot lifecycle, time synchronization), while all business logic resides in independent modules inside the `modules/` folder. The core has no hardcoded knowledge of any specific bot type — everything is discovered and assembled at runtime.
 
 ### Key Principles
 
@@ -29,6 +29,7 @@ The core (`core/`) provides foundational services (ORM database access, logging,
     │   ├── bot_manager.py         # Bot lifecycle management
     │   ├── database.py            # ORM layer, declarative models, DB utilities
     │   ├── logger.py              # Configurable logger with moods
+    │   ├── time_sync.py           # Adaptive NTP-based precise time service
     │   ├── colors.py              # Color palette (reference)
     │   ├── styles.py              # Standard styles, fonts, margins
     │   └── graphics.py            # Atomic factories for Plotly graphic elements
@@ -86,6 +87,19 @@ For dynamic tables (e.g., collector candles) the flag `_dynamic = True` and the 
 - **`core/colors.py`** — centralized color palette used across all modules. Changing a constant updates the color throughout the application.
 - **`core/styles.py`** — standard values for fonts, margins, borders, and ready-made style dictionaries (e.g., `STYLE_BOTCARD`, `bot_card_header_style()`).
 - **`core/graphics.py`** — atomic Plotly factories: lines, horizontal lines, markers, candles, volumes, `apply_layout`. They simplify chart building and ensure uniformity.
+
+## Time Synchronization Service
+
+`core/time_sync.py` provides an adaptive NTP-based precise time service. It is a thread-safe singleton, started once in `app.py` before any bot logic, and exposes lock-free UTC access to all modules.
+
+- **Architecture** — a colony of autonomous filter instances. Each instance independently filters NTP samples using its own threshold and history, chooses a favorite server, and evolves (reproduces, dies, inherits experience). A consensus layer aggregates the instances’ outputs into a single correction, applying robust statistics and a post-gate filter.
+- **PLL clock model** — maintains `anchor_offset` and `rate` (drift). The model is published as an immutable `ClockSnapshot` with a dynamic TTL and declared accuracy. External consumers can obtain UTC via `get_utc_ns()` (lock-free) or `get_clock_snapshot(precision_ns)` with strict precision guarantees.
+- **Self-healing** — watchdog restarts dead sync threads, handles sleep/resume events, and can trigger a full colony cold start if consensus degrades. Colony bias integrator compensates constant server offsets.
+- **Keep-awake** — on Windows, disables Modern Standby and Power Throttling; on Linux, checks that systemd sleep targets are masked.
+- **Public API** — `start()`, `stop()`, `wait_for_first_sync()`, `get_utc_ns()`, `get_utc_ns_with_precision()`, `get_clock_snapshot()`, `get_sync_telemetry()`.
+- **Telemetry** — full diagnostic dump available via `get_sync_telemetry()` and rendered in the UI (⏱ button) in short and full forms.
+
+The service is designed to operate as a node-wide time source: once moved to a separate process/factory, it will retain state, perform graceful shutdown, and provide health-checks for the whole node.
 
 ## Settings Database (`config.db`)
 
@@ -263,14 +277,21 @@ When a bot is stopped or removed, `BotManager` automatically removes references 
 - Contains a mood queue and `get_pending_mood()` method for UI indication.
 - `get_recent_logs()` returns the last lines from log files.
 
+### `core/time_sync.py`
+- Adaptive NTP-based precise time service (`TimeSyncService` singleton).
+- Colony of autonomous filter instances with consensus, PLL clock model, colony bias integrator.
+- Lock-free `get_utc_ns()`, `get_clock_snapshot()`, `get_sync_telemetry()`.
+- Watchdog, keep-awake, graceful start/stop.
+- See [Time Synchronization Service](#time-synchronization-service) above.
+
 ### `core/colors.py` / `core/styles.py` / `core/graphics.py`
 - Centralized references for colors, styles, and graphic element factories.
 
 ### `app.py`
 - Universal Dash UI.
-- Sticky panel with buttons ➕ (add bot), ⚙️ (settings), 📋 (logs).
+- Sticky panel with buttons ➕ (add bot), ⚙️ (settings), 📋 (logs), ⏱ (time telemetry).
 - Supports header moods via Store and callbacks.
-- Log panel updates every 1 sec if open.
+- Log panel updates every 1 sec if open; time panel provides short/full telemetry on demand.
 - Dynamically discovers bot types and renders their cards.
 - Bot cards use `html.Details`/`html.Summary` for collapsing; header color reflects status (green — running, red — stopped).
 
@@ -310,6 +331,7 @@ The application will be available at `http://127.0.0.1:8050`.
 - The ⚙️ button opens the settings panel: debug mode, logging levels for different modules.
 - The ➕ button adds a new bot; choose the type from the dropdown and fill out the form.
 - The 📋 button shows recent log entries.
+- The ⏱ button shows time synchronization telemetry (short on first click, full on second, closes on third).
 - The T.B.O.T header collapses/expands on click; when collapsed, it shrinks and compresses.
 - Bot cards collapse by clicking the header; header color indicates status.
 
@@ -324,6 +346,18 @@ The application will be available at `http://127.0.0.1:8050`.
 ## Disclaimer
 
 **Risk Warning:** Trading cryptocurrencies and other digital assets involves significant risk and may result in the loss of your invested capital. This software is provided for educational and research purposes only. The author assumes no responsibility for any financial losses or damages incurred through the use of this software. Use at your own risk.
+
+## Support the Project ☕
+
+If this project has saved you time or helped in your work, you can support its development using cryptocurrency:
+
+| Network / Token | Wallet Address |
+| :--- | :--- |
+| **💚 USDT (TRC-20)** | TCnh86qJvsmRdkKajafcFqzbvY2Eiqw4UE |
+| **🔷 EVM (ETH / BSC / Polygon)** | 0x650C779ABf16e2D697957E73f53F781cdBA49Ecc |
+| **₿ BTC** | bc1qwekqfc0epnmfkm4n4sfd3s6d4ku69pw5xphtg0 |
+
+*Please double-check the network before sending funds.*
 
 ## Author
 
