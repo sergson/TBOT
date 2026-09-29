@@ -57,19 +57,57 @@ def _emit_deferred_logs(logs: List[Tuple[str, str]]) -> None:
 
 #Default NTP servers, similar to testing
 DEFAULT_NTP_SERVERS=[
+            'krgnss.krzem.ru',
+            'ntp1.niiftri.irkutsk.ru', #часто bais до1 ms
+            #'ntp2.niiftri.irkutsk.ru', #часто bais около 2ms
+            #'time.apple.com', #часто таймаут
+            #'ntp.nict.jp', часто bias 10ms
             'time.google.com',
+            #'ntp1.vniiftri.ru', #большая задержка
+            #'ntp2.vniiftri.ru', #большая задержка
             'ntp3.vniiftri.ru',
+            #'ntp4.vniiftri.ru', #большая задержка
+            #'ntp21.vniiftri.ru', #часто тайм-аут
             'vniiftri.khv.ru',
             'ptbtime1.ptb.de',
+            'ptbtime2.ptb.de',
             'time.cloudflare.com',
             'time.aws.com',
-            'ntp.msk-ix.ru',
+            'ntp.msk-ix.ru', #,бывает bias до 6
+            #'time.windows.com',#часто bais до 10 ms
+            #'ntp.ix.ru', #бывает bias до 7ms
+            #'clepsydra.dec.com', ошибка
+            #'time.nist.gov', #бывает bias до 2 ms
+            #'ntp.mobatime.ru', ошибка
+            #'ntp0.ntp-servers.net', #,sdftn bias до 6
+            #'ntp1.stratum1.ru', ошибка
+            #'ntp.ru', timeout
             'ts1.aco.net',
+            #'tick.usask.ca',# bias более 1ms
+            #'ntp.nsu.ru',timeout
+            #'ntp.psn.ru', ошибка
+            #'ntp.rsu.edu.ru', ошибка
+            #'x.ns.gin.ntt.net', bais 2ms
+            #'clock.sjc.he.net', timeout
+            #'ntp.fiord.ru', timeout
             'time1.ams-ix.net',
+            #'ntp.ntsc.ac.cn' timeout
+            #'ntp1.jst.mfeed.ad.jp',#Bias 2..3ms
+            #'time.fu-berlin.de', #Bias 2..3ms
+            #'time1.esa.int',#bais до 2 ms
+            #'nts.netnod.se',таймаут
+            #'nts1.time.nl' #bais до 2 ms,
+            #'time.facebook.com',#таймаут
             'ntp.se',
-            'ntp1.inrim.it',
+            #'ntp.yandex.ru',#таймаут
+            #'ntp1.oma.be',#таймаут
+            #'time.nplindia.org',#большая задержка
+            #'ntp1.inrim.it',#bais до 2 ms
             'ntp.metas.ch',
             'ntp.kriss.re.kr',
+            #'ntp.postech.ac.kr', #timeout
+            #'ntp.ntu.edu.tw',#большая задержка
+            #'ntp.gpstime.kr' #timeout
         ]
 
 # Windows Modern Standby: by default we ask the system not to go into
@@ -1226,7 +1264,7 @@ class Consensus:
                 matrix_rows.append([])  # NEW
                 continue
 
-            # NEW: matrix row from accepted cells
+            # matrix row from accepted cells
             row = [(srv, int(smp[2] - smp[1]), int(smp[0]), int(smp[1]))
                    for srv, smp in f['accepted']]
             matrix_rows.append(row)
@@ -2086,6 +2124,13 @@ class TimeSyncService:
 
         self._last_drift_persist_tick: int = 0
 
+        # Monotonic floor for get_utc_ns_monotonic().
+        # Holds the maximum value ever returned by get_utc_ns_monotonic().
+        # Reset in start() and stop().
+        # See § "get_utc_ns_monotonic" in the module docstring.
+        self._mono_floor_ns: int = 0
+        self._mono_floor_lock: threading.Lock = threading.Lock()
+
     # -----------------------------------------------------------------
     # Public API
     # -----------------------------------------------------------------
@@ -2121,6 +2166,9 @@ class TimeSyncService:
 
         self.running = True
         self._stop_event.clear()
+
+        with self._mono_floor_lock:
+            self._mono_floor_ns = 0
 
         self._start_sync_thread(0, 0.0)
         self._start_sync_thread(1, self.second_sync_thread_delay)
@@ -2172,7 +2220,15 @@ class TimeSyncService:
             keep_awake.join(timeout=WATCHDOG_STOP_JOIN_SEC)
             if keep_awake.is_alive():
                 logger.warning(f"Keep-awake {keep_awake.name} did not finish within the allotted time")
-
+        # Reset monotonic floor BEFORE switching the source of get_utc_ns()
+        # to time.time_ns(), so that after stop() completes the floor does not
+        # pin a past model value when get_utc_ns() starts returning wall-clock.
+        # A negligible race window remains between the two operations; a
+        # concurrent caller can repopulate the floor with a model value in
+        # that window — this is bounded by the last model value and resolves
+        # within the magnitude of the step.
+        with self._mono_floor_lock:
+            self._mono_floor_ns = 0
         self.is_synced_event.clear()
 
     def get_sync_telemetry(self) -> Dict[str, Any]:
@@ -2260,6 +2316,53 @@ class TimeSyncService:
             return time.time_ns()
         now = time.monotonic_ns()
         return now + self._calculate_current_offset(now)
+
+    def get_utc_ns_monotonic(self) -> int:
+        """Returns a guaranteed non-decreasing estimate of UTC, in nanoseconds.
+
+        Unlike get_utc_ns(), which is a raw UTC estimate and may step
+        backward when the clock model is re-anchored (primary sync,
+        phase-jump reset, stop/restart), this method guarantees:
+
+            get_utc_ns_monotonic() at t2 >= get_utc_ns_monotonic() at t1
+            for any t2 > t1.
+
+        Mechanism — flat floor:
+            The maximum value ever returned is stored. A raw UTC value
+            below the floor is not returned; the floor is held until
+            real time catches up.
+
+        Semantics during catch-up:
+            When the underlying model has stepped backward, this method
+            returns the previous maximum and holds it, so the caller
+            observes a *pause* rather than a backward step. During this
+            interval the returned value may briefly LEAD true UTC by up
+            to the magnitude of the step.
+
+        Reset:
+            The floor is zeroed in start() and stop(). It therefore does
+            not persist across service restarts.
+
+        Thread-safety:
+            Takes a small dedicated lock. Safe to call from any thread.
+
+        Do NOT use for:
+            • elapsed-time measurement — use time.monotonic_ns() instead;
+            • strict absolute-UTC accuracy — use get_utc_ns_with_precision().
+
+        Use for:
+            • ordering events across services;
+            • log timestamps where monotonicity matters more than the
+              absolute value;
+            • TSO / distributed transactions with a skew budget;
+            • rate limiting, cache TTL.
+        """
+        raw = self.get_utc_ns()
+        with self._mono_floor_lock:
+            if raw <= self._mono_floor_ns:
+                return self._mono_floor_ns
+            self._mono_floor_ns = raw
+            return raw
 
     def get_utc_ns_with_precision(self, precision_ns: int) -> Optional[int]:
         """Returns UTC with guarantee |utc − utc_true| ≤ precision_ns.
@@ -3180,6 +3283,8 @@ class TimeSyncService:
                                rejected_offset_ns: Optional[int] = None,
                                rejected_prediction_ns: Optional[int] = None,
                                applied: bool = True) -> None:
+        if not self.running:
+            return
         new_target_offset = int(best_utc - best_mono)
 
         # --- Rejected by post-gate: write to history, touch PLL carefully ---

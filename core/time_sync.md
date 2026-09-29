@@ -977,7 +977,8 @@ svc.start()
 svc.wait_for_first_sync(timeout=30)
 svc.stop()
 
-svc.get_utc_ns()                                 # lock-free UTC ns
+svc.get_utc_ns()                                 # lock-free UTC ns, raw UTC estimate, may step backward
+svc.get_utc_ns_monotonic()						 # lock-free UTC ns with monotonic adds, guaranteed non-decreasing; may briefly lead UTC
 svc.get_utc_ns_with_precision(precision_ns)      # UTC ns | None (strict SLA)
 svc.get_clock_snapshot()                         # ClockSnapshot | None
 svc.get_clock_snapshot(precision_ns=500_000)     # TTL fits precision
@@ -998,6 +999,75 @@ Guarantee: for `now_mono ∈ [anchor_mono, anchor_mono + ttl_ns]`:
 ```
 
 provided that the consensus has not degraded more than at the moment of the snapshot.
+
+### Monotonic UTC — `get_utc_ns_monotonic()`
+
+`get_utc_ns()` returns a raw estimate of UTC. It is monotonic while the
+underlying clock model `(anchor_mono, anchor_offset, rate)` is unchanged,
+but the model **may step backward** in the following cases:
+
+| Scenario | Magnitude | Frequency |
+|---|---|---|
+| Primary synchronization (`is_synced_event` transitions from unset to set) | up to hundreds of ms | once per service lifetime |
+| Phase-jump reset (`\|phase_err\| > PHASE_JUMP_THRESHOLD_NS`) | > 100 ms | rare (sleep/resume, OS step, NTP glitch) |
+| Service stop / restart | up to hundreds of ms | on demand |
+
+Consumers that assume monotonicity (logging pipelines, TSO, rate-limiters,
+cache TTL) require a **separate** API that guarantees non-decreasing output.
+
+#### Guarantee
+
+For any `t2 > t1`:
+
+```
+get_utc_ns_monotonic() at t2  ≥  get_utc_ns_monotonic() at t1
+```
+
+#### Mechanism
+
+Flat floor: the maximum value ever returned is stored; a raw value below
+the floor is replaced by the floor until real time catches up.
+
+- On a backward step, the caller observes a **pause**, not a backward jump.
+- During the pause, the returned value may briefly **lead** true UTC by up
+  to the magnitude of the step.
+
+#### Reset
+
+The floor is zeroed in `start()` and `stop()`. It does not persist across
+service restarts.
+
+#### Thread-safety
+
+Takes a small dedicated lock. Safe to call from any thread.
+
+#### Consumer guidance
+
+| Task | Recommended call |
+|---|---|
+| Absolute timestamp for a log record | `get_utc_ns()` |
+| Ordering events across services | `get_utc_ns_monotonic()` |
+| Measuring duration (elapsed) | `time.monotonic_ns()` directly |
+| Rate limiting, cache TTL | `get_utc_ns_monotonic()` |
+| Strict SLA precision | `get_utc_ns_with_precision(ns)` |
+| TSO / distributed transactions | `get_utc_ns_monotonic()` with a skew budget |
+
+**Rule:** never measure elapsed time via `get_utc_ns()` — always via
+`time.monotonic_ns()`.
+
+#### Non-goals
+
+`get_utc_ns()` is deliberately **not** made monotonic. It is an estimate
+of UTC; its job is to be *correct*, not monotonic. A floor inside
+`get_utc_ns()` would:
+
+- mask genuine model errors,
+- accumulate one-sided bias if the model is repeatedly wrong in one
+  direction,
+- break the `accuracy_ns ≤ precision_ns` guarantee of `ClockSnapshot`.
+
+The split into two APIs mirrors the model used by Google TrueTime, AWS
+ClockBound, and PTP.
 
 ---
 
@@ -1038,6 +1108,22 @@ provided that the consensus has not degraded more than at the moment of the snap
 | rate | sign-constancy + drift-confirm | sign-constancy only; reset-to-prior at streak ≥ 4 |
 | drift persist to DB | yes | no |
 | force-apply | — | after 50 consecutive rejects |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # Chrony vs T.B.O.T — A Comparative Overview
