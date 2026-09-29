@@ -16,7 +16,8 @@ This document is built **from physics to code**: first — what we measure and h
   - [5. The signal path: from NTP packet to stabilized time](#5-the-signal-path-from-ntp-packet-to-stabilized-time)
   - [6. What each σ means in the system](#6-what-each-σ-means-in-the-system)
   - [7. How the PLL drives the clock](#7-how-the-pll-drives-the-clock)
-  - [8. The colony: why it exists and how it evolves](#8-the-colony-why-it-exists-and-how-it-evolves)
+  - [8. What happens when consensus returns "rejected"](#8-what-happens-when-consensus-returns-rejected)
+  - [9. The colony: why it exists and how it evolves](#9-the-colony-why-it-exists-and-how-it-evolves)
 - [Part II. Flow logic (diagrams)](#part-ii-flow-logic-diagrams)
 - [Part III. Registry of constants](#part-iii-registry-of-constants)
 - [Part IV. Runtime state](#part-iv-runtime-state)
@@ -208,7 +209,7 @@ Step-by-step — **how a physical sample becomes UTC**:
    ┌────────────────────────────────────────────────────────────┐
    │  Step 2. Compensation of the known server bias             │
    │  proposed[srv] −= colony_bias[srv]                          │
-   │  (the gradually accumulated correction, see §8.4)          │
+   │  (the gradually accumulated correction, see §9.4)          │
    └────────────────────────────────────────────────────────────┘
                              │
                              ▼
@@ -239,7 +240,7 @@ Step-by-step — **how a physical sample becomes UTC**:
    │  prediction = drift_prediction (OLS) or short_vote (median) │
    │  delta = consensus_offset − prediction                      │
    │  limit = POST_GATE_K · σ_consensus                          │
-   │  If |delta| > limit → rejected (written to history)         │
+   │  If |delta| > limit → rejected (see §8)                     │
    │  Otherwise → applied (written to applied_offsets)           │
    └────────────────────────────────────────────────────────────┘
                              │
@@ -353,11 +354,178 @@ if dt_ns < self._min_pll_update_interval_ns:
 
 The threshold is half the interval between threads (15 s at a 60-second cycle).
 
-### 8. The colony: why it exists and how it evolves
+### 8. What happens when consensus returns "rejected"
+
+#### 8.1 Where reject comes from
+
+In `_process_round_locked`, after the matrix is assembled:
+
+```python
+consensus_offset = mean(L² cells)   # the fresh observation
+prediction       = drift_prediction | short_vote
+delta            = consensus_offset − prediction
+limit            = POST_GATE_K · σ_consensus
+```
+
+- If `|delta| ≤ limit` → **applied** (the normal path, §7).
+- If `|delta| > limit` → **rejected** with a caveat:
+  - `_consecutive_rejects += 1`;
+  - if the counter reaches `POST_GATE_FORCE_APPLY_AFTER = 50` → **forced apply** (§8.5);
+  - otherwise `applied = False`, and the returned tuple carries `rejected_offset_ns` (raw `consensus_offset`) and `rejected_prediction_ns` (the gate's opinion).
+
+The gate's physical meaning: "what the consensus just measured is **too far** from my verified trajectory. Most likely this is an outlier, not a real clock excursion."
+
+#### 8.2 What does NOT happen on reject
+
+| Not updated | Why this is correct |
+|---|---|
+| `applied_offsets.appendleft(...)` — not called | The "clean" trajectory stays uncontaminated. `σ_consensus`, `drift_slope` (OLS), and `drift_prediction` are all computed from it. If we stuffed rejected outliers in, both σ and the OLS slope would break. |
+| `drift_slope` (OLS over 300 applied) | Does not see the rejected value. OLS is sensitive to a single outlier. |
+| `drift_prediction` base point | Stays at the last applied offset. It is **extrapolated** via `rate·(t_ref − _last_apply_mono)` so it does not freeze in time. |
+| Drift persist to DB (`append_drift_sample`) | The reject branch **returns before** reaching it. |
+| `_last_drift_persist_tick` | Not reset. |
+
+#### 8.3 What DOES happen on reject
+
+**(a) `_recent_observed` is still updated.** Right after the matrix is assembled, **before** the gate:
+
+```python
+self._recent_observed.appendleft(consensus_offset)
+```
+
+This is crucial. `_recent_observed` is a separate window of "all observations, including rejected". `short_vote = median(15)` is computed from it. As a result: the gate's own prediction does not freeze — the median sees fresh data even when `applied_offsets` is stuck.
+
+**(b) A record is written to `_slew_error_history`.** A `SlewRecord` with `rejected_offset_ns ≠ None`, `ref_ns = predicted_now`, and `diff_ns = rejected_offset_ns − predicted_now`. Pure telemetry — it does not enter PLL logic.
+
+**(c) `anchor_offset` shifts, depending on the streak length:**
+
+```python
+dt_ns            = best_mono − self._anchor_mono
+predicted_now    = self._anchor_offset + rate · dt_ns
+phase_err_reject = rejected_offset_ns − predicted_now
+```
+
+| streak | What anchor does | Physics |
+|---|---|---|
+| **streak ≤ 1** | `anchor_offset := rejected_prediction_ns`; `anchor_mono := best_mono` | "This is a single outlier. I do not trust the raw consensus_offset, and I do not shift toward it. I put the anchor at the point that the **verified trajectory** (the gate's prediction) considers correct." The clock keeps running along the old model. |
+| **streak ≥ 2** | `anchor_offset := predicted_now + PLL_KP_REJECT · phase_err_reject` | "The streak is confirmed — the gate is stale. I pull the anchor by 30% (`PLL_KP_REJECT = 0.30`) toward the **raw** consensus_offset, but do not jump all the way." Equivalent to `0.7·predicted_now + 0.3·rejected_offset_ns`. |
+
+The key difference: `rejected_prediction_ns` is the gate's prediction (from `applied_offsets` with rate extrapolation), while `predicted_now` is the PLL's own model prediction (`anchor + rate·dt`). They are usually close, but during a long reject series they diverge — the PLL starts to "catch up" to reality via P-correction, while the gate's prediction stays in the past.
+
+**(d) The `_phase_err_window` is fed and `rate` is corrected.** If `dt_ns ≥ _min_pll_update_interval_ns`:
+
+```python
+self._apply_rate_sign_constancy_step_locked()
+self._phase_err_window.appendleft(phase_err_reject)
+```
+
+Reject deltas **participate in the sign-constancy detector** on a par with accept phases. If 20+ reject deltas in a row have the same sign, the `rate` estimate is systematically biased and the spring pulls it. Order matters: the spring is applied first (window without the current value), then the value is appended — so the reject does not vote for its own decision.
+
+**(e) σ_consensus expands — the gate opens itself.** In `_compute_consensus_sigma_ns`:
+
+```python
+streak = self._consensus._consecutive_rejects
+if streak > 0:
+    grow  = (1.0 / THRESHOLD_SHRINK_FLOOR) ** streak
+    sigma = int(sigma * grow)
+```
+
+With `THRESHOLD_SHRINK_FLOOR = 0.99`:
+
+| streak | σ multiplier | effect on `limit = POST_GATE_K · σ` |
+|---|---|---|
+| 1 | ×1.01 | barely noticeable |
+| 4 | ×1.04 | gate slightly wider |
+| 10 | ×1.11 | noticeably wider |
+| 50 (force-apply) | ×1.65 | gate wide open |
+
+Plus `short_vote` gradually shifts toward the rejected values (via `_recent_observed`), and `drift_prediction` is extrapolated via `rate`. Together this **prevents the gate from sticking**: sooner or later `|delta|` falls below the new `limit`.
+
+**(f) Reset of `rate` to prior after `REJECT_RATE_RESET_STREAK = 4`:**
+
+```python
+if streak >= REJECT_RATE_RESET_STREAK:
+    rate_ppm  = self._rate * 1e6
+    prior_ppm = self._rate_prior * 1e6
+    if abs(rate_ppm − prior_ppm) > REJECT_RATE_RESET_MIN_DIVERGE_PPM:
+        new_ppm = (1 − GAIN)·rate_ppm + GAIN·prior_ppm
+        self._rate = new_ppm * 1e-6
+        self._phase_err_window.clear()
+```
+
+With `GAIN = 1.0` this is a **hard reset** `rate := rate_prior`. Logic: 4 rejects in a row means the clock model (and its `rate`) has drifted too far from what history confirms. Safer to return to the DB prior than to keep extrapolating from a skewed estimate.
+
+The developer's note in the code warns directly: if this happens, check hardware/temperature and **clear the `drift_history` table** — the prior itself may be wrong.
+
+**(g) The clock snapshot is published.** If `rate` changed (via sign-constancy or reset-to-prior) or the dt branch was taken, `_publish_clock_and_metrics_locked()` recomputes TTL and accuracy for the new rate/anchor and invalidates `_precision_cache`. Otherwise external consumers of `get_clock_snapshot(precision_ns=...)` would receive stale numbers.
+
+**(h) `_target_offset` — what we consider the truth:**
+
+```python
+self._target_offset = (
+    rejected_prediction_ns if streak ≤ 1 else rejected_offset_ns
+)
+```
+
+Telemetry only. Meaning: on a single outlier, "the truth" is the gate's prediction; on a confirmed streak, it is the raw consensus itself.
+
+**(i) Colony bias is updated.** `_update_bias_history_locked(raw_snapshot)` with **raw** `proposed` (before bias subtraction). Even if the consensus rejected this particular point as an instantaneous outlier, the server's long-term behavior is still accumulated.
+
+#### 8.4 When the streak resets (accept after reject)
+
+If the gate passes — `self._consecutive_rejects = 0`. Then: σ_consensus returns to its normal form (`grow = 1`), `applied_offsets` starts receiving points again, `drift_slope` begins to "see" them, and the PLL proceeds normally (`predicted + KP·phase_err`).
+
+#### 8.5 Force-apply after 50 consecutive rejects
+
+```python
+if self._consecutive_rejects >= POST_GATE_FORCE_APPLY_AFTER:
+    self._defer_log("warning", "... force-apply ...")
+    self._consecutive_rejects = 0
+    # applied remains True
+```
+
+This is **insurance against a dead lock**. Physics: if 50 rounds in a row (~25 minutes at a 30-second interval) were rejected, then `drift_prediction`/`short_vote` are **hopelessly lagging** the real clock excursion (e.g. an external time step, or a sudden drift change). Force-apply means: "enough. Accept `consensus_offset` as is, reset the counter, rebuild the prediction from the new applied". Then σ_consensus is recomputed and the gate restarts with fresh data.
+
+#### 8.6 Reject vs accept: summary table
+
+| Aspect | accept (applied=True) | reject (applied=False) |
+|---|---|---|
+| `applied_offsets` | appendleft(consensus_offset, t_ref_mono) | **untouched** |
+| `_recent_observed` | appendleft(consensus_offset) | appendleft(consensus_offset) — **same** |
+| `_consecutive_rejects` | reset to 0 | += 1 |
+| `drift_slope` (OLS) | recomputed over applied | not recomputed |
+| `drift_prediction` | updated to the last applied + extrapolation | stays at the old one + extrapolation via rate |
+| `short_vote` | median(15 observed) — including the current | median(15 observed) — **including the rejected** |
+| σ_consensus | `_noise_sigma_ns(applied)` | `_noise_sigma_ns(applied) × (1/0.99)^streak` |
+| anchor_offset | `predicted + KP·phase_err` | `streak ≤ 1`: gate prediction; `streak ≥ 2`: `0.7·predicted + 0.3·rejected` |
+| `_phase_err_window` | appendleft(phase_err) | appendleft(phase_err_reject) |
+| rate: sign-constancy | applied | applied (if dt is sufficient) |
+| rate: drift-confirm | applied | **not applied** |
+| rate: reset-to-prior | — | when `streak ≥ 4` and diverg > 1 ppm |
+| `_target_offset` | new_target_offset | gate prediction (streak≤1) or raw (streak≥2) |
+| Drift persist to DB | yes, once every ~300 ticks | **no** |
+| Colony bias | updated | updated |
+| Publishing the clock snapshot | yes | yes (if rate/anchor changed) |
+
+#### 8.7 The physical meaning of the whole mechanism
+
+The gate protects the PLL from two extremes:
+
+1. **A single outlier** (server blinked, DNS glitch, random interference). The gate says "no", the anchor stays on the verified trajectory, and the clock does not twitch.
+2. **A real step / excursion** (sleep-resume, system clock step, sudden drift change). The gate also says "no" at first, but then:
+   - `short_vote` gradually sees the new points,
+   - σ_consensus expands,
+   - `streak ≥ 2` starts P-correction toward the raw consensus,
+   - `streak ≥ 4` resets `rate` to prior,
+   - `streak ≥ 50` — force-apply.
+
+Thus the system **does not jump on every outlier**, yet **does not stick forever** in the face of a real event. The trade-off between robustness and adaptivity is governed by three numbers: `POST_GATE_K`, `REJECT_RATE_RESET_STREAK`, `POST_GATE_FORCE_APPLY_AFTER`.
+
+### 9. The colony: why it exists and how it evolves
 
 The colony is **not decoration** — it is a mechanism for robust server selection. The idea: different filters with different thresholds and "bindings" give different opinions; consensus averages them; the worst instances die off, the best reproduce.
 
-#### 8.1 Lifecycle
+#### 9.1 Lifecycle
 
 ```
 COLD START → warmup → MATURE → (reproduce | deathbed) → death
@@ -370,7 +538,7 @@ COLD START → warmup → MATURE → (reproduce | deathbed) → death
 - **Death.** `low_accept_windows ≥ 5` → the instance dies.
 - **Divine birth.** If the population drops below `MIN_POPULATION = 5`, a new independent root is created, banning favorites of the stuck instances.
 
-#### 8.2 Favorite — the instance's "preferred server"
+#### 9.2 Favorite — the instance's "preferred server"
 
 A favorite is the server an instance "clings" to: if it passes the filter, the instance holds on to it (armed-lock). Favorite selection:
 
@@ -380,7 +548,7 @@ A favorite is the server an instance "clings" to: if it passes the filter, the i
 
 Physics: the instance does not "flicker" between servers every second. It holds the chosen server while it is honestly responding.
 
-#### 8.3 Consensus matrix
+#### 9.3 Consensus matrix
 
 The matrix is **L×L**, where L is the maximum number for which there are ≥L rows of length ≥L. Each row is a set of `proposed` from one instance. Rows refer to different moments in time (instances poll servers at different moments via `attempt_idx = k`).
 
@@ -388,7 +556,7 @@ The matrix is **L×L**, where L is the maximum number for which there are ≥L r
 
 The arithmetic mean over L² cells is a **balanced estimate of true UTC**.
 
-#### 8.4 Colony bias — compensation for a server's constant offset
+#### 9.4 Colony bias — compensation for a server's constant offset
 
 Some servers lie by a constant amount (e.g. +3 ms). This is not noise — this is a **bias**. It is estimated as follows:
 
@@ -400,7 +568,7 @@ Some servers lie by a constant amount (e.g. +3 ms). This is not noise — this i
 
 Thereafter every new sample of this server is corrected by `bias[srv]`. Physics: we **subtract the server's systematic error** and work only with its noise.
 
-#### 8.5 Spread-gate — when the colony may reproduce
+#### 9.5 Spread-gate — when the colony may reproduce
 
 If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`), the colony is out of phase — reproduction is forbidden. This prevents the fixation of "bad" lineages.
 
@@ -444,7 +612,7 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 │  │ │    consensus_offset = mean(L² cells)                    │
 │  │ ├── post-gate                                              │
 │  │ │    delta = consensus − pred; limit = K·σ_consensus       │
-│  │ │    |delta| > limit → rejected                            │
+│  │ │    |delta| > limit → rejected (see §8)                   │
 │  │ └── _check_triggers_locked()                              │
 │  │      σ_avg capture, reproduction, death, spread-gate      │
 │  └─────────────────────────────────────────────────────────┘
@@ -452,7 +620,7 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  _apply_new_sync_locked(...)                                 │
-│  not applied? → reject-streak logic                         │
+│  not applied? → reject-streak logic (see §8.3)              │
 │  primary sync? → anchor=best_utc, rate=prior                │
 │  |phase_err|>100ms? → reset                                 │
 │  otherwise: predicted, phase_err, anchor += KP·phase_err,   │
@@ -487,6 +655,36 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
           RESET:                  kp = 0.40                kp = 0.10
           anchor=target           boosted                 standard
           rate = prior            catch-up
+```
+
+### Post-gate reject branch (see §8)
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  post-gate: |consensus − pred| > POST_GATE_K·σ_consensus      │
+└─────────────────────────────┬────────────────────────────────┘
+                              ▼
+              ┌──────────────────────────────┐
+              │  _consecutive_rejects += 1   │
+              └───────────────┬──────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+     streak < 50                     streak ≥ 50
+              │                               │
+              ▼                               ▼
+   applied = False                  force-apply
+   · applied_offsets untouched       · streak = 0
+   · _recent_observed updated        · applied = True
+   · σ_consensus × (1/0.99)^streak   · normal PLL path
+   · anchor:                         · prediction rebuilt
+       streak ≤ 1 → gate pred        from the new applied
+       streak ≥ 2 → 0.7·pred + 0.3·raw
+   · rate reset to prior if streak ≥ 4
+   · sign-constancy on phase_err_reject
+   · drift-confirm skipped
+   · no drift persist to DB
+   · publish clock snapshot if rate changed
 ```
 
 ### Instance lifecycle
@@ -828,3 +1026,15 @@ provided that the consensus has not degraded more than at the moment of the snap
 | per-server `σ_s` | MAD of first differences | server noise without outliers |
 | `colony_bias[srv]` | arith. over time → median over servers | common center minus noise |
 | `noise_ref_ns` | **median** of σ_avg over instances | one faulty instance does not spoil the reference |
+
+### Quick cheat sheet: "what happens on reject"
+
+| Aspect | accept | reject |
+|---|---|---|
+| `applied_offsets` | updated | **untouched** |
+| `_recent_observed` | updated | updated (same) |
+| σ_consensus | plain | × (1/0.99)^streak |
+| anchor | `predicted + KP·phase_err` | `streak ≤ 1`: gate prediction; `streak ≥ 2`: `0.7·predicted + 0.3·raw` |
+| rate | sign-constancy + drift-confirm | sign-constancy only; reset-to-prior at streak ≥ 4 |
+| drift persist to DB | yes | no |
+| force-apply | — | after 50 consecutive rejects |
