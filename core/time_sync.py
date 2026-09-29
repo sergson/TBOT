@@ -57,57 +57,20 @@ def _emit_deferred_logs(logs: List[Tuple[str, str]]) -> None:
 
 #Default NTP servers, similar to testing
 DEFAULT_NTP_SERVERS=[
-            'krgnss.krzem.ru',
-            'ntp1.niiftri.irkutsk.ru', #часто bais до1 ms
-            #'ntp2.niiftri.irkutsk.ru', #часто bais около 2ms
-            #'time.apple.com', #часто таймаут
-            #'ntp.nict.jp', часто bias 10ms
+            'ntp1.niiftri.irkutsk.ru',
             'time.google.com',
-            #'ntp1.vniiftri.ru', #большая задержка
-            #'ntp2.vniiftri.ru', #большая задержка
             'ntp3.vniiftri.ru',
-            #'ntp4.vniiftri.ru', #большая задержка
-            #'ntp21.vniiftri.ru', #часто тайм-аут
             'vniiftri.khv.ru',
             'ptbtime1.ptb.de',
             'ptbtime2.ptb.de',
             'time.cloudflare.com',
             'time.aws.com',
-            'ntp.msk-ix.ru', #,бывает bias до 6
-            #'time.windows.com',#часто bais до 10 ms
-            #'ntp.ix.ru', #бывает bias до 7ms
-            #'clepsydra.dec.com', ошибка
-            #'time.nist.gov', #бывает bias до 2 ms
-            #'ntp.mobatime.ru', ошибка
-            #'ntp0.ntp-servers.net', #,sdftn bias до 6
-            #'ntp1.stratum1.ru', ошибка
-            #'ntp.ru', timeout
+            'ntp.msk-ix.ru',
             'ts1.aco.net',
-            #'tick.usask.ca',# bias более 1ms
-            #'ntp.nsu.ru',timeout
-            #'ntp.psn.ru', ошибка
-            #'ntp.rsu.edu.ru', ошибка
-            #'x.ns.gin.ntt.net', bais 2ms
-            #'clock.sjc.he.net', timeout
-            #'ntp.fiord.ru', timeout
             'time1.ams-ix.net',
-            #'ntp.ntsc.ac.cn' timeout
-            #'ntp1.jst.mfeed.ad.jp',#Bias 2..3ms
-            #'time.fu-berlin.de', #Bias 2..3ms
-            #'time1.esa.int',#bais до 2 ms
-            #'nts.netnod.se',таймаут
-            #'nts1.time.nl' #bais до 2 ms,
-            #'time.facebook.com',#таймаут
             'ntp.se',
-            #'ntp.yandex.ru',#таймаут
-            #'ntp1.oma.be',#таймаут
-            #'time.nplindia.org',#большая задержка
-            #'ntp1.inrim.it',#bais до 2 ms
             'ntp.metas.ch',
             'ntp.kriss.re.kr',
-            #'ntp.postech.ac.kr', #timeout
-            #'ntp.ntu.edu.tw',#большая задержка
-            #'ntp.gpstime.kr' #timeout
         ]
 
 # Windows Modern Standby: by default we ask the system not to go into
