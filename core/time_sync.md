@@ -1,201 +1,497 @@
-# TimeSyncService — adaptive colony of NTP filters
+# TimeSyncService — the physics of precise time and the adaptive colony of NTP filters
 
-Module for precise NTP-based time synchronization with an architecture of
-**competing filter instances** combined by consensus, and a
-**PI clock model** (anchor + rate) for external consumers.
+A module for precise NTP-based time synchronization. The architecture is a **competitive colony of filters** with consensus and a **PI clock model** (anchor + rate) for external consumers.
 
-Operates as an evolutionary system: instances autonomously filter the NTP signal,
-reproduce, die, inherit experience — and through this collectively find
-optimal time sources without a central dispatcher. In parallel, a
-PI controller tracks local clock drift, and a bias integrator
-compensates for constant server offset.
+This document is built **from physics to code**: first — what we measure and how stable time is derived from it, then — the registry of constants and runtime state.
 
 ---
 
-## Table of contents
+## Contents
 
-- [Logic flow](#logic-flow)
-- [Architecture](#architecture)
-- [Registry of constants and variables](#registry-of-constants-and-variables)
-- [Runtime state](#runtime-state)
-- [Public API](#public-api)
+- [Part I. The physics of the process](#part-i-the-physics-of-the-process)
+  - [1. A single NTP exchange: what is physically measured](#1-a-single-ntp-exchange-what-is-physically-measured)
+  - [2. What smp\[0..3\] is — the anatomy of one sample](#2-what-smp03-is--the-anatomy-of-one-sample)
+  - [3. What "ref" means at each level](#3-what-ref-means-at-each-level)
+  - [4. Map of averaging: where each mean is used and why](#4-map-of-averaging-where-each-mean-is-used-and-why)
+  - [5. The signal path: from NTP packet to stabilized time](#5-the-signal-path-from-ntp-packet-to-stabilized-time)
+  - [6. What each σ means in the system](#6-what-each-σ-means-in-the-system)
+  - [7. How the PLL drives the clock](#7-how-the-pll-drives-the-clock)
+  - [8. The colony: why it exists and how it evolves](#8-the-colony-why-it-exists-and-how-it-evolves)
+- [Part II. Flow logic (diagrams)](#part-ii-flow-logic-diagrams)
+- [Part III. Registry of constants](#part-iii-registry-of-constants)
+- [Part IV. Runtime state](#part-iv-runtime-state)
+- [Part V. Public API](#part-v-public-api)
 
 ---
 
-## Logic flow
+## Part I. The physics of the process
 
-### Full cycle of one round (sync thread)
+### 1. A single NTP exchange: what is physically measured
 
-    ┌──────────────────────────────────────┐
-    │  _sync_worker (Thread 0 or Thread 1) │
-    │  sleep(sync_interval) → new round    │
-    └────────────────┬─────────────────────┘
-                     │
-                     ▼
-    ┌────────────────────────────────────────────────────────┐
-    │  _get_best_ntp_sample()                                │
-    │  1. n_attempts = max(MIN_POPULATION, population_size)  │
-    │  2. _poll_servers(n_attempts)                          │
-    │  3. raw_snapshot = mean(proposed) per server           │
-    │  4. samples_by_srv -= colony_bias[srv]                 │
-    │  5. σ_consensus = _compute_consensus_sigma_ns() (MAD)  │
-    └────────────────┬───────────────────────────────────────┘
-                     │
-                     ▼
-    ┌────────────────────────────────────────────────────────┐
-    │  _poll_servers(n_attempts)                             │
-    │  ├─ _query_dns_resolv()      (once per hour)           │
-    │  └─ in parallel for each server:                       │
-    │     _query_single_server()  — n_attempts times with    │
-    │        QUERY_ATTEMPT_SPACING_SEC step                  │
-    │     each sample: (delay_net_ns, mid_mono,              │
-    │                   t2_utc, unused)                      │
-    └────────────────┬───────────────────────────────────────┘
-                     │
-                     ▼
-    ┌────────────────────────────────────────────────────────┐
-    │  Consensus.atom_round(...)                             │
-    │  ┌──────────────────────────────────────────────────┐  │
-    │  │ _refresh_bans_locked()                           │  │
-    │  │   • owners of favorite assigned by min(id)       │  │
-    │  │   • banned_servers = occupied − {own favorite}   │  │
-    │  └──────────────────────────────────────────────────┘  │
-    │  ┌──────────────────────────────────────────────────┐  │
-    │  │ _process_round_locked()                          │  │
-    │  │  ordered = sort(population, by id)               │  │
-    │  │  for k, inst in enumerate(ordered):              │  │
-    │  │     available = samples_by_srv[attempt_idx=k]    │  │
-    │  │     available −= warmup_excluded                 │  │
-    │  │     ┌── cold start? → argmin(delay)              │  │
-    │  │     │                                            │  │
-    │  │     └── no:                                      │  │
-    │  │        accepted = {|proposed − ref| ≤ thr}       │  │
-    │  │        if not accepted:                          │  │
-    │  │           own_history_rejected ← closest_dev     │  │
-    │  │        else:                                     │  │
-    │  │           new_offset = Σ w·proposed              │  │
-    │  │              (w ∝ 1/delay)                       │  │
-    │  │           favorite = _select_favorite()          │  │
-    │  │              (armed / score / hysteresis)        │  │
-    │  │           own_history ← SlewRecord               │  │
-    │  │           threshold evolves:                     │  │
-    │  │              stdev(diffs) × diff_sigma           │  │
-    │  │              ⊓ shrink_floor ⊓ COLONY_FLOOR       │  │
-    │  │           matrix_rows.append(row)                │  │
-    │  └──────────────────────────────────────────────────┘  │
-    │  ┌──────────────────────────────────────────────────┐  │
-    │  │ _compute_history_votes()                         │  │
-    │  │   short_vote = median(last 15 observed)          │  │
-    │  │   drift_slope = OLS over 300 applied             │  │
-    │  │   drift_pred  = last applied + rate·Δ            │  │
-    │  └──────────────────────────────────────────────────┘  │
-    │  ┌──────────────────────────────────────────────────┐  │
-    │  │ _build_consensus_matrix()                        │  │
-    │  │   size = max L: at least L rows of length ≥ L    │  │
-    │  │   compact = _select_diverse_cells(rows, size)    │  │
-    │  │   drift comp: proposed − rate·(mid − t_ref)      │  │
-    │  │   consensus_offset = mean(L² cells)              │  │
-    │  └──────────────────────────────────────────────────┘  │
-    │  ┌──────────────────────────────────────────────────┐  │
-    │  │ post-gate (if DISABLE_POST_GATE=0)               │  │
-    │  │   pred = drift_pred || short_vote                │  │
-    │  │   delta = consensus − pred                       │  │
-    │  │   limit = POST_GATE_K · σ_consensus              │  │
-    │  │   if |delta| > limit:                            │  │
-    │  │      if streak ≥ POST_GATE_FORCE_APPLY_AFTER:    │  │
-    │  │         force-apply, streak = 0                  │  │
-    │  │      else:                                       │  │
-    │  │         applied = False                          │  │
-    │  │         rejected_offset_ns = consensus           │  │
-    │  │   else: streak = 0                               │  │
-    │  └──────────────────────────────────────────────────┘  │
-    │  applied_offsets.appendleft((offset, t_ref_mono))      │
-    │  ┌──────────────────────────────────────────────────┐  │
-    │  │ _check_triggers_locked()                         │  │
-    │  │   tick++                                         │  │
-    │  │   capture σ_avg (warmup rules 1/2b/2/3)          │  │
-    │  │   dominant_favorite? → _spawn_locked             │  │
-    │  │   deathbed? → _spawn_locked                      │  │
-    │  │   dead = [inst: low_accept_windows ≥ 5]          │  │
-    │  │   → _kill_locked (divine birth when pop < 5)     │  │
-    │  │   spread gate: median(spreads) < 2·median(σ_avg) │  │
-    │  └──────────────────────────────────────────────────┘  │
-    └────────────────┬───────────────────────────────────────┘
-                     │
-                     ▼
-    ┌────────────────────────────────────────────────────────┐
-    │  _apply_new_sync_locked(best_mono, best_utc, ...)      │
-    │  ├─ not applied? → reject-streak logic:                │
-    │  │    streak ≤ 1  → anchor = gate opinion              │
-    │  │    streak ≥ 2  → anchor = predicted + KP_REJECT·err │
-    │  │    streak ≥ REJECT_RATE_RESET_STREAK → reset rate   │
-    │  ├─ primary sync? → anchor = best_utc, rate = prior    │
-    │  ├─ dt < min_pll_interval? → skip PLL (is_stale=True)  │
-    │  ├─ |phase_error| > 100 ms? → reset anchor + rate      │
-    │  └─ normal update:                                     │
-    │       predicted = anchor + rate·dt                     │
-    │       phase_err = target − predicted                   │
-    │       kp = 0.40 if |phase_err|>20 ms, else 0.10        │
-    │       anchor += kp·phase_err                           │
-    │       _apply_rate_sign_constancy_step_locked()         │
-    │       _apply_drift_confirmation_locked()               │
-    │          rate ← α·rate + (1−α)·slope                   │
-    │       _phase_err_window.appendleft(phase_err)          │
-    │       _publish_clock_and_metrics_locked()              │
-    │       _update_bias_history_locked()                    │
-    │       persist drift → append_drift_sample()            │
-    └────────────────────────────────────────────────────────┘
+The system deals with two independent times:
 
-### PLL scheme (clock model)
+- **Local monotonic** (`mono`) — what `time.monotonic_ns()` measures in the client OS. It never "jumps", does not depend on the Windows/Linux system clock, but it drifts away from true UTC at the clock's rate (e.g. 10 ppm = 10 µs/s).
+- **Server UTC** — the reference we want to catch up with.
 
-                          ┌─────────────────────────┐
-                          │  UTC = mono + offset    │
-                          │  offset(t) = anchor_o   │
-                          │    + rate·(t−anchor_m)  │
-                          └───────────┬─────────────┘
-                                      │
+A single NTP exchange consists of four timestamps:
+
+| Label | What it is | Units |
+|---|---|---|
+| `t1` | client **sent** the request | monotonic |
+| `t2` | server **received** the request | server UTC |
+| `t3` | server **sent** the reply | server UTC |
+| `t4` | client **received** the reply | monotonic |
+
+The difference between the scales is what we are after. If the network were ideal (`t2−t1 == t4−t3`), the true offset would be:
+
+```
+θ = ((t2 − t1) + (t3 − t4)) / 2
+```
+
+This is the **four-timestamp NTP formula** — the heart of the whole module. Everything the code does further is a fight against the fact that `t2−t1 ≠ t4−t3` (network asymmetry, jitter, drift during the exchange).
+
+### 2. What smp[0..3] is — the anatomy of one sample
+
+Each successful NTP exchange becomes a 4-tuple:
+
+```python
+smp = (delay_ns, mid_mono_ns, t2_utc_ns, unused)
+```
+
+The physical meaning of each field:
+
+| Field | Name | What it is physically |
+|---|---|---|
+| `smp[0]` | `delay_ns` | **pure network round-trip delay**: `(t4 − t1) − (t3 − t2)`. This is how much "extra" time the network took, excluding server processing. The smaller, the more accurate the estimate. Minimum 1 ns. |
+| `smp[1]` | `mid_mono_ns` | **the middle of the round in local monotonic time**: `(t1 + t4) // 2`. The point to which the whole estimate refers. |
+| `smp[2]` | `t2_utc_ns` | **server UTC referred to that midpoint**: `θ + mid_mono`. Roughly — "what our clock should show at that moment, according to this server". |
+| `smp[3]` | — | reserved for a bias shift (always 0 for now). |
+
+From these numbers comes the key quantity — **`proposed`**:
+
+```
+proposed = smp[2] − smp[1] = θ
+```
+
+This is the **difference between the scales**: "by how much monotonic time lags UTC, in UTC-scale units" (per this particular server, at this particular moment). It is the server's "proposal" of what the local offset should be.
+
+And the second key quantity — the **deviation** (`dev`), already relative to the current reference of the round (see §3):
+
+```
+dev = proposed − ref
+```
+
+### 3. What "ref" means at each level
+
+The word "ref" appears in the code in several places and means **different things at different levels**. This is fundamental.
+
+| Where | What `ref` is | Units | Physical meaning |
+|---|---|---|---|
+| `inst.own_reference_offset` | reference point of the instance | ns (UTC−mono) | "Where, according to this filter, the truth is right now". Delay-weighted mean of accepted `proposed`. |
+| `ref` in `_filter_instance` (local var) | same — `inst.own_reference_offset` | ns | Each server is compared against it: `dev = proposed − ref`. |
+| `rec.ref_ns` in an accepted record | the **old** `own_reference_offset` (before the recompute) | ns | What the servers were measured against in this round. |
+| `rec.ref_ns` in a rejected record | `inst.own_reference_offset` | ns | Same — what was compared, but nothing passed. |
+| `rec.ref_ns` in a consensus record (accepted) | `best_utc` | ns | The UTC chosen by consensus. |
+| `rec.ref_ns` in a consensus record (post-gate rejected) | `predicted_now` — the clock model's opinion | ns | What the PLL predicted at the moment of rejection. |
+| `t_ref_mono` (round argument) | arithmetic mean of `mid_mono` over all samples of the round | mono ns | "The moment to which the whole round refers". |
+| `t_ref_mono` in the matrix | same | mono ns | Drift compensation is done against it: `proposed − rate·(mid − t_ref)`. |
+| `seed_threshold_ns` | the previous `diff_threshold_ns` | ns | Initial threshold for new instances. |
+| `sigma_consensus_ns` | consensus σ | ns | Post-gate limit. |
+
+**The main rule:** `ref` is **not a constant**, it is a point that moves every round. A "cloud" of `proposed` from different servers forms around it, and the instance's filter cuts off those who wandered too far.
+
+### 4. Map of averaging: where each mean is used and why
+
+The system **deliberately** uses different types of averaging — each has its own physical job.
+
+#### 4.1 Arithmetic mean
+
+Used where the data is **already clean** and has uniform trust:
+
+| Where | What is averaged | Why arithmetic specifically |
+|---|---|---|
+| `t_ref_mono` (`_poll_servers`) | `mid_mono` over all samples of the round | Need a "neutral" moment. No weights needed — just the center of the cloud. |
+| `raw_snapshot` (`_get_best_ntp_sample`) | `proposed` over attempts of one server | Within a single server all attempts are equivalent. |
+| `consensus_offset` (`_build_consensus_matrix`) | `proposed` over **all L² cells of the matrix** | **The key place.** The matrix is built so that each cell is an independent measurement at its own moment. Arithmetic mean gives balance of time × ensemble of servers. No cell must dominate. |
+| `threshold_out` | thresholds of live instances (telemetry) | Diagnostics. |
+| `mean_interval` (`matrix_meta`) | intervals between matrix rows | Diagnostics. |
+
+#### 4.2 Delay-weighted mean
+
+Used to compute **the new reference offset of an instance** (`inst.own_reference_offset`):
+
+```python
+delays  = [smp[0] for _, smp in accepted]
+weights = [1.0 / max(d, 1) for d in delays]
+w_norm  = w / sum(weights)
+new_offset = Σ w_norm·(smp[2] − smp[1])
+```
+
+Physics: **a server with lower network delay deserves more trust**. An exchange over a 5 ms network gives a much blurrier estimate than one over 1 ms — the weight is inversely proportional to delay. This is a deliberate trade-off: we do not know whether the delay is symmetric, but the smaller it is, the smaller the asymmetry's contribution.
+
+#### 4.3 Median
+
+Used wherever there is a **risk of a single outlier** (bad server, DNS glitch, random timeout):
+
+| Where | What is median | Why |
+|---|---|---|
+| `short_vote` (`_compute_history_votes`) | the last 15 `_recent_observed` (including rejected) | The median is robust to a single anomaly — one "jump" won't pull the prediction. |
+| `noise_ref_ns` | σ_avg of live instances | One "frenzied" instance must not spoil the reference noise. |
+| `median(spreads)` (spread-gate) | history of stdev(offsets) | Same — one outlier does not block reproduction. |
+| `median_mean` (bias estimation) | per-server means of `proposed` | Robust "common center" — a stuck server does not drag the whole estimate. |
+| `median_delay`, `median_sigma` (score) | delays / σ of servers | Normalization for favorite scoring. |
+| `median` in `_compute_drift_prior` | ppm history from DB | Robust prior estimate. |
+
+#### 4.4 Standard deviation (stdev)
+
+Used where a **measure of the width of the cloud** is needed:
+
+| Where | What σ | Why |
+|---|---|---|
+| Instance threshold `new_raw` | σ(diffs) × `diff_sigma` | How much the instance "breathes" — to widen/narrow the filter. |
+| Instance `σ_avg` (`_capture_sigma_locked`) | **mean** of per-server σ(dev_ns) | Estimate of the "typical" server noise of this instance. Frozen once. |
+| `σ_consensus` (`_noise_sigma_ns`) | σ of first differences / √2 | Robust estimate of consensus decision noise without a trend. |
+| σ(delays) (`ntp_spread_ns`) | over all delays of the round | Network diagnostics. |
+
+#### 4.5 MAD (median absolute deviation)
+
+A robust (outlier-resistant) substitute for σ:
+
+| Where | What |
+|---|---|
+| `_update_colony_bias` | σ_s = `1.4826·MAD(first_diffs)/√2` — each server's noise. |
+| `_compute_colony_noise_ns` | same, for telemetry. |
+| `_compute_drift_prior` | σ from the drift history in the DB. |
+
+Physics: ordinary σ gets "inflated" by a single outlier, MAD does not. For noisy NTP servers this is critical.
+
+#### 4.6 Linear regression (OLS)
+
+Only in one place — **`drift_slope`**:
+
+```python
+slope = Σ(dx·dy) / Σ(dx²)         # ns/ns
+drift_slope = slope · round_ns    # ns/round
+```
+
+Applied to `applied_offsets` (only those approved by the post-gate). Physics: on a long window (300 rounds ≈ 2.5 h) the slope is **the true rate of the clock's departure** from UTC, robust to single glitches.
+
+#### 4.7 Summary table
+
+| Quantity | Type | Window | Why exactly this type |
+|---|---|---|---|
+| `t_ref_mono` | arithmetic | all samples of the round | neutral round center |
+| `raw_snapshot[srv]` | arithmetic | attempts of a single server | attempts are equivalent |
+| `own_reference_offset` | **weighted 1/delay** | accepted servers of the instance | fast servers get more trust |
+| `consensus_offset` | **arithmetic** | **L² matrix cells** | balance time × ensemble |
+| `short_vote` | **median** | last 15 observed | resistance to a single outlier |
+| `drift_slope` | **OLS** | 300 applied | true drift rate |
+| instance `σ_avg` | mean of per-server σ | all ✓ servers | typical noise |
+| `σ_consensus` | σ of first differences | 100 applied | robust consensus noise |
+| per-server `σ_s` | MAD | raw history | resistant to outliers |
+| `colony_bias[srv]` | **arith. over time, median over servers** | 33+ rounds | common center minus server noise |
+| `noise_ref_ns` | **median** of σ_avg | instances | one faulty instance does not spoil the reference |
+
+### 5. The signal path: from NTP packet to stabilized time
+
+Step-by-step — **how a physical sample becomes UTC**:
+
+```
+   ┌────────────────────────────────────────────────────────────┐
+   │  Step 1. Network exchange                                   │
+   │  Each server is polled n_attempts times, spaced by 1 s.    │
+   │  We get sample = (delay, mid_mono, t2_utc, 0).             │
+   │  proposed = t2_utc − mid_mono — the server's "proposal".   │
+   └────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │  Step 2. Compensation of the known server bias             │
+   │  proposed[srv] −= colony_bias[srv]                          │
+   │  (the gradually accumulated correction, see §8.4)          │
+   └────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │  Step 3. Per-instance filter                                │
+   │  inst takes attempt_idx = k (position in ordered).         │
+   │  Collects available = {srv: smp[k]}.                        │
+   │  For each server:                                           │
+   │    dev = proposed − own_reference_offset                    │
+   │    accepted, if |dev| ≤ own_threshold_ns.                   │
+   │  → new_offset = delay-weighted mean(proposed over accepted) │
+   │  → own_reference_offset := new_offset                       │
+   │  → own_threshold_ns evolves from σ(diffs)                   │
+   └────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │  Step 4. Consensus matrix                                   │
+   │  Each instance contributes a row of accepted proposed.      │
+   │  We collect L rows → L×L matrix.                            │
+   │  Drift compensation: proposed −= rate·(mid − t_ref_mono).   │
+   │  consensus_offset = arithmetic mean over all L² cells.      │
+   └────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │  Step 5. Prediction and post-gate                           │
+   │  prediction = drift_prediction (OLS) or short_vote (median) │
+   │  delta = consensus_offset − prediction                      │
+   │  limit = POST_GATE_K · σ_consensus                          │
+   │  If |delta| > limit → rejected (written to history)         │
+   │  Otherwise → applied (written to applied_offsets)           │
+   └────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │  Step 6. PLL                                                │
+   │  predicted = anchor_offset + rate·(t − anchor_mono)         │
+   │  phase_err = new_target_offset − predicted                  │
+   │  anchor_offset := predicted + KP·phase_err                  │
+   │  rate ← corrected (sign-constancy + drift-confirm)          │
+   └────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │  Step 7. Publication of the clock model                     │
+   │  get_utc_ns():  utc = mono + anchor_offset +                │
+   │                       rate·(mono − anchor_mono)             │
+   │  Lock-free. Used by external consumers.                     │
+   └────────────────────────────────────────────────────────────┘
+```
+
+**The key point:** each level solves its own physical problem.
+- Step 3 — "filter out bad servers and build a local reference point for each filter".
+- Step 4 — "average the opinions of all filters so that neither a single moment nor a single server dominates".
+- Step 5 — "prevent a single outlier from shifting the overall picture".
+- Step 6 — "smoothly pull our clock toward that picture, without jumping".
+
+### 6. What each σ means in the system
+
+There are many different σ's in the code, and they must not be confused.
+
+| σ | Where | What it physically measures | Magnitude |
+|---|---|---|---|
+| **σ(diffs)** | inside an instance | how much `own_reference_offset` "breathes" from round to round | ~units of ms |
+| **instance σ_avg** | `inst.own_sigma_avg_ns` | typical scatter of `dev_ns` of one server around the instance's reference | units–tens of ms |
+| **σ_consensus** | `_compute_consensus_sigma_ns` | how stable consensus decisions are (`applied_offsets`) | ~0.1–1 ms |
+| **per-server σ_s** | in `_update_colony_bias` | a server's own jitter (robustly, via MAD of first differences) | ~units of ms |
+| **σ_prior** | from the DB (`drift_history`) | historical scatter of clock drift estimates | ~units of ppm |
+| **ntp_spread_ns** | telemetry | scatter of network delays | ~units of ms |
+| **offset_spread_ns** | telemetry | σ of consensus decisions around their recent norm | ~0.1–1 ms |
+| **σ in quality (TTL)** | `_compute_snapshot_ttl_locked` | short vs long window of σ_consensus | dimensionless |
+
+**Do not confuse:** an instance's `σ_avg` is the **internal** scatter of servers before averaging; `σ_consensus` is the **external** scatter of already-averaged decisions. The first is many times larger than the second (averaging over N servers and M instances suppresses noise).
+
+### 7. How the PLL drives the clock
+
+A PLL (phase-locked loop) is a mechanism for **smooth** adjustment without jumps. The clock model:
+
+```
+utc(t) = mono(t) + anchor_offset + rate · (mono(t) − anchor_mono)
+```
+
+Where:
+- `anchor_offset` — the offset of the scales at the anchor point;
+- `anchor_mono` — the moment at which we fixed that offset;
+- `rate` — dimensionless drift rate (1 ppm = 1e-6), how far our `mono` leaves UTC per unit time.
+
+Each round:
+
+1. **Prediction.** What does the clock model think now?
+   ```
+   predicted = anchor_offset + rate·(best_mono − anchor_mono)
+   ```
+2. **Phase error.** How far has the prediction diverged from the new target offset?
+   ```
+   phase_err = new_target_offset − predicted
+   ```
+3. **Correction.** We do not "jump" at once, but pull by a fraction:
+   ```
+   anchor_offset := predicted + KP · phase_err
+   ```
+   with `KP = 0.10` normally and `KP = 0.40` for large errors (>20 ms).
+
+4. **Protection against jumps.** If `|phase_err| > 100 ms` — this is not drift but an event (sleep/resume, system clock step, NTP glitch). Then — a hard reset: anchor = target, rate = prior.
+
+5. **Rate correction** — see below.
+
+#### 7.1 How `rate` is estimated
+
+`rate` is **not a direct measurement**, but an estimate built by two mechanisms:
+
+**a) Sign-constancy** (`_apply_rate_sign_constancy_step_locked`).
+
+If `phase_err` within a 30-value window is **persistently of one sign** (t-statistic > 2.5, runs-z < −2), then our `rate` estimate is biased, and we systematically "undershoot" or "overshoot". The correction step:
+
+```
+step_ppm = base + confidence·(max − base)
+rate += direction · step_ppm · 1e-6
+```
+
+Where `base`, `max` are proportional to `σ_prior` (or fall back to 0.02/0.1 ppm). This is **not a PI controller**, but a discrete "spring" that pulls `rate` in the required direction.
+
+**b) Drift confirmation** (`_apply_drift_confirmation_locked`).
+
+`rate` is a fast but runaway-prone integrator. `drift_slope` from OLS is slow but stable. If they diverge by more than 3 ppm:
+
+```
+rate ← α·rate + (1 − α)·slope,   α = DRIFT_CONFIRM_ALPHA
+```
+
+This is insurance against `rate` "running away" due to a long series of one-sided `phase_err`.
+
+#### 7.2 Protection against PLL "sticking"
+
+If two sync threads wake up simultaneously (screen sleep, Modern Standby) — `dt` in the denominator of the I-correction becomes ~0 and `rate` instantly saturates. The protection:
+
+```python
+if dt_ns < self._min_pll_update_interval_ns:
+    # skip the PLL, but write to history
+```
+
+The threshold is half the interval between threads (15 s at a 60-second cycle).
+
+### 8. The colony: why it exists and how it evolves
+
+The colony is **not decoration** — it is a mechanism for robust server selection. The idea: different filters with different thresholds and "bindings" give different opinions; consensus averages them; the worst instances die off, the best reproduce.
+
+#### 8.1 Lifecycle
+
+```
+COLD START → warmup → MATURE → (reproduce | deathbed) → death
+```
+
+- **Cold start.** `own_reference_offset = None`. First round: the server with the minimum delay (argmin(delay)) is taken.
+- **Warmup.** History of `✓`-acceptances per server accumulates. Upon reaching `SIGMA_WARMUP_RECORDS = 5` per server — capture of `σ_avg`.
+- **MATURE.** The instance works: filters, updates `own_reference_offset`, evaluates a favorite, participates in the matrix.
+- **Reproduction.** By favorite dominance (σ_favorite < 0.7·σ_others) or by "deathbed" (accept_rate < 0.05 over 5 windows).
+- **Death.** `low_accept_windows ≥ 5` → the instance dies.
+- **Divine birth.** If the population drops below `MIN_POPULATION = 5`, a new independent root is created, banning favorites of the stuck instances.
+
+#### 8.2 Favorite — the instance's "preferred server"
+
+A favorite is the server an instance "clings" to: if it passes the filter, the instance holds on to it (armed-lock). Favorite selection:
+
+1. **Armed-lock**: if the favorite was accepted and the lock has not expired — keep it.
+2. **Score mode**: `score = d_norm + s_norm`, where `d_norm = delay/median(delay)`, `s_norm = σ_s/median(σ)`. The minimum is the candidate.
+3. **Hysteresis**: change the favorite only if the new one is better than the old by `FAVORITE_HYST = 15%`.
+
+Physics: the instance does not "flicker" between servers every second. It holds the chosen server while it is honestly responding.
+
+#### 8.3 Consensus matrix
+
+The matrix is **L×L**, where L is the maximum number for which there are ≥L rows of length ≥L. Each row is a set of `proposed` from one instance. Rows refer to different moments in time (instances poll servers at different moments via `attempt_idx = k`).
+
+`_select_diverse_cells` maximizes diversity: a server does not appear twice in the same row, and its total usage is limited. This guarantees that **different servers at different moments** are represented in the matrix — there are no correlated outliers.
+
+The arithmetic mean over L² cells is a **balanced estimate of true UTC**.
+
+#### 8.4 Colony bias — compensation for a server's constant offset
+
+Some servers lie by a constant amount (e.g. +3 ms). This is not noise — this is a **bias**. It is estimated as follows:
+
+1. From `_raw_proposed_history` (before bias application), the `mean` over time is taken for each server.
+2. The `median` of that mean across servers is computed — the "common center".
+3. `delta = mean_s − median_mean`.
+4. If `|delta| > K · σ_s` — the bias is confirmed; otherwise the server is just noisy, not shifted.
+5. `bias[srv] ← (1−k)·bias[srv] + k·delta`, clamped to ±50 ms.
+
+Thereafter every new sample of this server is corrected by `bias[srv]`. Physics: we **subtract the server's systematic error** and work only with its noise.
+
+#### 8.5 Spread-gate — when the colony may reproduce
+
+If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`), the colony is out of phase — reproduction is forbidden. This prevents the fixation of "bad" lineages.
+
+---
+
+## Part II. Flow logic (diagrams)
+
+### Full cycle of one round
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  _sync_worker (Thread 0 or Thread 1)                         │
+│  sleep(sync_interval) → new round                            │
+└─────────────────────────────┬────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│  _get_best_ntp_sample()                                      │
+│  1. n_attempts = max(MIN_POPULATION, population_size)        │
+│  2. _poll_servers(n_attempts)                                │
+│  3. raw_snapshot = mean(proposed) per server                 │
+│  4. samples_by_srv −= colony_bias[srv]                       │
+│  5. σ_consensus = _compute_consensus_sigma_ns() (MAD)        │
+└─────────────────────────────┬────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Consensus.atom_round(...)                                   │
+│  ┌── _refresh_bans_locked()  (favorite ownership)           │
+│  │ ┌── _process_round_locked()                               │
+│  │ │    for k, inst in ordered:                              │
+│  │ │      available = samples[attempt_idx=k]                 │
+│  │ │      accepted = {|proposed − ref| ≤ thr}                │
+│  │ │      new_offset = Σw·proposed, w ∝ 1/delay              │
+│  │ │      ref := new_offset; thr evolves                     │
+│  │ │      matrix_rows.append(row)                            │
+│  │ ├── _compute_history_votes()                              │
+│  │ │    short_vote     = median(15 observed)                 │
+│  │ │    drift_slope    = OLS(300 applied)                    │
+│  │ │    drift_pred     = last_applied + rate·Δt              │
+│  │ ├── _build_consensus_matrix()                             │
+│  │ │    size L, compact = diverse_cells                      │
+│  │ │    consensus_offset = mean(L² cells)                    │
+│  │ ├── post-gate                                              │
+│  │ │    delta = consensus − pred; limit = K·σ_consensus       │
+│  │ │    |delta| > limit → rejected                            │
+│  │ └── _check_triggers_locked()                              │
+│  │      σ_avg capture, reproduction, death, spread-gate      │
+│  └─────────────────────────────────────────────────────────┘
+└─────────────────────────────┬────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│  _apply_new_sync_locked(...)                                 │
+│  not applied? → reject-streak logic                         │
+│  primary sync? → anchor=best_utc, rate=prior                │
+│  |phase_err|>100ms? → reset                                 │
+│  otherwise: predicted, phase_err, anchor += KP·phase_err,   │
+│             sign-constancy, drift-confirmation              │
+│             publish clock snapshot, persist drift           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### PLL scheme
+
+```
+                          ┌──────────────────────────┐
+                          │  utc = mono + offset     │
+                          │  offset(t) = anchor_o    │
+                          │    + rate·(t−anchor_m)   │
+                          └─────────────┬────────────┘
+                                        │
     new_target_offset ◄── consensus_offset ◄── _process_round_locked
-                                      │
-                                      ▼
-                          ┌─────────────────────────┐
-                          │ dt = t_now − anchor_m   │
-                          │ predicted = anchor_o +  │
-                          │            rate·dt      │
-                          │ phase_err = target −    │
-                          │             predicted   │
-                          └───────────┬─────────────┘
-                                      │
-                ┌─────────────────────┼─────────────────────┐
-                │                     │                     │
-                ▼                     ▼                     ▼
-        |phase_err|>100ms       |phase_err|>20ms        normal
-          RESET:                 kp = 0.40            kp = 0.10
-          anchor=target          boosted             standard
-          rate = prior           catch-up
-
-### Favorite selection scheme
-
-    _select_favorite(inst, accepted):
-    ┌──────────────────────────────────────────────────────────┐
-    │  delays = accepted − inst.banned_servers                 │
-    │                                                          │
-    │  1. armed-lock active AND favorite ∈ delays → keep       │
-    │                                                          │
-    │  2. no delays → keep current favorite                    │
-    │                                                          │
-    │  3. score = d_norm + s_norm:                             │
-    │     d_norm = delay / median(delay)                       │
-    │     s_norm = σ_s / median(σ)  (if σ-history is enough)   │
-    │     else delay only (warmup)                             │
-    │                                                          │
-    │  4. favorite absent → forced change without hysteresis   │
-    │                                                          │
-    │  5. hysteresis: change only if                         │
-    │     score_new < score_cur · (1 − FAVORITE_HYST)          │
-    └──────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+                          ┌──────────────────────────┐
+                          │ dt = t_now − anchor_m    │
+                          │ predicted = anchor_o +   │
+                          │            rate·dt       │
+                          │ phase_err = target −     │
+                          │             predicted    │
+                          └─────────────┬────────────┘
+                                        │
+                ┌───────────────────────┼───────────────────────┐
+                ▼                       ▼                       ▼
+        |phase_err|>100ms        |phase_err|>20ms           normal
+          RESET:                  kp = 0.40                kp = 0.10
+          anchor=target           boosted                 standard
+          rate = prior            catch-up
+```
 
 ### Instance lifecycle
 
+```
          COLD START                         MATURE
        argmin(delay)              threshold narrowed, σ_avg captured
             │                              │
@@ -217,327 +513,252 @@ compensates for constant server offset.
             └──────────────────────────────│  death       │
                    pop < MIN_POPULATION    │  (divine?)   │
                    → divine birth          └──────────────┘
+```
 
 ---
 
-## Architecture
-
-### Three levels
-
-    ┌──────────────────────────────────────────────────────────┐
-    │              TimeSyncService (orchestration)              │
-    │  PLL (anchor + rate) · get_utc_ns · get_clock_snapshot    │
-    │  watchdog · keep-awake · start/stop · colony bias         │
-    └──────────────────────────┬───────────────────────────────┘
-                               │
-                               ▼
-    ┌──────────────────────────────────────────────────────────┐
-    │                   Consensus (observer)                    │
-    │   population · occupied · reproduction_allowed            │
-    │   pre/post gate · history votes · spread gate             │
-    │   lineage queue (divine birth)                            │
-    └──────────────────────────┬───────────────────────────────┘
-                               │
-           ┌───────────────────┼───────────────────┐
-           ▼                   ▼                   ▼
-    ┌────────────┐      ┌────────────┐      ┌────────────┐
-    │ Instance 0 │      │ Instance 1 │      │ Instance N │
-    │  favorite  │      │  favorite  │      │  favorite  │
-    │  history   │      │  history   │      │  history   │
-    │  threshold │      │  threshold │      │  threshold │
-    │  σ_avg     │      │  σ_avg     │      │  σ_avg     │
-    └────────────┘      └────────────┘      └────────────┘
-                               │
-                               ▼
-                  ┌─────────────────────────┐
-                  │      NTP servers        │
-                  └─────────────────────────┘
-
-| Component | Responsibility |
-|---|---|
-| **TimeSyncService** | PLL clock model, `get_utc_ns()`, `get_clock_snapshot()`, watchdog, keep-awake, colony bias, singleton |
-| **Consensus** | Holds colony, resolves server collisions, triggers reproduction, votes, applies pre/post gate |
-| **AlgorithmInstance** | Autonomous filter: own threshold, own history, own favorite, own σ_avg |
-| **SlewRecord** | Immutable round record for telemetry |
-| **ClockSnapshot** | Clock model snapshot for external consumers |
-| **2 sync threads** | Parallel rounds offset by half a period |
-| **Watchdog** | Restarts dead sync threads, diagnostics |
-| **Keep-awake** | Windows: disable Power Throttling; Linux: check systemd mask |
-
----
-
-## Registry of constants and variables
+## Part III. Registry of constants
 
 ### NTP servers
 
 | Name | Value | Notes |
 |---|---|---|
-| `DEFAULT_NTP_SERVERS` | 16 active | List of public NTP servers. Commented-out entries excluded due to bias/timeout. |
-| `NTP_EPOCH_OFFSET_SEC` | 2208988800 | Offset from NTP epoch (1900) to Unix (1970), sec. |
-| `NTP_PACKET_SIZE` | 48 | NTPv4 packet size, bytes. |
+| `DEFAULT_NTP_SERVERS` | 16 active | List of public NTP servers. |
+| `NTP_EPOCH_OFFSET_SEC` | 2208988800 | NTP epoch (1900) → Unix (1970) offset. |
+| `NTP_PACKET_SIZE` | 48 | NTPv4 packet size. |
 | `NTP_PORT` | 123 | NTP port. |
-| `PER_SERVER_HISTORY` | `max(len(DEFAULT_NTP_SERVERS), 10)` = 16 | Length of per-server min-delay queue and accept_window. |
-| `QUERY_ATTEMPT_SPACING_SEC` | 1.0 | Spacing of attempts within a round, sec. 5 attempts → span 4 s. |
+| `PER_SERVER_HISTORY` | `max(len(DEFAULT_NTP_SERVERS), 10)` = 16 | Length of the min-delay queue and accept_window. |
+| `QUERY_ATTEMPT_SPACING_SEC` | 1.0 | Spacing between attempts within a round. |
 | `QUERY_ATTEMPT_SPACING_NS` | 1_000_000_000 | Same in ns. |
 | `NTP_QUERY_TIMEOUT_SEC` | 2 | Timeout of a single NTP request. |
-| `NTP_QUERY_TIMEOUT_SAFE_SEC` | 2 | Extra margin for round timeout. |
-| `DNS_QUERY_TIMEOUT_SEC` | 5 | DNS resolution timeout. |
+| `DNS_QUERY_TIMEOUT_SEC` | 5 | DNS timeout. |
 | `NTP_RESOLVING_TIMEOUT_NS` | 3.6e12 (1 h) | DNS re-resolution period. |
-| `VALIDATE_ORIGIN` | `'1'` from env | Origin echo check. Can be disabled via `TIME_SYNC_VALIDATE_ORIGIN=0`. |
+| `VALIDATE_ORIGIN` | `'1'` from env | Origin echo check. |
 
-### Sync cycle and threads
+### Cycle and threads
 
 | Name | Value | Notes |
 |---|---|---|
 | `DEFAULT_INITIAL_INTERVAL_SEC` | 60 | Main interval between rounds. |
-| `SYNC_THREAD_SLOTS` | 2 | Number of parallel sync threads. |
-| `second_sync_thread_delay` | `sync_interval // 2` | Offset of second thread (30 s). |
-| `_min_pll_update_interval_ns` | `max(delay//2, 5)·1e9` | Protection against "stuck" PLL updates (15 s). |
+| `SYNC_THREAD_SLOTS` | 2 | Number of parallel threads. |
+| `second_sync_thread_delay` | `sync_interval // 2` | Offset of the second thread (30 s). |
+| `_min_pll_update_interval_ns` | `max(delay//2, 5)·1e9` | Protection against PLL "sticking" (15 s). |
 | `WATCHDOG_INTERVAL_SEC` | 30 | Thread liveness check frequency. |
-| `WATCHDOG_STOP_JOIN_SEC` | 3.0 | Watchdog join timeout on stop. |
-| `SYNC_THREAD_STOP_JOIN_SEC` | 15.0 | Overall stop timeout for sync threads. |
-| `PRE_START_JOIN_SEC` | 5.0 | Join timeout of "leftover" threads on start. |
-| `KEEP_AWAKE_REFRESH_SEC` | 30 | Re-setting ES_SYSTEM_REQUIRED. |
+| `WATCHDOG_STOP_JOIN_SEC` | 3.0 | Watchdog join timeout. |
+| `SYNC_THREAD_STOP_JOIN_SEC` | 15.0 | Overall stop timeout. |
+| `PRE_START_JOIN_SEC` | 5.0 | Join timeout for "leftover" threads. |
+| `KEEP_AWAKE_REFRESH_SEC` | 30 | ES_SYSTEM_REQUIRED re-set. |
 
 ### PLL
 
 | Name | Value | Notes |
 |---|---|---|
-| `PLL_KP` | 0.10 | Fraction of phase_error added to offset per round (normal). |
-| `PLL_KP_MEDIUM` | 0.40 | Boosted KP during medium jump. |
-| `PLL_KP_REJECT` | 0.30 | KP applied to raw when post-gate streak ≥ 2. |
-| `PLL_KI` | 0.01 | Fraction of phase_error/dt added to rate. |
+| `PLL_KP` | 0.10 | Fraction of phase_err added to offset per round. |
+| `PLL_KP_MEDIUM` | 0.40 | Boosted KP for a medium jump. |
+| `PLL_KP_REJECT` | 0.30 | KP for streak ≥ 2 (post-gate reject). |
+| `PLL_KI` | 0.01 | Fraction of phase_err/dt going into rate. |
 | `PLL_RATE_LIMIT` | 100e-6 (±100 ppm) | Drift estimate limit. |
-| `PHASE_JUMP_THRESHOLD_NS` | 100_000_000 (100 ms) | Reset threshold for anchor + rate. |
+| `PHASE_JUMP_THRESHOLD_NS` | 100_000_000 (100 ms) | Reset anchor + rate. |
 | `PHASE_MEDIUM_JUMP_NS` | 20_000_000 (20 ms) | Boosted KP threshold. |
-| `RATE_SPRING_BASE_PPM` | 0.02 | Base rate step when prior σ is unavailable. |
-| `RATE_SPRING_MAX_PPM` | 0.10 | Maximum rate step when prior σ is unavailable. |
+| `RATE_SPRING_BASE_PPM` | 0.02 | Base rate step (fallback). |
+| `RATE_SPRING_MAX_PPM` | 0.10 | Maximum rate step (fallback). |
 | `RATE_SPRING_SIGMA_FRACTION_BASE` | 0.05 | Base step = 0.05·σ_prior. |
 | `RATE_SPRING_SIGMA_FRACTION_MAX` | 0.25 | Max step = 0.25·σ_prior. |
-| `RATE_SPRING_T_SCALE` | 3.0 | Confidence = (|t|−T_THRESHOLD)/SCALE. |
-| `RATE_PRIOR_PULL` | 0.00 | Extra pull of rate toward prior (optional). |
-| `RATE_CLAMP_FROM_PRIOR_PPM` | 2.0 | ±window around prior for rate. |
-| `RATE_DETECT_WINDOW_N` | 30 | Length of phase_errors window. |
+| `RATE_SPRING_T_SCALE` | 3.0 | Confidence = (|t|−T)/SCALE. |
+| `RATE_PRIOR_PULL` | 0.00 | Extra pull of rate toward prior. |
+| `RATE_CLAMP_FROM_PRIOR_PPM` | 2.0 | ±window around prior. |
+| `RATE_DETECT_WINDOW_N` | 30 | phase_errors window. |
 | `RATE_DETECT_MIN_N` | 20 | Minimum for statistics. |
-| `RATE_T_THRESHOLD` | 2.5 | |t| threshold of the mean. |
+| `RATE_T_THRESHOLD` | 2.5 | Threshold of |t| of the mean. |
 | `RATE_Z_THRESHOLD` | −2.0 | Runs z: negative = sign sticking. |
 
 ### Colony bias
 
-| Name | Value | Notes |
-|---|---|---|
-| `COLONY_BIAS_GAIN` | 0.05 | Integrator speed per round. |
-| `COLONY_BIAS_MAX_NS` | 50_000_000 (50 ms) | Compensation limit. |
-| `COLONY_BIAS_DECAY` | 0.99 | Decay of inactive servers. |
-| `COLONY_BIAS_DECAY_FLOOR` | 10_000 (10 µs) | Below this — bias is removed. |
-| `K_THRESHOLD` | 1.0 | Soft-threshold: \|delta\| > K·σ_srv. |
-
-Note: the minimum history per server for bias estimation is
-`HISTORY_MAX_LEN // 3` and there is no separate constant for it.
+| Name | Value |
+|---|---|
+| `COLONY_BIAS_GAIN` | 0.05 |
+| `COLONY_BIAS_MAX_NS` | 50_000_000 (50 ms) |
+| `COLONY_BIAS_DECAY` | 0.99 |
+| `COLONY_BIAS_DECAY_FLOOR` | 10_000 (10 µs) |
+| `K_THRESHOLD` | 1.0 |
 
 ### Drift confirmation
 
-| Name | Value | Notes |
-|---|---|---|
-| `DRIFT_CONFIRM_RATE_DIVERGE_PPM` | 3.0 | Threshold of rate↔slope divergence. |
-| `DRIFT_CONFIRM_ALPHA` | 0.5 | 1.0 — off; 0.0 — full replacement rate←slope. |
-| `DRIFT_SEED_MIN_SAMPLES` | 5 | Minimum for trusting the prior median. |
-| `DRIFT_COLD_START_DIVERGE_PPM` | 3.0 | Threshold for resetting rate on cold start. |
-| `DRIFT_OUTLIER_K` | 3.0 | K·MAD for filtering prior from DB. |
+| Name | Value |
+|---|---|
+| `DRIFT_CONFIRM_RATE_DIVERGE_PPM` | 3.0 |
+| `DRIFT_CONFIRM_ALPHA` | 0.5 |
+| `DRIFT_SEED_MIN_SAMPLES` | 5 |
+| `DRIFT_COLD_START_DIVERGE_PPM` | 3.0 |
+| `DRIFT_OUTLIER_K` | 3.0 |
 
 ### Clock Snapshot / TTL
 
-| Name | Value | Notes |
-|---|---|---|
-| `CLOCK_SNAPSHOT_TTL_BASE_SEC` | 2.0 | Base TTL = 2·sync_interval. |
-| `CLOCK_SNAPSHOT_TTL_QUALITY_FLOOR` | 0.25 | Lower bound of quality (noisy σ_recent). |
-| `CLOCK_SNAPSHOT_TTL_QUALITY_CEIL` | 2.0 | Upper bound of quality (quiet σ_recent). |
-| `CLOCK_SNAPSHOT_TTL_ABS_MIN_SEC` | 30.0 | Absolute TTL minimum. |
-| `CLOCK_SNAPSHOT_TTL_ABS_MAX_SEC` | 600.0 | Absolute TTL maximum. |
-| `CLOCK_SNAPSHOT_TTL_RECENT_N` | 15 | Window of σ_recent (last rounds). |
-| `CLOCK_SNAPSHOT_ACCURACY_DEFAULT_NS` | 5_000_000 (5 ms) | Fallback accuracy before statistics accumulate. |
-| `CLOCK_SNAPSHOT_PRECISION_CACHE_MAX` | 16 | LRU cache limit of precision requests. |
+| Name | Value |
+|---|---|
+| `CLOCK_SNAPSHOT_TTL_BASE_SEC` | 2.0 |
+| `CLOCK_SNAPSHOT_TTL_QUALITY_FLOOR` | 0.25 |
+| `CLOCK_SNAPSHOT_TTL_QUALITY_CEIL` | 2.0 |
+| `CLOCK_SNAPSHOT_TTL_ABS_MIN_SEC` | 30.0 |
+| `CLOCK_SNAPSHOT_TTL_ABS_MAX_SEC` | 600.0 |
+| `CLOCK_SNAPSHOT_TTL_RECENT_N` | 15 |
+| `CLOCK_SNAPSHOT_ACCURACY_DEFAULT_NS` | 5_000_000 (5 ms) |
+| `CLOCK_SNAPSHOT_PRECISION_CACHE_MAX` | 16 |
 
-### Colony (filter and threshold)
+### Colony
 
-| Name | Value | Notes |
-|---|---|---|
-| `THRESHOLD_MIN_NS` | 1_000 (1 µs) | Absolute floor of threshold, protection from zero. |
-| `COLONY_THRESHOLD_FLOOR_NS` | 2_500_000 (2.5 ms) | Colony threshold floor. Protection against "collapse". |
-| `THRESHOLD_SHRINK_FLOOR` | 0.99 | No faster than 1% decrease per round. |
-| `COHERENCE_THRESHOLD_NS` | 5_000_000 (5 ms) | Seed threshold of the first round. |
-| `HISTORY_MAX_LEN` | 100 | Length of own_history / own_history_rejected. |
-| `ACCEPT_WINDOW_SIZE` | = PER_SERVER_HISTORY = 16 | Accept rate window. |
-| `DEATH_LOW_WINDOWS` | 5 | Low windows in a row → death. |
-| `DEATH_ACCEPT_THRESHOLD` | 0.05 | Threshold of a "low" accept rate. |
-| `REPRODUCTION_LAG_L` | = DEATH_LOW_WINDOWS = 5 | Min ticks between births. |
-| `FAVORITE_HYST` | 0.15 | Hysteresis of favorite change (15%). |
+| Name | Value |
+|---|---|
+| `THRESHOLD_MIN_NS` | 1_000 (1 µs) |
+| `COLONY_THRESHOLD_FLOOR_NS` | 2_500_000 (2.5 ms) |
+| `THRESHOLD_SHRINK_FLOOR` | 0.99 |
+| `COHERENCE_THRESHOLD_NS` | 5_000_000 (5 ms) |
+| `HISTORY_MAX_LEN` | 100 |
+| `ACCEPT_WINDOW_SIZE` | 16 |
+| `DEATH_LOW_WINDOWS` | 5 |
+| `DEATH_ACCEPT_THRESHOLD` | 0.05 |
+| `REPRODUCTION_LAG_L` | 5 |
+| `FAVORITE_HYST` | 0.15 |
 
-### Dominance / warmup σ_avg
+### Dominance / warmup
 
-| Name | Value | Notes |
-|---|---|---|
-| `ALPHA_SIGNIFICANCE` | 0.1 | Significance level in M = 2·ln(N/α)/Δ². |
-| `DOMINANT_MIN_HISTORY` | = ACCEPT_WINDOW_SIZE = 16 | M_min — lower bound of observations. |
-| `SIGMA_WARMUP_RECORDS` | = SPREAD_HISTORY_MIN = 5 | ✓ records per server for σ_avg. |
-| `SIGMA_WARMUP_TIMEOUT_MULT` | 3 | Warmup timeout = 3×5 = 15 ticks. |
-| `SIGMA_WARMUP_MIN_SURVIVORS` | 2 | Rule 2b: 2 full servers are enough. |
-| `WARMUP_MIN_SURVIVORS` | 2 | Minimum available servers to leave warmup. |
-| `DOMINANT_STDEV_RATIO` | 0.7 | σ_X < 0.7·σ_others — dominance condition. |
-| `DOMINANT_MIN_SERVERS` | 2 | Min servers in the last record. |
-| `DOMINANT_MIN_DEVS` | 2 | Min observations for stdev. |
-| `SIGMA_AVG_SANITY_MAX_NS` | 10_000_000 (10 ms) | Sanity: σ_avg above → capture cancelled. |
+| Name | Value |
+|---|---|
+| `ALPHA_SIGNIFICANCE` | 0.1 |
+| `DOMINANT_MIN_HISTORY` | 16 |
+| `SIGMA_WARMUP_RECORDS` | 5 |
+| `SIGMA_WARMUP_TIMEOUT_MULT` | 3 |
+| `SIGMA_WARMUP_MIN_SURVIVORS` | 2 |
+| `WARMUP_MIN_SURVIVORS` | 2 |
+| `DOMINANT_STDEV_RATIO` | 0.7 |
+| `DOMINANT_MIN_SERVERS` | 2 |
+| `DOMINANT_MIN_DEVS` | 2 |
+| `SIGMA_AVG_SANITY_MAX_NS` | 10_000_000 (10 ms) |
 
-### Population and divine
+### Population / divine
 
-| Name | Value | Notes |
-|---|---|---|
-| `MIN_POPULATION` | 5 | Below — colony degenerates, divine. |
-| `DIVINE_QUEUE_MAX` | = MIN_POPULATION = 5 | Maximum lineage roots. |
-| `DIVINE_ACCEPT_RATE_THRESHOLD` | 0.1 | accept_rate < 0.1 → stuck. |
-| `MAX_POPULATION_RATIO` | 0.7 | Fraction of the number of servers. |
-| `MAX_POPULATION_MIN_SERVERS` | 7 | Below — max_population = len(servers). |
+| Name | Value |
+|---|---|
+| `MIN_POPULATION` | 5 |
+| `DIVINE_QUEUE_MAX` | 5 |
+| `DIVINE_ACCEPT_RATE_THRESHOLD` | 0.1 |
+| `MAX_POPULATION_RATIO` | 0.7 |
+| `MAX_POPULATION_MIN_SERVERS` | 7 |
 
-### History and drift votes
+### History / drift votes
 
-| Name | Value | Notes |
-|---|---|---|
-| `HISTORY_VOTE_SHORT_WINDOW` | 15 | Short median window over `_recent_observed`. |
-| `HISTORY_VOTE_MIN_SAMPLES` | = SPREAD_HISTORY_MIN = 5 | Before this short_vote is inactive. |
-| `DRIFT_WINDOW` | 300 | Linear regression window over `applied_offsets`. |
-| `DRIFT_MIN_SAMPLES` | 30 | Before this drift_pred is inactive. |
-
-Note: drift persistence to the DB is done when
-`tick − _last_drift_persist_tick ≥ DRIFT_WINDOW` and
-`len(applied_offsets) ≥ DRIFT_WINDOW`; there is no separate interval constant.
+| Name | Value |
+|---|---|
+| `HISTORY_VOTE_SHORT_WINDOW` | 15 |
+| `HISTORY_VOTE_MIN_SAMPLES` | 5 |
+| `DRIFT_WINDOW` | 300 |
+| `DRIFT_MIN_SAMPLES` | 30 |
 
 ### Consensus gate
 
-| Name | Value | Notes |
-|---|---|---|
-| `POST_GATE_K` | 1.0 | Multiplier of σ_consensus in post-gate. |
-| `POST_GATE_FORCE_APPLY_AFTER` | 50 | After this many consecutive rejects — force-apply. |
-| `REJECT_RATE_RESET_STREAK` | 4 | Consecutive rejects triggering rate reset. |
-| `REJECT_RATE_RESET_GAIN` | 1.0 | 1.0 hard reset; 0.3 soft pull. |
-| `REJECT_RATE_RESET_MIN_DIVERGE_PPM` | 1.0 | Do not reset if rate is already close to prior. |
-| `DISABLE_POST_GATE` | 0 | 1 — disable post-gate (current: enabled). |
-| `DISABLE_SHORT_VOTE` | = DISABLE_POST_GATE | Tied to post-gate flag. |
-| `DISABLE_DRIFT_VOTE` | = DISABLE_POST_GATE | Tied to post-gate flag. |
-| `CONSENSUS_MATRIX_MIN` | 2 | Minimum size of the L×L matrix. |
-| `SPREAD_HISTORY_LEN` | = ACCEPT_WINDOW_SIZE = 16 | Queue of stdev(offsets). |
-| `SPREAD_HISTORY_MIN` | = REPRODUCTION_LAG_L = 5 | Minimum rounds before gate activation. |
-| `REPRODUCTION_SPREAD_MULT` | 2.0 | median(spreads) < MULT · median(σ_avg). |
+| Name | Value |
+|---|---|
+| `POST_GATE_K` | 1.0 |
+| `POST_GATE_FORCE_APPLY_AFTER` | 50 |
+| `REJECT_RATE_RESET_STREAK` | 4 |
+| `REJECT_RATE_RESET_GAIN` | 1.0 |
+| `REJECT_RATE_RESET_MIN_DIVERGE_PPM` | 1.0 |
+| `DISABLE_POST_GATE` | 0 |
+| `DISABLE_SHORT_VOTE` | = DISABLE_POST_GATE |
+| `DISABLE_DRIFT_VOTE` | = DISABLE_POST_GATE |
+| `CONSENSUS_MATRIX_MIN` | 2 |
+| `SPREAD_HISTORY_LEN` | 16 |
+| `SPREAD_HISTORY_MIN` | 5 |
+| `REPRODUCTION_SPREAD_MULT` | 2.0 |
 
 ### Environment flags
 
 | Name | Default | Notes |
 |---|---|---|
-| `TIME_SYNC_KEEP_AWAKE` | `'1'` | `0` — disable keep-awake (laptop, battery). |
-| `TIME_SYNC_VALIDATE_ORIGIN` | `'1'` | `0` — disable origin echo check. |
-| `TIME_SYNC_MODE` | — | `local\|daemon\|attached\|peer` (Sprint 2, not yet implemented). |
+| `TIME_SYNC_KEEP_AWAKE` | `'1'` | `0` — disable keep-awake. |
+| `TIME_SYNC_VALIDATE_ORIGIN` | `'1'` | `0` — disable origin echo. |
+| `TIME_SYNC_MODE` | — | Sprint 2, not implemented. |
 
 ---
 
-## Runtime state
+## Part IV. Runtime state
 
 ### TimeSyncService
 
 | Name | Init | Type | Notes |
 |---|---|---|---|
 | `ntp_servers` | list | list[str] | Active servers. |
-| `ntp_servers_resolved` | `{}` | dict[str,str] | DNS → IP cache. |
-| `ntp_servers_last_resolved_ns` | `-NTP_RESOLVING_TIMEOUT_NS` | int | Last resolution timestamp. |
+| `ntp_servers_resolved` | `{}` | dict | DNS → IP. |
 | `sync_interval` | 60 | int | Round period. |
-| `second_sync_thread_delay` | 30 | int | Offset of second thread. |
-| `_server_meta` | `{}` | dict[str,ServerMeta] | Metadata of NTP packets. |
-| `_executors_shutdown` | False | bool | State of thread pools. |
-| `dns_fail_servers` | `set()` | set | Servers that failed DNS. |
-| `running` | False | bool | Running flag. |
-| `is_synced_event` | Event | — | Set after first sync. |
-| `_stop_event` | Event | — | Stop signal. |
-| `_threads` | `{}` | dict[int,Thread] | Sync threads by slot. |
-| `_last_success_mono_ns` | 0 | int | 0 = no success yet. |
-| `_last_stalled_servers` | `()` | tuple | Diagnostics. |
-| `_delay_history` | deque(20) | deque[int] | All round delays. |
-| `_phase_err_window` | deque(30) | deque[int] | Phase errors for sign-constancy. |
-| `_per_server_delay` | defaultdict(deque 16) | dict | Min-delay per server. |
-| `_anchor_offset` | 0 | int | UTC reference at anchor. |
+| `second_sync_thread_delay` | 30 | int | Second thread offset. |
+| `_server_meta` | `{}` | dict | NTP packet metadata. |
+| `_anchor_offset` | 0 | int | UTC reference at the anchor. |
 | `_anchor_mono` | 0 | int | Anchor point (mono_ns). |
-| `_rate` | 0.0 | float | Drift estimate (dimensionless). |
-| `_clock_snapshot` | `(0,0,0.0)` | tuple | Lock-free snapshot for get_utc_ns. |
-| `_clock_snapshot_ttl_ns` | 120e9 | int | Current snapshot TTL. |
-| `_clock_snapshot_accuracy_ns` | 5e6 | int | Current snapshot accuracy. |
-| `_clock_snapshot_full` | 5-tuple | tuple | Atomic snapshot (anchor, offset, rate, ttl, acc). |
-| `_precision_cache` | OrderedDict | — | LRU cache of precision requests. |
-| `_target_offset` | 0 | int | Target offset (telemetry). |
-| `_last_phase_error` | None | Optional[int] | Last phase_error. |
-| `_slew_error_history` | deque(100) | SlewRecord | Consensus-level history. |
-| `_colony_bias` | `{}` | dict[str,int] | Accumulated bias. |
-| `_last_cold_gen` | 0 | int | Colony generation. |
+| `_rate` | 0.0 | float | Drift (dimensionless). |
+| `_clock_snapshot` | `(0,0,0.0)` | tuple | Lock-free snapshot. |
+| `_clock_snapshot_ttl_ns` | 120e9 | int | Snapshot TTL. |
+| `_clock_snapshot_accuracy_ns` | 5e6 | int | Snapshot accuracy. |
+| `_clock_snapshot_full` | 5-tuple | tuple | Atomic snapshot. |
+| `_precision_cache` | OrderedDict | LRU | Precision cache. |
+| `_target_offset` | 0 | int | Target offset. |
+| `_last_phase_error` | None | Optional[int] | Last phase_err. |
+| `_slew_error_history` | deque(100) | SlewRecord | Consensus history. |
+| `_colony_bias` | `{}` | dict | Accumulated bias. |
 | `_raw_proposed_history` | deque(100) | tuple | Raw history for bias. |
-| `_diff_sigma` | 1.0 | float | Threshold multiplier. |
-| `_last_diff_threshold` | None | Optional[int] | Last round threshold (seed). |
-| `_consensus` | Consensus | — | Colony. |
-| `_rate_prior` | 0.0 | float | Prior from drift DB. |
-| `_rate_spring_base_ppm` | 0.02 or 0.05·σ_prior | float | Rate step base. |
-| `_rate_spring_max_ppm` | 0.1 or 0.25·σ_prior | float | Rate step max. |
-| `_last_drift_persist_tick` | 0 | int | Drift persist pause. |
+| `_consensus` | Consensus | — | The colony. |
+| `_rate_prior` | 0.0 | float | Prior from the DB. |
+| `_rate_spring_base_ppm` | computed | float | Base rate step. |
+| `_rate_spring_max_ppm` | computed | float | Max rate step. |
+| `_last_drift_persist_tick` | 0 | int | Persist pause. |
 
 ### Consensus
 
-| Name | Init | Type | Notes |
-|---|---|---|---|
-| `sync_interval` | 60 | int | Sync interval (for ns/round conversion). |
-| `servers` | list | list[str] | Server list (fixed). |
-| `max_population` | calc | int | Population ceiling. |
-| `divine_queue_max` | max(5, max_pop) | int | Lineage ceiling. |
-| `diff_sigma` | 1.0 | float | stdev multiplier. |
-| `population` | `[init_pop]` | list[AlgorithmInstance] | Live instances. |
-| `_next_id` | init_pop | int | Id counter. |
-| `_tick` | 0 | int | Round counter. |
-| `_pending_logs` | `[]` | list | Deferred logs. |
-| `reproduction_allowed` | True | bool | Spread gate flag. |
-| `_spreads` | deque(16) | deque | stdev(offsets) history. |
-| `_mean_spread_ns` | None | Optional[float] | median(spreads). |
-| `noise_ref_ns` | None | Optional[float] | median(σ_avg) of live instances. |
-| `_recent_observed` | deque(300) | deque[int] | All observed consensus offsets. |
-| `applied_offsets` | deque(300) | deque[Tuple[int,int]] | (offset, t_ref_mono) trajectory of applied. |
-| `_last_short_vote` | None | Optional[int] | Short vote. |
-| `_last_drift_prediction` | None | Optional[int] | Drift prediction. |
-| `_last_drift_slope` | None | Optional[float] | Regression slope, ns/round. |
-| `_last_apply_mono_ns` | 0 | int | Mono of last applied (for extrapolation). |
-| `_consecutive_rejects` | 0 | int | Post-gate reject streak. |
-| `_occupied` | `set()` | set | Occupied servers. |
-| `cold_start_generation` | 0 | int | Full colony respawn counter. |
-| `_lineage_queue` | `[id...]` | list[int] | Queue of lineage roots. |
+| Name | Init | Type |
+|---|---|---|
+| `population` | `[init_pop]` | list[AlgorithmInstance] |
+| `_next_id` | init_pop | int |
+| `_tick` | 0 | int |
+| `reproduction_allowed` | True | bool |
+| `_spreads` | deque(16) | deque |
+| `_mean_spread_ns` | None | Optional[float] |
+| `noise_ref_ns` | None | Optional[float] |
+| `_recent_observed` | deque(300) | deque[int] |
+| `applied_offsets` | deque(300) | deque[Tuple[int,int]] |
+| `_last_short_vote` | None | Optional[int] |
+| `_last_drift_prediction` | None | Optional[int] |
+| `_last_drift_slope` | None | Optional[float] |
+| `_last_apply_mono_ns` | 0 | int |
+| `_consecutive_rejects` | 0 | int |
+| `_occupied` | `set()` | set |
+| `cold_start_generation` | 0 | int |
+| `_lineage_queue` | `[id...]` | list[int] |
 
 ### AlgorithmInstance
 
-| Name | Init | Type | Notes |
-|---|---|---|---|
-| `id` | n | int | Unique id. |
-| `lineage_id` | n / parent | int | Root id of the lineage. |
-| `favorite` | None | Optional[str] | Currently bound server. |
-| `banned_servers` | `set(_occupied)` | set | Others' favorites (only selection ban). |
-| `own_history` | deque(100) | SlewRecord | Accepted rounds. |
-| `own_history_rejected` | deque(100) | SlewRecord | All rejected by filter. |
-| `own_reference_offset` | None | Optional[int] | Current reference. |
-| `own_threshold_ns` | None | Optional[int] | Filter threshold. |
-| `own_sigma_avg_ns` | None | Optional[int] | Captured σ_avg (once). |
-| `armed_lock_until_tick` | `-1e9` | int | Until which tick we hold favorite. |
-| `warmup_excluded` | `set()` | set | Permanently banned servers. |
-| `warmup_started_tick` | `_tick` | int | Warmup start. |
-| `warmup_stuck_logged` | False | bool | Anti-spam flag. |
-| `accept_window` | deque(16) | deque[bool] | Accept rate window. |
-| `low_accept_windows` | 0 | int | Consecutive low windows. |
-| `deathbed_used` | False | bool | Already gave birth to deathbed. |
-| `born_tick` | `_tick` | int | Birth tick. |
-| `reproduced_count` | 0 | int | How many children produced. |
-| `max_offspring` | 2 | int | Children limit. |
-| `last_reproduced_tick` | `-1e9` | int | Lag control. |
-| `last_selection_mode` | None | Optional[str] | `warmup\|score\|armed_lock\|no_free\|single\|*_forced\|*_hysteresis\|*_hold\|*_no_favorite` |
-| `last_best_candidate` | None | Optional[str] | Last round candidate. |
-| `last_scores` | None | Optional[Dict[str,float]] | Scores of all candidates. |
+| Name | Init | Type |
+|---|---|---|
+| `id` | n | int |
+| `lineage_id` | n / parent | int |
+| `favorite` | None | Optional[str] |
+| `banned_servers` | `set(_occupied)` | set |
+| `own_history` | deque(100) | SlewRecord |
+| `own_history_rejected` | deque(100) | SlewRecord |
+| `own_reference_offset` | None | Optional[int] |
+| `own_threshold_ns` | None | Optional[int] |
+| `own_sigma_avg_ns` | None | Optional[int] |
+| `armed_lock_until_tick` | `-1e9` | int |
+| `warmup_excluded` | `set()` | set |
+| `warmup_started_tick` | `_tick` | int |
+| `accept_window` | deque(16) | deque[bool] |
+| `low_accept_windows` | 0 | int |
+| `deathbed_used` | False | bool |
+| `born_tick` | `_tick` | int |
+| `reproduced_count` | 0 | int |
+| `max_offspring` | 2 | int |
+| `last_reproduced_tick` | `-1e9` | int |
+| `last_selection_mode` | None | Optional[str] |
+| `last_best_candidate` | None | Optional[str] |
+| `last_scores` | None | Optional[Dict[str,float]] |
 
 ### NamedTuple
 
@@ -549,28 +770,36 @@ Note: drift persistence to the DB is done when
 
 ---
 
-## Public API
+## Part V. Public API
 
-    svc = TimeSyncService.get_instance()
+```python
+svc = TimeSyncService.get_instance()
 
-    svc.start()
-    svc.wait_for_first_sync(timeout=30)
-    svc.stop()
+svc.start()
+svc.wait_for_first_sync(timeout=30)
+svc.stop()
 
-    svc.get_utc_ns()                                 # lock-free UTC ns
-    svc.get_utc_ns_with_precision(precision_ns)      # UTC ns | None (strict SLA)
-    svc.get_clock_snapshot()                         # ClockSnapshot | None
-    svc.get_clock_snapshot(precision_ns=500_000)     # TTL fits precision
-    TimeSyncService.utc_from_snapshot(snap, now_mono)  # pure function
-    svc.get_sync_telemetry()                         # full dump
+svc.get_utc_ns()                                 # lock-free UTC ns
+svc.get_utc_ns_with_precision(precision_ns)      # UTC ns | None (strict SLA)
+svc.get_clock_snapshot()                         # ClockSnapshot | None
+svc.get_clock_snapshot(precision_ns=500_000)     # TTL fits precision
+TimeSyncService.utc_from_snapshot(snap, now_mono)  # pure function
+svc.get_sync_telemetry()                         # full dump
+```
 
 ### UTC restoration from a snapshot
 
-    utc = now_mono + anchor_offset_ns + round(rate · (now_mono − anchor_mono_ns))
+```
+utc = now_mono + anchor_offset_ns + round(rate · (now_mono − anchor_mono_ns))
+```
 
 Guarantee: for `now_mono ∈ [anchor_mono, anchor_mono + ttl_ns]`:
-`|utc_restored − utc_true| ≤ accuracy_ns` provided that consensus
-has not degraded more than at the moment of the snapshot.
+
+```
+|utc_restored − utc_true| ≤ accuracy_ns
+```
+
+provided that the consensus has not degraded more than at the moment of the snapshot.
 
 ---
 
@@ -584,3 +813,18 @@ has not degraded more than at the moment of the snapshot.
 | + PTP with HW timestamping | 1–10 µs |
 
 ---
+
+### Quick cheat sheet: "what is averaged where"
+
+| What | How | Why |
+|---|---|---|
+| `t_ref_mono` | arithmetic over all samples of the round | neutral round center |
+| `inst.own_reference_offset` | **weighted 1/delay** over accepted servers | fast servers get more trust |
+| `consensus_offset` | **arithmetic over L² matrix cells** | balance time × ensemble |
+| `short_vote` | **median** of the last 15 observed | resistance to a single outlier |
+| `drift_slope` | **OLS** over 300 applied | true drift rate |
+| instance `σ_avg` | mean of per-server σ(dev) | typical server noise |
+| `σ_consensus` | σ of first differences/√2 | robust consensus noise |
+| per-server `σ_s` | MAD of first differences | server noise without outliers |
+| `colony_bias[srv]` | arith. over time → median over servers | common center minus noise |
+| `noise_ref_ns` | **median** of σ_avg over instances | one faulty instance does not spoil the reference |
