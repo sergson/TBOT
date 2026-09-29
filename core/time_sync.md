@@ -1038,3 +1038,220 @@ provided that the consensus has not degraded more than at the moment of the snap
 | rate | sign-constancy + drift-confirm | sign-constancy only; reset-to-prior at streak ≥ 4 |
 | drift persist to DB | yes | no |
 | force-apply | — | after 50 consecutive rejects |
+
+
+# Chrony vs T.B.O.T — A Comparative Overview
+
+This document compares two approaches to NTP-based time synchronization: **Chrony**, a mature, general-purpose implementation, and **T.B.O.T**, a specialized system built around a colony of filter instances.
+
+The comparison is structured in three layers: architectural differences, areas where T.B.O.T offers advantages, and areas where Chrony offers advantages.
+
+---
+
+## 1. Fundamental architectural differences
+
+These are not differences in tuning, but in underlying approach.
+
+### 1.1 Rate estimation
+
+| | Chrony | T.B.O.T |
+|---|---|---|
+| Method | **Direct linear regression** over the history of a source | **PI-PLL + sign-constancy + drift-confirmation + prior from DB** |
+| Output | Offset and rate estimated jointly | Offset and rate estimated separately; rate is a filtered integrator |
+| Convergence to a drift change | **Fast** (tens of samples) | **Slow** (hundreds of rounds, bounded to ±2 ppm around prior) |
+| Robustness | Moderate — regression is sensitive to clustered outliers | **High** — multi-layer protection |
+
+Chrony trusts the regression: if the slope shifts, the clock's rate has likely changed. This is fast and accurate in clean conditions.
+
+T.B.O.T does not trust any single source of truth about rate. It keeps the rate within a narrow corridor around the prior and admits changes only through three independent triggers. This is slower but more resistant to "phantom" drift changes caused by network noise.
+
+**Consequence:** Chrony performs better on rapid temperature/load changes. T.B.O.T performs better when drift is stable but the network is not.
+
+### 1.2 Source of truth
+
+| | Chrony | T.B.O.T |
+|---|---|---|
+| Unit | Source | Instance-filter + consensus matrix |
+| Selection | Intersection algorithm (mathematically strict) | Colony evolution + post-gate + sign-constancy |
+| Falseticker rejection | Via intersection of confidence intervals | Via reject-streak + force-apply |
+| Final estimate | Weighted average over survivors | Arithmetic mean over L² cells of the ergodic matrix |
+
+Chrony **discards** incorrect sources entirely (falseticker detection). T.B.O.T **filters** every measurement from every server and builds its estimate from what passes.
+
+The first is cleaner from a statistical standpoint. The second is more robust when "correct" sources are few or are themselves noisy.
+
+### 1.3 Role of history
+
+| | Chrony | T.B.O.T |
+|---|---|---|
+| Between sessions | `driftfile` — a **single number** (the last rate) | `drift_history` — a **time series** with MAD-based statistics |
+| Provides | A coarse starting point | A **statistically meaningful prior** (n, σ, span) |
+| Example | — | n=14/14, σ=0.177 ppm, span=131 h |
+
+This is arguably the **most underappreciated advantage of T.B.O.T**. Chrony's `driftfile` is a cache of the last value; if it was written during an anomaly, Chrony will drift at startup. The T.B.O.T prior is a robust median with K·MAD outlier rejection. It does not break from a single bad session.
+
+### 1.4 Polling adaptivity
+
+| | Chrony | T.B.O.T |
+|---|---|---|
+| Interval | Adaptive, 64–1024 s | Fixed 60 s × 2 threads = 30 s |
+| Logic | Stable clock → poll less often | Constant sampling density |
+
+Chrony conserves traffic and CPU. T.B.O.T deliberately maintains **high density** — two samples per minute — so the filter and consensus have data even in noisy periods.
+
+**Consequence:** Chrony is better for mobile devices on battery. T.B.O.T is better for servers where traffic is not a constraint and accuracy matters.
+
+### 1.5 Hardware timestamping
+
+| | Chrony | T.B.O.T |
+|---|---|---|
+| HW timestamping | **Yes** (`SO_TIMESTAMPING`) | No (`time.monotonic_ns()` around `sendto`/`recvfrom`) |
+| Achievable precision | **Down to microseconds** on supported NICs | Limited by syscall and scheduler (tens of microseconds) |
+
+This is a **fundamental** limitation of T.B.O.T. Even with an ideal LAN server, one cannot go below ~50–100 µs without HW timestamping, because every NTP operation incurs 10–50 µs in the OS scheduler.
+
+Chrony is a mature tool in this respect, with two decades of cross-platform optimization.
+
+---
+
+## 2. Advantages of T.B.O.T
+
+### 2.1 Per-server bias integrator
+
+**Unique.** Neither Chrony nor ntpd subtracts a constant server bias as a separate entity. Chrony responds to bias through the common offset, and it is "smeared" across the whole estimate.
+
+T.B.O.T maintains `_colony_bias[srv]` — a separate integrator per server with a soft threshold `|delta| > K·σ_s`. This allows **simultaneous** use of a server with +3 ms bias and a server with zero bias without skewing the estimate.
+
+### 2.2 Multi-layer outlier protection
+
+Chrony defends itself with an intersection algorithm and a median. T.B.O.T uses **four independent layers**:
+
+1. Instance threshold (±2.5–7 ms)
+2. Post-gate (K·σ_consensus)
+3. Reject-streak reset of rate to prior
+4. Force-apply after 50 rejects
+
+The first layer is local, the second is global, the third stabilizes, the fourth guarantees no dead-lock. No comparable composition exists in mainstream NTP implementations.
+
+### 2.3 Dead-lock guarantee
+
+`POST_GATE_FORCE_APPLY_AFTER = 50` — if the gate sticks, after 50 rounds the system **will** apply the consensus and rebuild the prediction. Chrony in a similar situation (prolonged noise) simply converges slowly; ntpd may enter a "panic threshold" and refuse to correct the clock.
+
+The T.B.O.T behavior is explicit: "enough rejection, accept reality and rebuild."
+
+### 2.4 Ergodic consensus matrix
+
+`_select_diverse_cells` maximizes diversity of servers and time moments in an L×L matrix. This is closer in spirit to **ergodic theory** than to classical NTP averaging. Each cell is an independent measurement at its own moment; the mean over L² cells is balanced across time and ensemble.
+
+Chrony weights sources by delay and statistics but does not construct such a structured grid.
+
+### 2.5 Snapshot with an accuracy guarantee
+
+`get_clock_snapshot(precision_ns=500_000)` returns a snapshot **with an explicit guarantee** `accuracy_ns ≤ precision_ns`, or `None`. The consumer receives not "the best available" but an **obligation**: "within this time window the error will not exceed X."
+
+Chrony reports an error estimate via `chronyc tracking`, but without a formal guarantee and without a precision selector.
+
+### 2.6 Telemetry
+
+T.B.O.T's telemetry is at the level of a **research bench**: per-instance histories, matrices, per-server σ, bias, accept rate, favorite selection, armed locks. Chrony's telemetry (`chronyc sources -v`, `chronyc tracking`) exists but is substantially smaller in scope.
+
+### 2.7 Robustness under noise
+
+An observed snapshot: **74% rejects, clock held within 0.96 ms**. This works because rate is pinned to prior and extrapolation is clean. Chrony under 74% source loss falls back to "last known offset + driftfile degradation" and slowly drifts.
+
+---
+
+## 3. Advantages of Chrony
+
+### 3.1 Hardware timestamping
+
+A fundamental precision advantage. Even with a LAN server, T.B.O.T cannot go below ~50–100 µs. Chrony with `hwtimestamp` on an Intel i210 reaches **single-digit microseconds**.
+
+### 3.2 Adaptive polling
+
+Fixed 60 s in T.B.O.T. Chrony adapts: 64 s on stable clocks, 1024 s on very stable ones, faster during divergence. T.B.O.T generates more traffic than necessary in stable mode and does not accelerate in unstable mode.
+
+### 3.3 Simplicity
+
+- ~50 constants in T.B.O.T
+- Five distinct σ definitions
+- Four types of reject logic
+- A colony with evolution, spawn, and divine birth
+
+A misconfigured parameter is difficult to notice without telemetry. Chrony has two decades of testing on millions of systems.
+
+### 3.4 NTP server capability
+
+Chrony can serve time to other machines on the network (`allow`). T.B.O.T exposes `get_utc_ns()` but is not an NTP server without an additional wrapper.
+
+### 3.5 Protocol coverage
+
+Chrony supports NTP, PTP (hardware and software), and reference clocks (GPS, PPS, DCF77). T.B.O.T implements an NTPv4 client only.
+
+### 3.6 Adaptation to drift changes
+
+`RATE_CLAMP_FROM_PRIOR_PPM = 2.0` — a ±2 ppm window around the prior. If the actual drift changes (e.g. a laptop switching power profiles), Chrony catches up in minutes; T.B.O.T takes tens of minutes, or may not adapt at all if the new operating point lies outside the window.
+
+### 3.7 No source specialization
+
+`AlgorithmInstance` objects share the same logic and evolve through death/reproduction over time. This is elegant, but there is **no specialization**: no instances that "trust stratum-1 only," no instances that "work only with LAN." Chrony permits configuring sources with priorities and types.
+
+---
+
+## 4. Summary table
+
+| Criterion | Advantage | Comment |
+|---|---|---|
+| Accuracy on public NTP | Tie | Both ~1 ms |
+| Accuracy on LAN | **Chrony** | HW timestamping reaches µs |
+| Accuracy with GPS/PPS | **Chrony** | Reference clocks out of the box |
+| Robustness under noise | **T.B.O.T** | 74% rejects → 1 ms |
+| Adaptation to drift change | **Chrony** | Regression converges faster |
+| Long-term stability | **T.B.O.T** | Prior with MAD statistics |
+| Dead-lock protection | **T.B.O.T** | Force-apply |
+| Per-server bias | **T.B.O.T** | Unique functionality |
+| Filter composition | **T.B.O.T** | Four layers |
+| Traffic economy | **Chrony** | Adaptive polling |
+| Simplicity | **Chrony** | 20 years of testing |
+| Telemetry | **T.B.O.T** | Research-grade |
+| Snapshot accuracy guarantee | **T.B.O.T** | `precision_ns` API |
+| NTP server | **Chrony** | `allow` |
+| PTP/GPS | **Chrony** | Out of the box |
+| Cross-platform | **Chrony** | All UNIX, Windows port |
+| Windows Modern Standby | **T.B.O.T** | Explicit protection |
+| Mobility | **Chrony** | Adaptive polling |
+
+---
+
+## 5. General observation
+
+The two systems address different problems and are not direct competitors.
+
+**Chrony** is a **general-purpose tool**. It is designed to work wherever any time source is available and to extract the maximum achievable precision with minimal intervention. It is a "Swiss army knife" of time synchronization.
+
+**T.B.O.T** is a **specialized system** for a specific scenario: **a Windows/Linux server without GPS, but with a requirement to hold ~1 ms stably under high network noise and constant Modern Standby pressure**. In this scenario it addresses the problem more fundamentally than Chrony because it:
+
+- accounts for per-server bias,
+- uses a prior with robust statistics,
+- prevents the prediction from drifting without a guaranteed exit,
+- operates at 74% rejects,
+- provides a formal accuracy guarantee to the consumer.
+
+A task to "build a general-purpose replacement for Chrony" would not be winnable on scope. The T.B.O.T design, judging by the code, targets a different objective: **holding time as robustly as possible in an unfavorable environment**. In that niche, T.B.O.T is objectively stronger.
+
+---
+
+## 6. Possible exchanges
+
+**What T.B.O.T could borrow from Chrony:**
+
+1. Hardware timestamping (would yield 50–100× precision on LAN if a LAN server becomes available).
+2. Adaptive polling (would conserve traffic in stable mode).
+3. Support for reference clocks (GPS/PPS) — would broaden applicability.
+
+**What Chrony could borrow from T.B.O.T:**
+
+1. Per-server bias integrator.
+2. Formal accuracy guarantee for clock snapshots.
+3. Robust prior from a time series rather than a single value.
+4. Force-apply as a dead-lock protection mechanism.
