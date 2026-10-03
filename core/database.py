@@ -23,8 +23,7 @@ DATA_DIR = 'data'
 TIMESYNC_DB = 'timesync_config.db'
 TIMESYNC_DB_LOCK = threading.RLock()
 _TIMESYNC_DB_READY = False
-
-DRIFT_HISTORY_MAX = 100          # ~10 days at 10 samples/day
+DRIFT_HISTORY_MAX = 100
 
 # ----------------------------------------------------------------------
 # Field classes
