@@ -1593,3 +1593,25 @@ A task to "build a general-purpose replacement for Chrony" would not be winnable
 2. Formal accuracy guarantee for clock snapshots.
 3. Robust prior from a time series rather than a single value.
 4. Force-apply as a dead-lock protection mechanism.
+
+
+
+## Support the Project ☕
+
+If this project has saved you time or helped in your work, you can support its development using cryptocurrency:
+
+| Network / Token | Wallet Address |
+| :--- | :--- |
+| **💚 USDT (TRC-20)** | TCnh86qJvsmRdkKajafcFqzbvY2Eiqw4UE |
+| **🔷 EVM (ETH / BSC / Polygon)** | 0x650C779ABf16e2D697957E73f53F781cdBA49Ecc |
+| **₿ BTC** | bc1qwekqfc0epnmfkm4n4sfd3s6d4ku69pw5xphtg0 |
+
+*Please double-check the network before sending funds.*
+
+## Author
+
+Created and maintained by [sergson](https://github.com/sergson)
+
+## License
+
+GNU General Public License v3.0
