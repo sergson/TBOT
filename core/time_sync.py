@@ -62,7 +62,6 @@ DEFAULT_NTP_SERVERS=[
             'ntp3.vniiftri.ru',
             'vniiftri.khv.ru',
             'ptbtime1.ptb.de',
-            'ptbtime2.ptb.de',
             'time.cloudflare.com',
             'time.aws.com',
             'ntp.msk-ix.ru',
@@ -70,7 +69,9 @@ DEFAULT_NTP_SERVERS=[
             'time1.ams-ix.net',
             'ntp.se',
             'ntp.metas.ch',
-            'ntp.kriss.re.kr',
+            'ntp.nic.kz',
+            'time.nist.gov',
+            'ntp1.inrim.it'
         ]
 
 # Windows Modern Standby: by default we ask the system not to go into
@@ -95,11 +96,11 @@ QUERY_ATTEMPT_SPACING_NS = int(QUERY_ATTEMPT_SPACING_SEC * 1_000_000_000) #nanos
 
 #Server history queue length
 PER_SERVER_HISTORY = max(len(DEFAULT_NTP_SERVERS),10)
-
 NTP_QUERY_TIMEOUT_SEC = 2          # timeout of a single NTP request
 NTP_QUERY_TIMEOUT_SAFE_SEC = NTP_QUERY_TIMEOUT_SEC     # protective timeout for NTP requests
 NTP_RESOLVING_TIMEOUT_NS = 3600 * 1000_000_000     # DNS resolution timeout for NTP servers, nanoseconds
 DNS_QUERY_TIMEOUT_SEC = 5 # timeout of a single DNS request
+HISTORY_MAX_LEN = 250             # length of round history queue
 
 # Origin echo validation (protection against race/spoofing). Can be disabled for debugging.
 VALIDATE_ORIGIN = os.environ.get('TIME_SYNC_VALIDATE_ORIGIN', '1') == '1'
@@ -123,7 +124,7 @@ RATE_SPRING_SIGMA_FRACTION_BASE = 0.05   # coefficients to historical drift valu
 RATE_SPRING_SIGMA_FRACTION_MAX  = 0.25   # coefficients to historical drift values max  = 0.25·σ_prior
 RATE_SPRING_T_SCALE   = 3.0    # at |t| > threshold+SCALE — full confidence
 RATE_PRIOR_PULL       = 0.00   # additional pull of drift (rate) to historical value, fraction per round, optional
-RATE_CLAMP_FROM_PRIOR_PPM = 2.0  # maximum deviation of drift (rate) from historical ppm ≈ 5σ_prior
+RATE_CLAMP_SIGMA_K = 1.0 # maximum deviation of drift (rate) from historical ppm ≈ 1σ_prior
 
 # --- PLL protection against "stuck" updates and phase jumps ---
 # If less than this interval has passed between two PLL updates —
@@ -143,12 +144,13 @@ RATE_CLAMP_FROM_PRIOR_PPM = 2.0  # maximum deviation of drift (rate) from histor
 PHASE_JUMP_THRESHOLD_NS = 100_000_000   # > 100 ms — reset
 
 #Detector of sign constancy of correction for PLL rate
-RATE_DETECT_WINDOW_N   = 30     # length of phase_errors window
-RATE_DETECT_MIN_N      = 20     # minimum for statistics
+RATE_DETECT_WINDOW_N   = HISTORY_MAX_LEN // 3     # length of phase_errors window
+RATE_DETECT_MIN_N      = HISTORY_MAX_LEN // 5     # minimum for statistics
 RATE_T_THRESHOLD       = 2.5    # |t| of the mean
 RATE_Z_THRESHOLD       = -2.0   # runs z: negative = sign sticking
 
 # Colony bias integrator (constant server shift), additional control:
+MIN_BAIS_HIST_DIVIDER = 4/3        # Minimum history size for bias, divisor
 COLONY_BIAS_GAIN = 0.05            # integrator speed per round
 COLONY_BIAS_MAX_NS = 50_000_000    # compensation limit ±50 ms
 COLONY_BIAS_DECAY = 0.99           # leakage of bias value of inactive servers per round
@@ -172,6 +174,12 @@ THRESHOLD_MIN_NS = 1_000         # 1 µs
 # can be lowered to 1–2 ms, on a slow channel — raised to
 # 8–10 ms.
 COLONY_THRESHOLD_FLOOR_NS = 2_500_000         # 2.5 ms
+# Second floor: allows dropping below COLONY_THRESHOLD_FLOOR_NS,
+# but only as long as the instance's acceptable speed remains high.
+# This is not a replacement for the first floor, but an "emergency hatch" out of it.
+COLONY_THRESHOLD_SECOND_FLOOR_NS = 2_000_000  # 2 ms
+COLONY_THRESHOLD_FLOOR_ACCEPT_RATE = 0.90     # > 90% accepted
+
 # Rate limit of filter narrowing: the threshold per round cannot drop
 # by more than this factor. 0.99= 1% per round. Slower = reference manages
 # to adapt, but accuracy comes later.
@@ -179,10 +187,9 @@ THRESHOLD_SHRINK_FLOOR = 0.99
 
 ACCEPT_WINDOW_SIZE = PER_SERVER_HISTORY # length of accept-history window of an instance, ticks
 DEATH_LOW_WINDOWS = 5              # how many low accept-windows in a row → death
-DEATH_ACCEPT_THRESHOLD = 0.05      # fraction of accepted in window below which the window is "low"
+DEATH_ACCEPT_THRESHOLD = 0.1      # was 0.05, fraction of accepted in window below which the window is "low"
 REPRODUCTION_LAG_L = DEATH_LOW_WINDOWS # minimum ticks between two births
 COHERENCE_THRESHOLD_NS = 5_000_000 # Starting estimate, ns
-HISTORY_MAX_LEN = 100               # length of round history queue
 # Reproduction filters.
 SPREAD_HISTORY_LEN = ACCEPT_WINDOW_SIZE     # length of stdev(offsets) queue
 SPREAD_HISTORY_MIN = REPRODUCTION_LAG_L     # minimum rounds before reproduction is active
@@ -231,7 +238,7 @@ POST_GATE_K = 1.0
 # forcibly passes consensus_offset. Needed for the case when
 # prediction has drifted away from the real drift (extrapolation did not keep up,
 # external step, ...), and the gate is stuck in a closed state.
-POST_GATE_FORCE_APPLY_AFTER = 50
+POST_GATE_FORCE_APPLY_AFTER = HISTORY_MAX_LEN // 2
 #Parameters for resetting rate to historical value when consensus filter triggers
 REJECT_RATE_RESET_STREAK = 4      # how many rejects in a row
 REJECT_RATE_RESET_GAIN   = 1.0    # 1.0 = hard reset of PLL rate, 0.3 = soft pull
@@ -244,15 +251,15 @@ DISABLE_SHORT_VOTE = DISABLE_POST_GATE
 DISABLE_DRIFT_VOTE = DISABLE_POST_GATE
 
 # Consensus history vote — predictions until drift is established.
-HISTORY_VOTE_SHORT_WINDOW = 15     # window for computing median, rounds
-DRIFT_WINDOW = 300                 # window for computing linear regression (drift), rounds
-HISTORY_VOTE_MIN_SAMPLES = SPREAD_HISTORY_MIN # minimum history, rounds, until this short_vote is not active
-DRIFT_MIN_SAMPLES = 30             #minimum history, rounds, until this drift is not active
+HISTORY_VOTE_SHORT_WINDOW = HISTORY_MAX_LEN // 5     # window for computing short predistion
+SHORT_VOTE_MIN_SAMPLES = HISTORY_VOTE_SHORT_WINDOW // 2   #min window for computing short predistion
+DRIFT_WINDOW = HISTORY_MAX_LEN * 3                 # window for computing linear regression (drift), rounds
+DRIFT_MIN_SAMPLES = HISTORY_MAX_LEN // 3             #minimum history, rounds, until this drift is not active
 DRIFT_OUTLIER_K = 3.0            # outlier cutoff by K·MAD analysis of data stored in database
 
 # --- Runtime drift confirmation ---
 # Soft pull of self._rate to consensus._last_drift_slope on divergence.
-# drift_slope — robust linear regression of applied_offsets over 300 points,
+# drift_slope — robust linear regression of applied_offsets over many of points,
 # resistant to single outliers. self._rate — I-integrator of PLL, subject to
 # runaway during prolonged one-sided phase_error (bias, step).
 # Activated only if |rate_ppm − slope_ppm| > DRIFT_CONFIRM_RATE_DIVERGE_PPM.
@@ -263,7 +270,7 @@ DRIFT_OUTLIER_K = 3.0            # outlier cutoff by K·MAD analysis of data sto
 #   1.0 → mechanism disabled           (rate := rate)
 DRIFT_CONFIRM_RATE_DIVERGE_PPM = 3.0 # relies on observation — if rate is noisy within ±3 ppm, and drift_slope is stable ±0.5 ppm
 DRIFT_CONFIRM_ALPHA = 0.5 # 1.0 — fully disables the mechanism (rate = rate), 0.0 — fully replaces rate with slope
-DRIFT_SEED_MIN_SAMPLES = 5       # minimum history, if less, we do not trust the median
+DRIFT_SEED_MIN_SAMPLES = 3       # minimum history, if less, we do not trust the median
 
 # Threshold for resetting rate in _rate_prior at colony cold start.
 # If |rate_ppm − slope_ppm| > threshold and drift_slope exists → rate = prior.
@@ -472,15 +479,14 @@ class Consensus:
         self._mean_spread_ns: Optional[float] = None
         self.noise_ref_ns: Optional[float] = None
         # Trajectory of all observed mean_offset (applied + rejected).
-        # Feeds only short_vote/drift_prediction — prediction must not
-        # get stuck when gate freezes applied_offsets.
-        self._recent_observed: deque[int] = deque(maxlen=DRIFT_WINDOW)
+        self._recent_observed: deque[Tuple[int,int]] = deque(maxlen=DRIFT_WINDOW)
 
         # Trajectory of applied mean_offset
         self.applied_offsets: deque[Tuple[int, int]] = deque(maxlen=DRIFT_WINDOW)
         self._last_short_vote: Optional[int] = None
         self._last_drift_prediction: Optional[int] = None
         self._last_drift_slope: Optional[float] = None
+        self._last_short_slope: Optional[float] = None
 
         # --- Extrapolation of prediction to the time since last applied ---
         # monotonic mark t_ref_mono of the last applied round.
@@ -581,6 +587,7 @@ class Consensus:
                 },
                 'history_vote': {
                     'short_vote_ns': self._last_short_vote,
+                    'short_slope_ns_per_round': self._last_short_slope,
                     'drift_prediction_ns': self._last_drift_prediction,
                     'drift_slope_ns_per_round': self._last_drift_slope,
                     'applied_len': len(self.applied_offsets),
@@ -852,6 +859,52 @@ class Consensus:
             inst.low_accept_windows += 1
         else:
             inst.low_accept_windows = 0
+
+    @staticmethod
+    def _instance_accept_rate(inst: AlgorithmInstance,
+                              extra_accept: bool = False) -> Optional[float]:
+        """
+        Accept rate based on `accept_window`.
+        `extra_accept=True` — count the current round as accepted.
+        This is necessary because the threshold update occurs before
+        `inst.accept_window.append(True)`.
+        """
+        w = inst.accept_window
+        n = len(w)
+        if n == 0 and not extra_accept:
+            return None
+
+        accepted = sum(w)
+        if extra_accept:
+            accepted += 1
+            if n >= ACCEPT_WINDOW_SIZE:
+                if w[0]:
+                    accepted -= 1
+                n = ACCEPT_WINDOW_SIZE
+            else:
+                n += 1
+
+        return (accepted / n) if n else None
+
+    @staticmethod
+    def _effective_threshold_floor_ns(inst: AlgorithmInstance,
+                                      extra_accept: bool = False) -> int:
+        """
+        Effective lower bound `own_threshold_ns`.
+        """
+        current = inst.own_threshold_ns
+        if current is None:
+            return COLONY_THRESHOLD_FLOOR_NS
+
+        if current > COLONY_THRESHOLD_FLOOR_NS:
+            return COLONY_THRESHOLD_FLOOR_NS
+
+        rate = Consensus._instance_accept_rate(inst, extra_accept=extra_accept)
+        if rate is not None and rate > COLONY_THRESHOLD_FLOOR_ACCEPT_RATE:
+            return COLONY_THRESHOLD_SECOND_FLOOR_NS
+
+        return min(current, COLONY_THRESHOLD_FLOOR_NS)
+
 
     @staticmethod
     def _filter_instance(inst: AlgorithmInstance,
@@ -1136,6 +1189,13 @@ class Consensus:
         if compact is None:
             return None
 
+        # Diversity check: discard degenerate matrices
+        # where the number of distinct servers < minimum consensus size.
+        # Particularly relevant for Size=2, where n_distinct=1..2 passes
+        # silently and yields underestimated noise → an artificially narrow post-gate.
+        if len({name for row in compact for name, *_ in row}) < CONSENSUS_MATRIX_MIN:
+            return None
+
         # Drift compensation
         corrected = []
         for row in compact:
@@ -1290,10 +1350,13 @@ class Consensus:
                             inst.own_threshold_ns = max(new_raw, COLONY_THRESHOLD_FLOOR_NS)
                     else:
                         # Evolution: no faster than 1% down per round, and not below
-                        # the colony floor.
+                        # the colony floor / second floor.
                         shrink_floor = int(inst.own_threshold_ns * THRESHOLD_SHRINK_FLOOR)
+                        floor_ns = self._effective_threshold_floor_ns(
+                            inst, extra_accept=True
+                        )
                         inst.own_threshold_ns = max(
-                            new_raw, shrink_floor, COLONY_THRESHOLD_FLOOR_NS,
+                            new_raw, shrink_floor, floor_ns,
                         )
             inst.own_reference_offset = new_offset
             inst.favorite = best_srv
@@ -1312,7 +1375,8 @@ class Consensus:
         built = self._build_consensus_matrix(matrix_rows, t_ref_mono, rate)
         if built is None:
             self._defer_log("debug",
-                            f"Consensus: matrix not assembled (Size<3), round skipped")
+                            f"Consensus: matrix not assembled "
+                            f"(Size<{CONSENSUS_MATRIX_MIN}), round skipped")
             return None
 
         compact_rows, size, consensus_offset = built
@@ -1335,7 +1399,7 @@ class Consensus:
             round_stdev_ns = round(stdev_interval)
         elif len(intervals) == 1:
             mean_interval = intervals[0]
-            round_stdev_ns = 0
+            round_stdev_ns = None
         else:
             mean_interval = 1.0
             round_stdev_ns = 0
@@ -1348,8 +1412,10 @@ class Consensus:
         # Observation — into a separate window for prediction.
         # This does NOT replace applied_offsets; drift/sigma/TTL continue
         # to read applied_offsets, cleared of outliers.
-        self._recent_observed.appendleft(consensus_offset)
-
+        self._recent_observed.appendleft(
+            (consensus_offset,
+             t_ref_mono if t_ref_mono is not None else time.monotonic_ns())
+        )
         # --- Post-gate: split into applied / rejected ---
         prediction = None
         if not DISABLE_DRIFT_VOTE and drift_prediction is not None:
@@ -1467,75 +1533,170 @@ class Consensus:
             rate: float = 0.0,
     ) -> Tuple[Optional[int], Optional[int], Optional[float]]:
         """
-        (short_vote, drift_prediction, drift_slope).
+        Compute three votes about current consensus_offset for the post-gate:
 
-        Sources are separated:
-          short_vote       — _recent_observed[:HISTORY_VOTE_SHORT_WINDOW]
-                             (all observed consensus_offset, including
-                             rejected). median for resistance to
-                             single NTP outliers.
-          drift_prediction — linear regression over applied_offsets
-                             (only gate-approved, clean data).
-          drift_slope      — the same slope; goes to _last_drift_slope
-                             → PLL rate confirmation + persist to drift_history.
-                             UNITS: ns/round (for compatibility with
-                             existing consumers of _last_drift_slope).
+            short_vote       — OLS-based prediction over the SHORT window
+                               (_recent_observed), fast and gate-independent.
+            drift_prediction — OLS-based prediction over applied_offsets (long
+                               window, only gate-approved points), slower but
+                               built on clean data.
+            drift_slope      — slope from the long OLS; goes to _last_drift_slope
+                               → PLL rate confirmation + persist to drift_history.
+                               UNITS: ns/round (for compatibility with existing
+                               consumers of _last_drift_slope).
 
-        Regression is computed on REAL monotonic time, not on
-        index. applied_offsets is appended only on accept-rounds, so
-        between adjacent records 30 s may pass, or hours (if
-        gate rejects for a long time). With regression by index, the slope is divided by
-        30 s regardless of the real step, which gives an overestimate by (real
-        step / 30 s) times. This is exactly what gave slope −77 ppm at rate −9 ppm.
+        ============================================================
+        Both predictors share the SAME structure
+        ============================================================
 
-        For this reason, applied_offsets is stored as deque[Tuple[int,int]]:
-        (consensus_offset_ns, t_ref_mono_ns). All other consumers
-        (σ, TTL, accuracy, drift confirm, persist) must unpack
-        offset via `o for o, _ in ...`.
+            predict(t_ref) = base_value + slope · (t_ref − base_time)
 
-        Why short_vote — by observed:
-            While the gate is stuck (series of rejects), applied_offsets is frozen,
-            and the mean over it does not reflect the current clock position. This gave
-            a deadlock: prediction is not updated → gate does not open.
-            The observed window is fed independently of the gate decision.
+        where:
+            base_value = the FRESHEST point in the corresponding window,
+            base_time  = its t_ref_mono,
+            slope      = OLS slope over the window.
 
-        Why drift_* — by applied:
-            Regression does not suppress single outliers the way median does. Mixing
-            rejected outliers into slope is not allowed — it would distort the estimate of
-            physical drift, which goes into persist and rate confirmation.
+        They differ only in SOURCE and WINDOW:
 
-        Extrapolation rate·(t_ref − _last_apply) is applied to both:
-        compensates for the time since the last applied round. For drift_prediction
-        the base point is the LAST applied-offset, so extrapolation
-        brings it exactly to the moment t_ref without double-counting one round.
+          • short_vote       — source: _recent_observed (all consensus_offset,
+                               including gate-rejected). Window: 50
+                               (HISTORY_VOTE_SHORT_WINDOW). Fed every round
+                               regardless of the gate → never freezes when the
+                               gate is stuck.
+          • drift_prediction — source: applied_offsets (gate-approved, clean).
+                               Window: up to 750 (DRIFT_WINDOW).
+                               Feeds the long-term drift estimate and drift_history.
+
+        ============================================================
+        Why NOT a rolling median for short_vote (historical note)
+        ============================================================
+
+        Earlier short_vote was `median(_recent_observed[:50])`.
+        Median is robust to single outliers, but:
+          (a) it is blind to the drift — its output is the CENTER of the
+              window, not the CURRENT position. At −9 ppm over a 50-round
+              window the median lags by roughly rate · (window/2) ≈ 7 ms;
+          (b) combining that lagged median with an additional
+              rate·(t_ref − last_apply) extrapolation DOUBLE-COUNTED the
+              drift and, during a long reject streak (last_apply frozen),
+              drove the prediction away from reality — the gate could not
+              reopen on its own.
+
+        OLS over the same window fixes both:
+          (a) slope is measured directly, so the prediction is anchored to
+              the FRESHEST point in the window and extrapolated by the
+              measured slope, not by a possibly-stale PLL rate;
+          (b) the source window is fed every round, so no dependence on
+              _last_apply_mono_ns; the prediction tracks reality even while
+              applied_offsets is frozen.
+
+        ============================================================
+        Robustness against single outliers in _recent_observed
+        ============================================================
+
+        _recent_observed contains rejected points by design. Before OLS a
+        MAD-based trim is applied (DRIFT_OUTLIER_K · 1.4826 · MAD around the
+        median). This preserves the outlier-resistance the median used to
+        provide while keeping the drift sensitivity that OLS provides.
+
+        ============================================================
+        Why drift_* — by applied (clean data only)
+        ============================================================
+
+        Regression does not suppress single outliers the way median does.
+        Mixing rejected outliers into the LONG slope is not allowed — it
+        would distort the estimate of physical drift, which goes into
+        persist and rate confirmation.
+
+        ============================================================
+        Units and representation
+        ============================================================
+
+        Both windows store (value, t_ref_mono) tuples. Regression is
+        computed on REAL monotonic time, not on index. applied_offsets is
+        appended only on accept-rounds; _recent_observed is appended every
+        round. Between adjacent records a variable amount of real time may
+        pass; index-based regression would distort the slope, which is why
+        time-tags are used as the x-axis.
 
         Returns
         -------
-        short_vote       : int | None   — absolute offset, ns
-        drift_prediction : int | None   — absolute offset, ns
-        drift_slope      : float | None — ns/round (NOT ns/index, NOT ns/ns)
+        short_vote       : int | None   — absolute offset at t_ref, ns
+        drift_prediction : int | None   — absolute offset at t_ref, ns
+        drift_slope      : float | None — long-window slope, ns/round
+                                          (also stored in self._last_drift_slope
+                                           by _process_round_locked)
+
+        Side effects
+        ------------
+        self._last_short_slope : float | None — short-window slope, ns/round.
+                                Telemetry only; not consumed by PLL.
         """
-        # --- short_vote: by observed (applied + rejected) ---
+
+        round_ns = self.sync_interval * 1_000_000_000 // SYNC_THREAD_SLOTS
+
+        # ---------------------------------------------------------------
+        # short_vote — OLS over _recent_observed (short window, always fed)
+        # ---------------------------------------------------------------
         n_obs = len(self._recent_observed)
         short_vote: Optional[int] = None
-        if n_obs >= HISTORY_VOTE_MIN_SAMPLES:
-            window = list(self._recent_observed)[:HISTORY_VOTE_SHORT_WINDOW]
-            # median always: the observed window contains outliers that
-            # would not have entered applied_offsets.
-            short_vote = int(statistics.median(window))
+        short_slope_ns_per_round: Optional[float] = None
 
-        # --- drift_prediction / drift_slope: by applied (clean) ---
+        if n_obs >= SHORT_VOTE_MIN_SAMPLES:
+            # Take the NEWEST HISTORY_VOTE_SHORT_WINDOW points, then flip to
+            # oldest-first for OLS. _recent_observed is newest-first.
+            recent_newest_first = list(self._recent_observed)[:HISTORY_VOTE_SHORT_WINDOW]
+            series_obs = list(reversed(recent_newest_first))  # oldest-first
+
+            # MAD-trim around the median to suppress single outliers that
+            # would otherwise skew the OLS slope.
+            ys_raw = [y for y, _ in series_obs]
+            med = statistics.median(ys_raw)
+            mad = statistics.median(abs(y - med) for y in ys_raw) * 1.4826
+            if mad > 0:
+                series_obs = [(y, t) for (y, t) in series_obs
+                              if abs(y - med) <= DRIFT_OUTLIER_K * mad]
+
+            if len(series_obs) >= SHORT_VOTE_MIN_SAMPLES:
+                t0 = series_obs[0][1]
+                y0 = series_obs[0][0]
+                xs = [t - t0 for _, t in series_obs]
+                ys = [y - y0 for y, _ in series_obs]
+                x_mean = statistics.mean(xs)
+                y_mean = statistics.mean(ys)
+                num = 0.0
+                den = 0.0
+                for x, y in zip(xs, ys):
+                    dx = x - x_mean
+                    num += dx * (y - y_mean)
+                    den += dx * dx
+                if den > 0.0:
+                    slope_obs = num / den  # ns/ns
+                    short_slope_ns_per_round = slope_obs * round_ns
+
+                    # Base point = freshest observed point in the window.
+                    base_val, base_mono = series_obs[-1]
+                    if t_ref_mono is not None and t_ref_mono > base_mono:
+                        short_vote = int(base_val
+                                         + slope_obs * (t_ref_mono - base_mono))
+                    else:
+                        short_vote = int(base_val)
+
+        self._last_short_slope = short_slope_ns_per_round
+
+        # ---------------------------------------------------------------
+        # drift_prediction / drift_slope — OLS over applied_offsets (long window)
+        # ---------------------------------------------------------------
         n_app = len(self.applied_offsets)
         drift_prediction: Optional[int] = None
         drift_slope: Optional[float] = None
+
         if n_app >= DRIFT_MIN_SAMPLES:
             series = list(reversed(self.applied_offsets))  # oldest-first
             t0 = series[0][1]
             y0 = series[0][0]
-
-            xs = [t - t0 for _, t in series]  # ns from the start
-            ys = [y - y0 for y, _ in series]  # ns from the start
-
+            xs = [t - t0 for _, t in series]
+            ys = [y - y0 for y, _ in series]
             x_mean = statistics.mean(xs)
             y_mean = statistics.mean(ys)
             num = 0.0
@@ -1545,31 +1706,39 @@ class Consensus:
                 num += dx * (y - y_mean)
                 den += dx * dx
             if den > 0.0:
-                slope = num / den  # ns/ns, dimensionless
+                slope = num / den  # ns/ns
+                drift_slope = slope * round_ns  # ns/round
 
-                # Conversion to ns/round for existing consumers of
-                # _last_drift_slope (_apply_drift_confirmation, cold-start
-                # reset, drift persist — all of them compute
-                # slope_ppm = drift_slope / (round_sec * 1e3)).
-                round_ns = self.sync_interval * 1_000_000_000 // SYNC_THREAD_SLOTS
-                drift_slope = slope * round_ns
-
-                # Prediction base point: offset at the moment of the last
-                # applied. The shift to t_ref is done by the extrapolation block
-                # below (rate · (t_ref − last_apply)). We do NOT add
-                # one round here — otherwise it would be counted twice.
+                # Base point = last applied offset. Extrapolation to t_ref is
+                # done below via the PLL rate (or slope, in warmup).
                 drift_prediction = series[-1][0]
 
-        # --- Extrapolation to the time since the last applied ---
-        if t_ref_mono is not None and self._last_apply_mono_ns > 0:
+        # ---------------------------------------------------------------
+        # Extrapolation of drift_prediction to t_ref
+        # ---------------------------------------------------------------
+        # short_vote extrapolates itself internally (base = freshest observed,
+        # slope from the same window) — do NOT add anything here.
+        #
+        # drift_prediction is anchored at last applied. When the gate has been
+        # closed for a long time that base becomes stale; the extrapolation
+        # below compensates it.
+        #
+        # Source of extrapolation rate (Variant A):
+        #   n_app <  DRIFT_WINDOW → slope (rate not yet validated by drift-confirm)
+        #   n_app >= DRIFT_WINDOW → rate  (validated by drift-confirm)
+        if (drift_prediction is not None
+                and t_ref_mono is not None
+                and self._last_apply_mono_ns > 0):
             elapsed_ns = t_ref_mono - self._last_apply_mono_ns
             if elapsed_ns > 0:
-                correction = round(rate * elapsed_ns)
-                if correction != 0:
-                    if short_vote is not None:
-                        short_vote += correction
-                    if drift_prediction is not None:
-                        drift_prediction += correction
+                if n_app >= DRIFT_WINDOW and drift_slope is not None:
+                    extrap_rate = rate  # ns/ns
+                elif drift_slope is not None:
+                    extrap_rate = drift_slope / round_ns  # ns/round → ns/ns
+                else:
+                    extrap_rate = 0.0
+                if extrap_rate != 0.0:
+                    drift_prediction += int(round(extrap_rate * elapsed_ns))
 
         return short_vote, drift_prediction, drift_slope
 
@@ -1752,7 +1921,7 @@ class Consensus:
                             )
             return
         inst.own_sigma_avg_ns = avg
-        self._defer_log("info",
+        self._defer_log("debug",
                         f"Instance {inst.id}: captured σ_avg={inst.own_sigma_avg_ns} ns "
                         f"over {len(sigmas)} servers (N={len(counts)}, n_min={n_min})"
                         )
@@ -2062,11 +2231,13 @@ class TimeSyncService:
 
         #Processing of known drift values
         prior = self.compute_drift_prior()
+        self._rate_prior_active = False
         if (prior['n'] >= DRIFT_SEED_MIN_SAMPLES
                 and prior['median_ppm'] is not None
                 and prior['sigma_ppm'] is not None
                 and prior['sigma_ppm'] < PLL_RATE_LIMIT * 1e6):
             self._rate_prior = prior['median_ppm'] * 1e-6
+            self._rate_prior_active = True
             self._defer_log("info",
                 f"Drift prior: {prior['median_ppm']:+.3f} ppm ±{prior['sigma_ppm']:.3f} "
                 f"(n={prior['kept']}/{prior['n']}, span={prior['span_sec'] / 3600:.1f}h)"
@@ -2080,6 +2251,13 @@ class TimeSyncService:
                 )
             else:
                 self._defer_log("info", "Drift prior: empty history, rate_prior=0")
+        # Processing drift sigma for clamp by known prior
+        self._rate_clamp_sigma_ppm: Optional[float] = None
+        if (prior['n'] >= DRIFT_SEED_MIN_SAMPLES
+                and prior['sigma_ppm'] is not None
+                and prior['sigma_ppm'] > 0):
+            self._rate_clamp_sigma_ppm = prior['sigma_ppm']
+
 
         # Setting the rate correction step of the PLL
         self._rate_spring_base_ppm = RATE_SPRING_SIGMA_FRACTION_BASE * prior['sigma_ppm'] if prior['sigma_ppm'] else RATE_SPRING_BASE_PPM
@@ -2252,6 +2430,41 @@ class TimeSyncService:
                 'jitter_ns': int(statistics.stdev(vals)) if len(vals) >= 2 else 0,
             }
 
+        # --- Diagnostics ---
+        # Source driving drift_prediction extrapolation:
+        #   'short_vote' — drift_prediction not yet ready; gate uses SV
+        #   'slope'      — n_app < ​​DRIFT_WINDOW; extrapolation based on slope
+        #   'rate'       — n_app >= DRIFT_WINDOW; extrapolation based on self._rate
+        with self._consensus._lock:
+            n_app = len(self._consensus.applied_offsets)
+
+        if n_app < DRIFT_MIN_SAMPLES:
+            extrap_src = 'short_vote'
+        elif n_app < DRIFT_WINDOW:
+            extrap_src = 'slope'
+        else:
+            extrap_src = 'rate'
+
+        if self._rate_clamp_sigma_ppm is not None:
+            span = RATE_CLAMP_SIGMA_K * self._rate_clamp_sigma_ppm
+            clamp_lo = self._rate_prior * 1e6 - span
+            clamp_hi = self._rate_prior * 1e6 + span
+        else:
+            clamp_lo = None
+            clamp_hi = None
+
+        extrapolation_diag = {
+            'source': extrap_src,
+            'n_app': n_app,
+            'rate_prior_active': self._rate_prior_active,
+            'rate_clamp_lo_ppm': clamp_lo,
+            'rate_clamp_hi_ppm': clamp_hi,
+            'rate_clamp_sigma_ppm': self._rate_clamp_sigma_ppm,
+            'rate_prior_ppm': (self._rate_prior * 1e6
+                               if self._rate_prior else None),
+            'short_slope_ns_per_round': self._consensus._last_short_slope,
+        }
+
         return {
             'precise_ns': precise,
             'system_ns': system,
@@ -2269,7 +2482,8 @@ class TimeSyncService:
             'rate_ppm': self._rate * 1e6,
             'phase_error_ns': self._last_phase_error,
             'second_sync_thread_delay': self.second_sync_thread_delay,
-            'server_meta': server_meta_snapshot
+            'server_meta': server_meta_snapshot,
+            'extrapolation_diag': extrapolation_diag,
         }
 
     def get_utc_ns(self) -> int:
@@ -3063,7 +3277,7 @@ class TimeSyncService:
             self._last_drift_persist_tick = self._consensus._tick
             self._last_cold_gen = cur_gen
         self._raw_proposed_history.appendleft(raw_snapshot)
-        if len(self._raw_proposed_history) >= HISTORY_MAX_LEN // 3:
+        if len(self._raw_proposed_history) >= HISTORY_MAX_LEN // MIN_BAIS_HIST_DIVIDER:
             self._update_colony_bias()
 
     def _maybe_reset_rate_on_cold_start_locked(self) -> None:
@@ -3077,6 +3291,8 @@ class TimeSyncService:
           • |rate − slope| > DRIFT_COLD_START_DIVERGE_PPM → rate drifted away, reset to prior.
           • |rate − slope| ≤ threshold → rate is consistent with the measurement, keep.
         """
+        if not self._rate_prior_active:
+            return
         slope_ns = self._consensus._last_drift_slope # race of _last_drift_slope is not critical
         rate_ppm = self._rate * 1e6
 
@@ -3232,9 +3448,11 @@ class TimeSyncService:
         # Additional soft pull to prior — insurance against runaway
         new_rate_ppm += RATE_PRIOR_PULL * (self._rate_prior * 1e6 - new_rate_ppm)
         # Clamp around prior
-        lo = self._rate_prior * 1e6 - RATE_CLAMP_FROM_PRIOR_PPM
-        hi = self._rate_prior * 1e6 + RATE_CLAMP_FROM_PRIOR_PPM
-        new_rate_ppm = max(lo, min(hi, new_rate_ppm))
+        if self._rate_clamp_sigma_ppm is not None:
+            span = RATE_CLAMP_SIGMA_K * self._rate_clamp_sigma_ppm
+            lo = self._rate_prior * 1e6 - span
+            hi = self._rate_prior * 1e6 + span
+            new_rate_ppm = max(lo, min(hi, new_rate_ppm))
         self._rate = new_rate_ppm * 1e-6
         self._defer_log("debug",
                         f"rate_sign_constancy: t={t:+.2f} z={z:+.2f} "
@@ -3273,20 +3491,21 @@ class TimeSyncService:
             streak = self._consensus._consecutive_rejects
             rate_before_streak_ppm = rate_at_entry * 1e6
             if streak >= REJECT_RATE_RESET_STREAK:
-                rate_ppm = self._rate * 1e6
-                prior_ppm = self._rate_prior * 1e6
-                diverge = abs(rate_ppm - prior_ppm)
-                if diverge > REJECT_RATE_RESET_MIN_DIVERGE_PPM:
-                    new_ppm = (1 - REJECT_RATE_RESET_GAIN) * rate_ppm \
-                              + REJECT_RATE_RESET_GAIN * prior_ppm
-                    self._rate = new_ppm * 1e-6
-                    self._phase_err_window.clear()
-                    self._defer_log("warning",
-                                    f"Post-gate reject-streak={streak}: rate "
-                                    f"{rate_ppm:+.3f} → {new_ppm:+.3f} ppm "
-                                    f"(prior {prior_ppm:+.3f}, Δ={diverge:.2f} ppm). "
-                                    f"Check hardware/temperature or clear the timesync_config.db database, "
-                                    f"the drift_history table (otherwise historical data may be erroneous)")
+                if self._rate_prior_active:
+                    rate_ppm = self._rate * 1e6
+                    prior_ppm = self._rate_prior * 1e6
+                    diverge = abs(rate_ppm - prior_ppm)
+                    if diverge > REJECT_RATE_RESET_MIN_DIVERGE_PPM:
+                        new_ppm = (1 - REJECT_RATE_RESET_GAIN) * rate_ppm \
+                                  + REJECT_RATE_RESET_GAIN * prior_ppm
+                        self._rate = new_ppm * 1e-6
+                        self._phase_err_window.clear()
+                        self._defer_log("warning",
+                                        f"Post-gate reject-streak={streak}: rate "
+                                        f"{rate_ppm:+.3f} → {new_ppm:+.3f} ppm "
+                                        f"(prior {prior_ppm:+.3f}, Δ={diverge:.2f} ppm). "
+                                        f"Check hardware/temperature or clear the timesync_config.db database, "
+                                        f"the drift_history table (otherwise historical data may be erroneous)")
 
             rate_before_ppm = self._rate * 1e6
             self._last_phase_error = phase_err_reject
@@ -3328,7 +3547,7 @@ class TimeSyncService:
             win_len = len(self._phase_err_window)
             moved = "moved" if abs(rate_delta_ppm) > 1e-9 else "unchanged"
 
-            self._defer_log("info",
+            self._defer_log("debug",
                             f"Post-gate rejected raw={rejected_offset_ns} ns; "
                             f"predicted_model={predicted_now} ns; "
                             f"new_anchor={self._anchor_offset} ns; "
@@ -3493,7 +3712,7 @@ class TimeSyncService:
                     logger.debug(f"Thread {thread_id}: round skipped by consensus")
                     with self.lock:
                         self._raw_proposed_history.appendleft(raw_snapshot)
-                        if len(self._raw_proposed_history) >= HISTORY_MAX_LEN // 3:
+                        if len(self._raw_proposed_history) >= HISTORY_MAX_LEN // 2:
                             self._update_colony_bias()
                         logs = self._drain_pending_logs()
                 else:
@@ -3563,7 +3782,7 @@ class TimeSyncService:
             for srv, proposed in snapshot:
                 per_server.setdefault(srv, []).append(proposed)
 
-        min_history = HISTORY_MAX_LEN // 3
+        min_history = HISTORY_MAX_LEN // MIN_BAIS_HIST_DIVIDER
 
         stats: Dict[str, Tuple[float, float]] = {}
         for srv, vals in per_server.items():
@@ -3819,7 +4038,7 @@ class TimeSyncService:
                 )
                 if ok:
                     self._defer_log(
-                        "info",
+                        "debug",
                         f"keep-awake: Power Throttling disabled ({desc})",
                     )
                     applied = True
@@ -3874,7 +4093,7 @@ class TimeSyncService:
                     f"Priority remains Normal."
                 )
             else:
-                self._defer_log("info", "keep-awake: priority class = ABOVE_NORMAL")
+                self._defer_log("debug", "keep-awake: priority class = ABOVE_NORMAL")
         except Exception as e:
             self._defer_log(
                 "warning",
@@ -3885,7 +4104,7 @@ class TimeSyncService:
         ES_CONTINUOUS = 0x80000000
         ES_SYSTEM_REQUIRED = 0x00000001
 
-        self._defer_log("info", "keep-awake: ES_SYSTEM_REQUIRED request set")
+        self._defer_log("debug", "keep-awake: ES_SYSTEM_REQUIRED request set")
         with self.lock:
             logs = self._drain_pending_logs()
         _emit_deferred_logs(logs)
@@ -4076,6 +4295,77 @@ def _fmt_consensus_series(records) -> str:
     t_oldest = _ts_to_hms(records[-1].timestamp_ns)
     return f"[{t_newest}  {diffs_str}  {t_oldest}]"
 
+
+def _fmt_record_compact(rec) -> str:
+    """Compact single-line SlewRecord entry."""
+    inst_mark = (f"[inst {rec.instance_id}]" if rec.instance_id is not None
+                 else "[consensus]")
+    ts = _ts_to_hms(rec.timestamp_ns)
+
+    if rec.rejected_offset_ns is not None:
+        thr_str = (f"±{rec.threshold_ns / 1e6:.3f} ms"
+                   if rec.threshold_ns is not None else "N/A")
+        size_str = f"  [Size={len(rec.matrix)}]" if rec.matrix else ""
+        clamp_str = ""
+        if rec.ref_ns is not None:
+            clamp_ns = rec.ref_ns - rec.rejected_offset_ns
+            clamp_str = (f"  clamp={clamp_ns / 1e6:+.6f} ms "
+                         f"(pred={rec.ref_ns / 1e6:+.6f} ms)")
+        return (f"{inst_mark} [{ts}]  REJECTED  "
+                f"Δ {rec.diff_ns / 1e6:+.6f} ms  (thr {thr_str})"
+                f"{size_str}{clamp_str}")
+
+    fav_mark = f" fav={rec.favorite}" if rec.favorite else ""
+    if rec.diff_ns is None:
+        diff_str = "Δ cold-start"
+    else:
+        diff_str = f"Δ {rec.diff_ns / 1e6:+.6f} ms"
+
+    thr_str = (f"±{rec.threshold_ns / 1e6:.3f} ms"
+               if rec.threshold_ns is not None else "N/A")
+
+    matrix_str = ""
+    if rec.instance_id is None and rec.matrix:
+        matrix_str = f"  [Size={len(rec.matrix)}]"
+
+    srv_str = ""
+    if rec.servers:
+        n_ok = sum(1 for s in rec.servers if s[4] == '✓')
+        srv_str = f"  srv ✓{n_ok}/{len(rec.servers)}"
+
+    return (f"{inst_mark} [{ts}]  {diff_str}  "
+            f"(thr {thr_str}){fav_mark}{matrix_str}{srv_str}")
+
+def _fmt_extrap_diag_lines(diag: dict, indent: str = "      ") -> list:
+    """extrapolation source and rate clamp."""
+    src = diag.get('source', 'N/A')
+    lo = diag.get('rate_clamp_lo_ppm')
+    hi = diag.get('rate_clamp_hi_ppm')
+    sigma = diag.get('rate_clamp_sigma_ppm')
+    prior = diag.get('rate_prior_ppm')
+
+    out = [f"{indent}extrapolation source        : {src}"]
+
+    if lo is not None and hi is not None:
+        sigma_str = f"σ={sigma:.3f}" if sigma is not None else "σ=N/A"
+        prior_str = (f", prior={prior:+.3f}"
+                     if prior is not None else "")
+        out.append(
+            f"{indent}rate clamp                  : "
+            f"[{lo:+.3f}, {hi:+.3f}] ppm "
+            f"(1σ{prior_str}, {sigma_str})"
+        )
+    else:
+        out.append(
+            f"{indent}rate clamp                  : none (no prior)"
+        )
+    if not diag.get('rate_prior_active', False):
+        out.append(
+            f"{indent}rate clamp                  : none (no prior — "
+            f"reset/clamp disabled)"
+        )
+    return out
+
 #Generalized telemetry
 def build_short_telemetry_content():
     """Short telemetry: only top-level results.
@@ -4173,6 +4463,23 @@ def build_short_telemetry_content():
     if DISABLE_SHORT_VOTE: flags_off.append("short_vote")
     if DISABLE_DRIFT_VOTE: flags_off.append("drift_vote")
 
+    diag = telemetry.get('extrapolation_diag') or {}
+    extr_src = diag.get('source', 'N/A')
+    if diag.get('rate_clamp_lo_ppm') is not None:
+        clamp_str = (f"[{diag['rate_clamp_lo_ppm']:+.2f}, "
+                     f"{diag['rate_clamp_hi_ppm']:+.2f}] ppm "
+                     f"(1σ)")
+    else:
+        clamp_str = "none (no prior)"
+
+    # short vote slope (from _recent_observed OLS)
+    hv_short_slope = history_vote.get('short_slope_ns_per_round')
+    if hv_short_slope is not None and round_sec:
+        short_slope_ppm = hv_short_slope / (round_sec * 1e3)
+        short_slope_str = f"{hv_short_slope:+.0f} ns/round ({short_slope_ppm:+.3f} ppm)"
+    else:
+        short_slope_str = "N/A"
+
     lines = [
         "TIME SYNC — SUMMARY",
         "─" * 50,
@@ -4193,9 +4500,12 @@ def build_short_telemetry_content():
         f"Occupied servers           : {len(occupied)}",
         f"Offsets spread (stdev)     : {_fmt_ms(spread_ns)}",
         f"Colony reproduction        : {gate_line}",
-        f"Predictions (history votes): len={hv_len} "
+        f"Predictions                : len={hv_len} "
         f"short={short_str} "
         f"slope={slope_str }",
+        f"Short slope                : {short_slope_str}",
+        f"Extrapolation source       : {extr_src}",
+        f"Rate clamp                 : {clamp_str}",
         f"Consensus Δ applied in last {HISTORY_MAX_LEN} rounds  :{_fmt_consensus_series(applied_records)}",
         f"Consensus Δ rejected in last {HISTORY_MAX_LEN} rounds : {_fmt_consensus_series(rejected_records)}",
     ]
@@ -4205,6 +4515,538 @@ def build_short_telemetry_content():
     lines.append(f"→ click Time again for full telemetry "
                  f"({len(instances)} instances, matrices, history)")
     return "\n".join(lines)
+
+def build_medium_telemetry_content():
+    """Intermediate telemetry: results and headers without 'heavy' details."""
+    try:
+        telemetry = time_sync_service.get_sync_telemetry()
+    except Exception as e:
+        logger.error(f"Time sync telemetry error: {e}")
+        return "Time sync not available"
+
+    precise_ns = telemetry.get('precise_ns')
+    sys_ns = telemetry.get('system_ns')
+    if precise_ns is None or sys_ns is None:
+        return "Time sync not available (first sync pending)"
+
+    # ---- Field extraction (matches full telemetry) ----
+    offset_ns         = telemetry.get('offset_ns')
+    slew_error_ns     = telemetry.get('slew_error_ns')
+    slew_errors_ns    = telemetry.get('slew_errors_ns') or []
+    offset_spread_ns  = telemetry.get('offset_spread_ns')
+    ntp_spread_ns     = telemetry.get('ntp_spread_ns')
+    diff_threshold_ns = telemetry.get('diff_threshold_ns')
+    population        = telemetry.get('population') or {}
+    gate              = (population.get('reproduction_gate') or {}) if population else {}
+    instances         = telemetry.get('instances') or {}
+    colony_bias_ns    = telemetry.get('colony_bias_ns') or {}
+    colony_noise_ns   = telemetry.get('colony_noise_ns') or {}
+    per_server_delay  = telemetry.get('per_server_delay') or {}
+    history_vote      = (population.get('history_vote') or {}) if population else {}
+    rate_ppm          = telemetry.get('rate_ppm')
+    phase_error_ns    = telemetry.get('phase_error_ns')
+    second_sync_thread_delay = telemetry.get('second_sync_thread_delay')
+    server_meta       = telemetry.get('server_meta') or {}
+
+    all_consensus_records = slew_errors_ns or []
+    applied_history  = [r for r in all_consensus_records
+                        if r.rejected_offset_ns is None]
+    rejected_history = [r for r in all_consensus_records
+                        if r.rejected_offset_ns is not None]
+
+    sys_str     = _ns_to_utc_str(sys_ns)
+    precise_str = _ns_to_utc_str(precise_ns)
+    offset_spread = _fmt_ms(offset_spread_ns)
+    ntp_spread    = _fmt_ms(ntp_spread_ns)
+    offset_ms     = _fmt_ms(offset_ns)
+
+    if slew_error_ns == 0 and offset_spread_ns is not None:
+        slew_error = "compensated"
+    elif slew_error_ns == 0:
+        slew_error = "N/A"
+    else:
+        slew_error = _fmt_ms(slew_error_ns)
+
+    diff_threshold_str = (f"±{_fmt_ms(diff_threshold_ns)}"
+                          if diff_threshold_ns is not None else "N/A")
+
+   # ---- Compact history render ----
+    def render_history_compact(records, limit=HISTORY_MAX_LEN):
+        if not records:
+            return "      (empty)"
+        return "\n".join(
+            "      " + _fmt_record_compact(rec) for rec in records[:limit]
+        )
+
+    # ---- Dominant analysis ---
+    def render_dominant_analysis(_inst, _current_tick):
+        _hist = _inst.get('own_history') or []
+        cur_fav = _inst.get('favorite')
+        _dominant_min_samples = _inst.get('dominant_min_samples')
+        _sigma_avg = _inst.get('sigma_avg_ns')
+        _thr_ns = _inst.get('threshold_ns')
+        _lock_until = _inst.get('armed_lock_until_tick', -10 ** 9)
+
+        _lines = []
+
+        if _current_tick < _lock_until:
+            _lines.append(
+                f"      armed-lock active: {_lock_until - _current_tick} ticks left "
+                f"(until tick {_lock_until})"
+            )
+
+        if _thr_ns is None or _thr_ns <= 0:
+            _lines.append("      → not armed: threshold not established yet")
+            return "\n".join(_lines)
+        if _sigma_avg is None or _sigma_avg <= 0:
+            _warmup_exc = _inst.get('warmup_excluded') or []
+            _warmup_start = _inst.get('warmup_started_tick')
+            last = _hist[0] if _hist else None
+            avail = [_n for _n, *_ in (last.servers or ())] if last else []
+            avail = [_n for _n in avail if _n not in _warmup_exc]
+
+            grace_left = None
+            if _warmup_start is not None:
+                grace_left = (_warmup_start
+                              + SIGMA_WARMUP_TIMEOUT_MULT * SIGMA_WARMUP_RECORDS
+                              - _current_tick)
+
+            counts: dict = {}
+            for rec in _hist:
+                if rec.is_cold_start or not rec.servers:
+                    continue
+                for name, _p, _d, _dl, mark in rec.servers:
+                    if mark == '✓':
+                        counts[name] = counts.get(name, 0) + 1
+
+            _lines.append(
+                f"      → warming up: σ_avg not captured "
+                f"(need {SIGMA_WARMUP_RECORDS} ✓/srv, "
+                f"grace left: "
+                f"{grace_left if grace_left is None else max(grace_left, 0)} ticks)"
+            )
+            if len(avail) < WARMUP_MIN_SURVIVORS:
+                _lines.append(
+                    f"      rule 1: only {len(avail)} available "
+                    f"(< {WARMUP_MIN_SURVIVORS}), stay in warmup"
+                )
+            for name in avail:
+                c = counts.get(name, 0)
+                mark = ("" if c >= SIGMA_WARMUP_RECORDS
+                        else f" (need {SIGMA_WARMUP_RECORDS - c} more)")
+                _lines.append(f"      {name}: {c}/{SIGMA_WARMUP_RECORDS}{mark}")
+            if _warmup_exc:
+                _lines.append(
+                    f"      permanently excluded: {', '.join(_warmup_exc)}"
+                )
+            return "\n".join(_lines)
+
+        if _dominant_min_samples is None:
+            _lines.append(
+                f"      → not armed: M undefined "
+                f"(N<{DOMINANT_MIN_SERVERS} or no history)"
+            )
+            return "\n".join(_lines)
+
+        last = _hist[0] if _hist else None
+        srv_num = len(last.servers) if (last and last.servers) else 0
+        _delta = _sigma_avg / _thr_ns
+        _lines.append(
+            f"      M={_dominant_min_samples}  "
+            f"σ_avg={_sigma_avg / 1e6:.3f} ms  "
+            f"thr=±{_thr_ns / 1e6:.3f} ms  Δ={_delta:.3f}  N={srv_num}"
+        )
+
+        per_srv: dict = {}
+        for rec in _hist:
+            if rec.is_cold_start or not rec.servers:
+                continue
+            for name, _proposed, dev, _delay, mark in rec.servers:
+                if mark == '✓':
+                    per_srv.setdefault(name, []).append(dev)
+
+        if not per_srv:
+            _lines.append("      (no ✓ server data yet)")
+            return "\n".join(_lines)
+
+        groups = []
+        for name, devs in per_srv.items():
+            sd = statistics.stdev(devs) if len(devs) >= 2 else None
+            groups.append((name, len(devs), sd))
+        groups.sort(key=lambda g: (g[0] != cur_fav, -g[1]))
+
+        for name, cnt, sd in groups:
+            sd_str = f"σ={sd / 1e6:.3f} ms" if sd is not None else "σ=N/A"
+            mark = "  ← current" if name == cur_fav else ""
+            if name == cur_fav:
+                progress = (f"✓ {cnt}/{_dominant_min_samples}"
+                            if cnt >= _dominant_min_samples
+                            else f"{cnt}/{_dominant_min_samples} "
+                                 f"(need {_dominant_min_samples - cnt} more)")
+            else:
+                progress = f"{cnt}"
+            _lines.append(f"      {name}: {progress}, {sd_str}{mark}")
+
+        if cur_fav is None or cur_fav not in per_srv:
+            _lines.append("      → not armed: current favorite absent in ✓ history")
+            return "\n".join(_lines)
+
+        on_favorite = per_srv[cur_fav]
+        others = [d for _n, dl in per_srv.items() if _n != cur_fav for d in dl]
+
+        if len(on_favorite) < _dominant_min_samples:
+            _lines.append(
+                f"      → not armed: need "
+                f"{_dominant_min_samples - len(on_favorite)} more on favorite"
+            )
+        elif len(others) < _dominant_min_samples:
+            _lines.append(
+                f"      → not armed: only {len(others)}/"
+                f"{_dominant_min_samples} on others"
+            )
+        elif len(on_favorite) < DOMINANT_MIN_DEVS or len(others) < DOMINANT_MIN_DEVS:
+            _lines.append(
+                f"      → not armed: insufficient data for stdev "
+                f"(need ≥{DOMINANT_MIN_DEVS} on favorite and others)"
+            )
+        else:
+            sx = statistics.stdev(on_favorite)
+            so = statistics.stdev(others)
+            if so == 0:
+                _lines.append("      → not armed: σ_others=0")
+            else:
+                _ratio = sx / so
+                verdict = "ARMED" if _ratio < DOMINANT_STDEV_RATIO else "not dominant"
+                _lines.append(
+                    f"      → {verdict}: σ_X/σ_others={_ratio:.3f} "
+                    f"(need <{DOMINANT_STDEV_RATIO})"
+                )
+        return "\n".join(_lines)
+
+    all_refs = [i.get('reference_offset_ns') for i in instances.values()
+                if i.get('reference_offset_ns') is not None]
+    median_ref = int(statistics.median(all_refs)) if all_refs else None
+
+    applied_str  = render_history_compact(applied_history,  limit=HISTORY_MAX_LEN)
+    rejected_str = render_history_compact(rejected_history, limit=HISTORY_MAX_LEN)
+
+    # ---- Bias ----
+    if not colony_bias_ns:
+        colony_bias_str = "      (empty — history not full yet)"
+    else:
+        lines = []
+        for srv, b_ns in sorted(colony_bias_ns.items(), key=lambda kv: abs(kv[1])):
+            lines.append(f"      {srv:<30s} : {b_ns / 1e6:+9.6f} ms")
+        colony_bias_str = "\n".join(lines)
+
+    if colony_noise_ns:
+        lines = []
+        for srv, s_ns in sorted(colony_noise_ns.items(), key=lambda kv: kv[1]):
+            lines.append(f"      {srv:<30s} : {s_ns / 1e6:7.3f} ms")
+        colony_noise_str = "\n".join(lines)
+    else:
+        colony_noise_str = "      (empty)"
+
+    # ---- Per-server min delay ----
+    if per_server_delay:
+        lines = []
+        for srv, st in sorted(per_server_delay.items(),
+                              key=lambda kv: (kv[1].get('jitter_ns') or 0)):
+            mean = st.get('mean_ns')
+            jit = st.get('jitter_ns') or 0
+            n = st.get('n', 0)
+            med_str = f"{mean / 1e6:7.3f}" if mean is not None else "    N/A"
+            lines.append(
+                f"      {srv:<30s} : med {med_str} ms, "
+                f"jitter {jit / 1e6:7.3f} ms (n={n})"
+            )
+        per_server_delay_str = "\n".join(lines)
+    else:
+        per_server_delay_str = "      (empty — no successful rounds yet)"
+
+    # ---- NTP server metadata ----
+    if server_meta:
+        lines = [f"      {'name':<30s} | {'str':>3s} {'mode':>4s} {'prec':>4s} "
+                 f"{'root_dly':>10s} {'root_disp':>10s}  ref_id          age_s"]
+        for srv, m in sorted(server_meta.items(),
+                              key=lambda kv: (kv[1].get('stratum') or 999, kv[0])):
+            stratum = m.get('stratum', '?')
+            mode    = m.get('mode', '?')
+            prec    = m.get('precision', '?')
+            rd_ns   = m.get('root_delay_ns')
+            rp_ns   = m.get('root_disp_ns')
+            ref_id  = (m.get('ref_id') or '—')[:15]
+            age_s   = m.get('age_sec')
+
+            rd_str  = f"{rd_ns / 1e6:>8.3f}ms" if rd_ns is not None else f"{'N/A':>10s}"
+            rp_str  = f"{rp_ns / 1e6:>8.3f}ms" if rp_ns is not None else f"{'N/A':>10s}"
+            age_str = f"{age_s:>6.1f}" if age_s is not None else f"{'N/A':>6s}"
+
+            lines.append(
+                f"      {srv:<30s} | {stratum:>3} {mode:>4} {prec:>4} "
+                f"{rd_str} {rp_str}  {ref_id:<15s} {age_str}"
+            )
+        server_meta_str = "\n".join(lines)
+    else:
+        server_meta_str = "      (empty — no NTP packets parsed yet)"
+
+    # ---- Predictions ----
+    hv_len   = history_vote.get('applied_len', 0)
+    hv_short = history_vote.get('short_vote_ns')
+    hv_drift = history_vote.get('drift_prediction_ns')
+    hv_slope = history_vote.get('drift_slope_ns_per_round')
+    hv_last  = history_vote.get('last_applied_ns')
+
+    if hv_short is None and hv_drift is None:
+        history_vote_str = (
+            f"      (history collecting: {hv_len}/{SHORT_VOTE_MIN_SAMPLES} "
+            f"for short vote, {DRIFT_MIN_SAMPLES} for drift)"
+        )
+    else:
+        lines = [f"      applied history length      : {hv_len}"]
+        if hv_short is not None:
+            delta = (hv_short - hv_last) / 1e6 if hv_last is not None else None
+            tail = (f"  (vs last consensus: {delta:+.3f} ms)"
+                    if delta is not None else "")
+            lines.append(
+                f"      short vote (median {HISTORY_VOTE_SHORT_WINDOW:>3}) : "
+                f"{hv_short / 1e6:+.6f} ms{tail}"
+            )
+            #short-window slope from the same OLS
+            hv_short_slope = history_vote.get('short_slope_ns_per_round')
+            if hv_short_slope is not None and second_sync_thread_delay:
+                short_slope_us = hv_short_slope / 1000.0
+                short_slope_ppm = hv_short_slope / (second_sync_thread_delay * 1000.0)
+                lines.append(
+                    f"      short slope                 : "
+                    f"{short_slope_us:+.3f} μs/round  ({short_slope_ppm:+.3f} ppm)"
+                )
+            else:
+                lines.append(f"      short slope                 : N/A")
+        else:
+            lines.append(
+                f"      short vote                  : N/A "
+                f"({hv_len}/{SHORT_VOTE_MIN_SAMPLES})"
+            )
+
+        if hv_drift is not None and hv_slope is not None:
+            slope_us = hv_slope / 1000.0
+            ppm = (hv_slope / (second_sync_thread_delay * 1000.0)
+                   if second_sync_thread_delay else None)
+            vs_short = ((hv_drift - hv_short) / 1e6
+                        if hv_short is not None else None)
+            tail = (f"  (vs short vote: {vs_short:+.3f} ms)"
+                    if vs_short is not None else "")
+            lines.append(
+                f"      drift prediction (next step) : "
+                f"{hv_drift / 1e6:+.6f} ms{tail}"
+            )
+            ppm_tail = f"{ppm:+.3f} ppm" if ppm is not None else "ppm N/A"
+            lines.append(
+                f"      drift slope                 : "
+                f"{slope_us:+.3f} μs/round  ({ppm_tail})"
+            )
+        else:
+            lines.append(f"      drift prediction            : N/A "
+                         f"({hv_len}/{DRIFT_MIN_SAMPLES})")
+        diag = telemetry.get('extrapolation_diag') or {}
+        lines.extend(_fmt_extrap_diag_lines(diag))
+        history_vote_str = "\n".join(lines)
+
+
+    # ---- Colony summary ----
+    if not population:
+        colony_str = "N/A"
+    else:
+        spread_ns = population.get('spread_ns')
+        favorites = population.get('favorites') or []
+        occupied  = population.get('occupied') or []
+
+        gate_allowed = population.get('reproduction_allowed')
+        med_sp   = gate.get('median_spread_ns')
+        noise_r  = gate.get('noise_ref_ns')
+        hist_len = gate.get('history_len', 0)
+        hist_min = gate.get('history_min', SPREAD_HISTORY_MIN)
+        thr_ns   = gate.get('threshold_ns')
+        ratio    = gate.get('ratio')
+
+        if noise_r is None:
+            n_sigma = sum(1 for i in instances.values() if i.get('sigma_avg_ns'))
+            gate_str = (f"reproduction gate : warming up — "
+                        f"need σ_avg on ≥2 instances (have {n_sigma})")
+        elif med_sp is None:
+            gate_str = (f"reproduction gate : warming up — "
+                        f"collecting spread history ({hist_len}/{hist_min} rounds)")
+        else:
+            gate_str = (
+                f"reproduction gate                    : "
+                f"{'allowed' if gate_allowed else 'blocked'}\n"
+                f"  median spread (last {hist_len:>2})   : {_fmt_ms(med_sp)}\n"
+                f"  noise ref (median σ)                 : {_fmt_ms(noise_r)}\n"
+                f"  threshold ({REPRODUCTION_SPREAD_MULT}·σ_ref)               : "
+                f"{_fmt_ms(thr_ns)}\n"
+                f"  ratio                                : "
+                f"{ratio:.3f}  (need < 1.0)"
+            )
+
+        matrix_recent = [rec for rec in slew_errors_ns
+                         if rec.instance_id is None and rec.matrix is not None]
+        if matrix_recent:
+            size_last    = len(matrix_recent[0].matrix)
+            mean_last    = matrix_recent[0].matrix_meta[1][0]
+            jitter_last  = matrix_recent[0].matrix_meta[1][1]
+            matrix_str = (
+                f"  matrix (last consensus)   : size={size_last} "
+                f"(cells={size_last * size_last}), "
+                f"period {_fmt_s(mean_last)} ±{_fmt_ms(jitter_last)}"
+            )
+        else:
+            matrix_str = "  matrix (last consensus)   : —"
+
+        colony_str = (
+            f"instances alive           : {population.get('population')}\n"
+            f"  current tick              : {population.get('tick')}\n"
+            f"  {gate_str}\n"
+            f"{matrix_str}\n"
+            f"  offsets spread (stdev)     : "
+            f"{_fmt_ms(spread_ns) if spread_ns is not None else 'N/A'}\n"
+            f"  favorites (per instance)  : "
+            f"[{', '.join(str(f) if f else '—' for f in favorites) or '—'}]\n"
+            f"  occupied servers          : "
+            f"[{', '.join(occupied) or '—'}]"
+        )
+
+    # ---- Per-instance blocks ----
+    instance_blocks = []
+    current_tick = population.get('tick', 0)
+    for pos, inst_id in enumerate(sorted(instances.keys())):
+        inst = instances[inst_id]
+        ref_ns     = inst.get('reference_offset_ns')
+        thr_ns     = inst.get('threshold_ns')
+        repro_done = inst.get('reproduced_count')
+        repro_max  = inst.get('max_offspring')
+        rate       = inst.get('accept_rate')
+        born_tick  = inst.get('born_tick')
+        banned     = inst.get('banned_servers') or []
+        hist       = inst.get('own_history') or []
+        hist_rej   = inst.get('own_history_rejected') or []
+        warmup_exc = inst.get('warmup_excluded') or []
+        warmup_start = inst.get('warmup_started_tick')
+
+        if ref_ns is None:
+            ref_str = "N/A (cold start)"
+        elif median_ref is None:
+            ref_str = f"{ref_ns / 1e9:.3f} s (absolute)"
+        else:
+            ref_str = f"Δ {(ref_ns - median_ref) / 1e6:+.6f} ms vs median(instance refs)"
+
+        sigma_avg = inst.get('sigma_avg_ns')
+        dominant_min_samples = inst.get('dominant_min_samples')
+        lock_until = inst.get('armed_lock_until_tick', -10 ** 9)
+        lock_str = (f"until tick {lock_until} ({lock_until - current_tick} left)"
+                    if current_tick < lock_until else "off")
+
+        sel_mode = inst.get('last_selection_mode') or 'N/A'
+        sel_cand = inst.get('last_best_candidate') or '—'
+        fav_score = inst.get('last_favorite_score')
+        cand_score = inst.get('last_candidate_score')
+        if fav_score is not None and cand_score is not None:
+            score_tail = (f"  (fav score={fav_score:.3f}, "
+                          f"cand score={cand_score:.3f})")
+        else:
+            score_tail = ""
+        sel_line = (f"  favorite selection        : {sel_mode}, "
+                    f"best candidate={sel_cand}{score_tail}\n")
+
+        attempt_idx = pos
+        attempt_line = (
+            f"  attempt index             : {attempt_idx} "
+            f"(of {len(instances)}, per-server attempt)\n"
+        )
+
+        header = (
+            f"Instance {inst_id}\n"
+            f"{attempt_line}"
+            f"  favorite server           : {inst.get('favorite') or '—'}\n"
+            f"{sel_line}"
+            f"  reference offset          : {ref_str}\n"
+            f"                              (delay-weighted mean over accepted servers)\n"
+            f"  filter threshold          : "
+            f"{'±' + _fmt_ms(thr_ns) if thr_ns is not None else 'N/A'}\n"
+            f"  σ_avg (captured)          : "
+            f"{_fmt_ms(sigma_avg) if sigma_avg is not None else 'N/A (warming up)'}\n"
+            f"  dominant minimum samples                : "
+            f"{dominant_min_samples if dominant_min_samples is not None else 'N/A'}\n"
+            f"  armed lock                : {lock_str}\n"
+            f"  offspring produced (cap)  : {repro_done} / {repro_max}"
+            f"{' (cap reached)' if repro_done >= repro_max else ''}\n"
+            f"  born at tick              : {born_tick}  "
+            f"(age: {current_tick - born_tick if born_tick is not None else '?'} ticks)\n"
+            f"  accept rate (last {PER_SERVER_HISTORY})     : "
+            f"{f'{rate * 100:.0f}%' if rate is not None else 'N/A'}\n"
+            f"  consecutive low windows   : {inst.get('low_accept_windows')}\n"
+            f"  deathbed trigger used     : "
+            f"{'yes' if inst.get('deathbed_used') else 'no'}\n"
+            f"  banned (occupied by others): [{', '.join(banned) or '—'}]\n"
+            f"  warmup excluded           : [{', '.join(warmup_exc) or '—'}]\n"
+            f"  warmup started at tick    : "
+            f"{warmup_start}  "
+            f"(age: {current_tick - warmup_start if warmup_start is not None else '?'} ticks, "
+            f"grace: {SIGMA_WARMUP_TIMEOUT_MULT * SIGMA_WARMUP_RECORDS} ticks)\n"
+            f"  Dominant analysis:\n{render_dominant_analysis(inst, current_tick)}"
+        )
+
+        accepted_block = (f"  Accepted rounds ({len(hist)}):\n"
+                          f"{render_history_compact(hist)}")
+        rejected_block = (f"  Rejected-all rounds ({len(hist_rej)}):\n"
+                          f"{render_history_compact(hist_rej)}")
+
+        instance_blocks.append("\n".join([header, accepted_block, rejected_block]))
+
+    instances_str = ("\n\n".join(instance_blocks)
+                     if instance_blocks else "(no instances)")
+
+    flags_off = []
+    if DISABLE_POST_GATE:  flags_off.append("post_gate")
+    if DISABLE_SHORT_VOTE: flags_off.append("short_vote")
+    if DISABLE_DRIFT_VOTE: flags_off.append("drift_vote")
+    flags_str = (f"DISABLED in consensus: {', '.join(flags_off)}\n"
+                 if flags_off else "")
+
+    return (
+        f"Spread of per-server min delay "
+        f"(mixed servers, per-round min-of-5): {ntp_spread}\n"
+        f"{flags_str}"
+        f"\nConsensus predictions (history & drift):\n"
+        f"{history_vote_str}\n"
+        f"Precise time (T.B.O.T time): {precise_str}\n"
+        f"System time (OS time): {sys_str}\n"
+        f"Current OS time offset, precise time - system time = {offset_ms}\n"
+        f"Current T.B.O.T time offset, precise time - NTP time = {slew_error}\n"
+        f"Estimated clock rate vs UTC: "
+        f"{f'{rate_ppm:+.3f} ppm' if rate_ppm is not None else 'N/A'}\n"
+        f"Last phase error (residual): "
+        f"{_fmt_ms(phase_error_ns) if phase_error_ns is not None else 'N/A'}\n"
+        f"Standard deviation of T.B.O.T time offsets: {offset_spread}\n"
+        f"Mean filter threshold (accepted instances): {diff_threshold_str}\n"
+        f"\nColony bias (accumulated, applied to raw proposed):\n"
+        f"{colony_bias_str}\n"
+        f"\nColony noise estimate "
+        f"(robust: 1.4826·MAD(first diffs)/√2, active only):\n"
+        f"{colony_noise_str}\n"
+        f"\nPer-server min delay (last 10 rounds each, mixed servers):\n"
+        f"{per_server_delay_str}\n"
+        f"\nNTP server metadata (from packet headers, all fields):\n"
+        f"{server_meta_str}\n"
+        f"\nColony state:\n"
+        f"  {colony_str}\n"
+        f"\nConsensus history (applied, post-gate):\n"
+        f"{applied_str}\n"
+        f"\nConsensus history (rejected by post-gate):\n"
+        f"{rejected_str}\n"
+        f"\nPer-instance telemetry:\n"
+        f"{instances_str}"
+    )
 
 def build_full_telemetry_content():
     try:
@@ -4272,25 +5114,25 @@ def build_full_telemetry_content():
     def fmt_record(rec):
         inst_mark = (f"[inst {rec.instance_id}]" if rec.instance_id is not None
                      else "[consensus]")
+
         if rec.rejected_offset_ns is not None:
             thr_str = (f"±{rec.threshold_ns / 1e6:.3f} ms"
                        if rec.threshold_ns is not None else "N/A")
+            size_str = f"  [Size={len(rec.matrix)}]" if rec.matrix else ""
+            clamp_str = ""
+            if rec.ref_ns is not None:
+                clamp_ns = rec.ref_ns - rec.rejected_offset_ns
+                clamp_str = (f"  clamp={clamp_ns / 1e6:+.6f} ms "
+                             f"(pred={rec.ref_ns / 1e6:+.6f} ms)")
             return (f"{inst_mark} [{_ts_to_hms(rec.timestamp_ns)}]  "
                     f"REJECTED  Δ {rec.diff_ns / 1e6:+.6f} ms  "
-                    f"(thr {thr_str})")
+                    f"(thr {thr_str}){size_str}{clamp_str}")
+
         fav_mark = f" fav={rec.favorite}" if rec.favorite else ""
         if rec.diff_ns is None:
             diff_str = "Δ cold-start"
         else:
             diff_str = f"Δ {rec.diff_ns / 1e6:+.6f} ms"
-
-        # --- post-gate ---
-        if rec.rejected_offset_ns is not None and rec.ref_ns is not None:
-            clamp_ns = rec.ref_ns - rec.rejected_offset_ns
-            gate_tail = (f"  [post-gate: raw={rec.rejected_offset_ns / 1e6:+.6f}ms → "
-                         f"{rec.ref_ns / 1e6:+.6f}ms, clamp={clamp_ns / 1e6:+.6f}ms]")
-        else:
-            gate_tail = ""
 
         # if this is a consensus record with a matrix — render the matrix
         if rec.instance_id is None and rec.matrix:
@@ -4306,7 +5148,7 @@ def build_full_telemetry_content():
             rows = [
                 f"{inst_mark} [{_ts_to_hms(rec.timestamp_ns)}] "
                 f"{diff_str} ({fmt_threshold(rec.threshold_ns)})  "
-                f"[Size={size}]{gate_tail}"
+                f"[Size={size}]"
             ]
             for row_idx, row in enumerate(rec.matrix):
                 cells = ", ".join(
@@ -4320,7 +5162,7 @@ def build_full_telemetry_content():
         # Fallback to the old format
         return (f"{inst_mark} [{_ts_to_hms(rec.timestamp_ns)}] "
                 f"{diff_str} ({fmt_threshold(rec.threshold_ns)}){fav_mark} "
-                f"{fmt_servers(rec.servers)}{gate_tail}")
+                f"{fmt_servers(rec.servers)}")
 
     def render_history(records, limit=HISTORY_MAX_LEN):
         if not records:
@@ -4537,7 +5379,7 @@ def build_full_telemetry_content():
 
     if hv_short is None and hv_drift is None:
         history_vote_str = (
-            f"      (history collecting: {hv_len}/{HISTORY_VOTE_MIN_SAMPLES} "
+            f"      (history collecting: {hv_len}/{SHORT_VOTE_MIN_SAMPLES} "
             f"for short vote, {DRIFT_MIN_SAMPLES} for drift)"
         )
     else:
@@ -4550,10 +5392,21 @@ def build_full_telemetry_content():
                 f"      short vote (median {HISTORY_VOTE_SHORT_WINDOW:>3}) : "
                 f"{hv_short / 1e6:+.6f} ms{tail}"
             )
+            # short-window slope from the same OLS
+            hv_short_slope = history_vote.get('short_slope_ns_per_round')
+            if hv_short_slope is not None and second_sync_thread_delay:
+                short_slope_us = hv_short_slope / 1000.0
+                short_slope_ppm = hv_short_slope / (second_sync_thread_delay * 1000.0)
+                lines.append(
+                    f"      short slope                 : "
+                    f"{short_slope_us:+.3f} μs/round  ({short_slope_ppm:+.3f} ppm)"
+                )
+            else:
+                lines.append(f"      short slope                 : N/A")
         else:
             lines.append(
                 f"      short vote                  : N/A "
-                f"({hv_len}/{HISTORY_VOTE_MIN_SAMPLES})"
+                f"({hv_len}/{SHORT_VOTE_MIN_SAMPLES})"
             )
 
         if hv_drift is not None and hv_slope is not None:
@@ -4576,6 +5429,8 @@ def build_full_telemetry_content():
         else:
             lines.append(f"      drift prediction            : N/A "
                          f"({hv_len}/{DRIFT_MIN_SAMPLES})")
+        diag = telemetry.get('extrapolation_diag') or {}
+        lines.extend(_fmt_extrap_diag_lines(diag))
         history_vote_str = "\n".join(lines)
 
     # ---- Colony summary ----
@@ -4619,24 +5474,32 @@ def build_full_telemetry_content():
             size_hist = [len(rec.matrix) for rec in matrix_recent[:10]]
             mean_last = matrix_recent[0].matrix_meta[1][0]  # mean period between rows
             jitter_last = matrix_recent[0].matrix_meta[1][1]  # absolute spread (stdev)
+            jitter_str = (f"±{_fmt_ms(jitter_last)}" if jitter_last is not None
+                          else "±N/A (single interval)")
 
             # Mean period is taken from matrix_meta, not from (max-min)/(size-1)
             matrix_time = mean_last
 
             def _cv_perc(rec):
-                """CV = 100 * stdev / mean. stdev in matrix_meta is already rounded — ok for telemetry."""
+                """CV = 100 * stdev / mean.
+                sd may be None when Size=2 (a single interval; stdev is not calculated).
+                Returns None — the caller should display N/A.
+                """
                 mean, sd = rec.matrix_meta[1][0], rec.matrix_meta[1][1]
-                return (100.0 * sd / mean) if mean else 0.0
+                if not mean or sd is None:
+                    return None
+                return 100.0 * sd / mean
 
             matrix_times_covar_perc = [
-                f"±{_cv_perc(rec):.1f}" for rec in matrix_recent[:10]
+                (f"±{cv:.1f}" if (cv := _cv_perc(rec)) is not None else "±N/A")
+                for rec in matrix_recent[:10]
             ]
 
             matrix_str = (
                 f'  matrix (last consensus)   : size={size_last} '
                 f'(cells={size_last * size_last})\n'
                 f'time interval between matrix lines: {_fmt_s(matrix_time)} '
-                f'±{_fmt_ms(jitter_last)}\n'
+                f'{jitter_str}\n'
                 f'matrix rows period coefficient of variation '
                 f'history (last {len(size_hist)}): {matrix_times_covar_perc} %\n'
                 f'matrix size history (last {len(size_hist)}): {size_hist}\n'
@@ -4756,7 +5619,7 @@ def build_full_telemetry_content():
     return (
         f"Spread of per-server min delay (mixed servers, per-round min-of-5): {ntp_spread}\n"
         f"{flags_str}"
-        f"\nConsensus predictions (history vote & drift):\n"
+        f"\nConsensus predictions (history & drift):\n"
         f"{history_vote_str}\n"
         f"Precise time (T.B.O.T time): {precise_str}\n"
         f"System time (OS time): {sys_str}\n"

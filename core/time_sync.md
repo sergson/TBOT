@@ -8,6 +8,7 @@ This document is built **from physics to code**: first — what we measure and h
 
 ## Contents
 
+- [Part 0. Scope and applicability](#part-0-scope-and-applicability)
 - [Part I. The physics of the process](#part-i-the-physics-of-the-process)
   - [1. A single NTP exchange: what is physically measured](#1-a-single-ntp-exchange-what-is-physically-measured)
   - [2. What smp\[0..3\] is — the anatomy of one sample](#2-what-smp03-is--the-anatomy-of-one-sample)
@@ -24,6 +25,80 @@ This document is built **from physics to code**: first — what we measure and h
 - [Part V. Public API](#part-v-public-api)
 
 ---
+
+## Part 0. Scope and applicability
+
+This module is **not a general-purpose replacement for Chrony/ntpd**. It targets a
+specific deployment scenario:
+
+### 0.1 Intended deployment
+
+- **Stationary equipment.** A server, workstation, or dedicated box that runs
+  continuously for weeks. Power profile, temperature, and CPU load are assumed
+  roughly constant.
+- **No GPS / PPS / PTP hardware.** Only public NTP servers over the internet.
+- **High network noise.** Public NTP jitter on the order of 1–2 ms per server.
+- **Windows Modern Standby pressure** (or equivalent): the service must keep the
+  process awake and priority elevated to avoid scheduler-induced round skew.
+- **Accuracy target ~0.5–1.5 ms**, not microseconds.
+
+### 0.2 Estimation time is a feature, not a bug
+
+The PLL does **not** estimate `rate` from a single regression. `rate` is built
+by three mechanisms that require a long observation horizon:
+
+ Mechanism | Minimum data | Typical wall-clock (60 s × 2 threads) |
+|---|---|---|
+| `short_vote` (OLS over observed) | `SHORT_VOTE_MIN_SAMPLES = 25` | ~12 min |
+| `drift_slope` (OLS over applied) | `DRIFT_MIN_SAMPLES = 83` | ~40 min |
+| `drift_confirm` active | `DRIFT_WINDOW = 750` | ~6 h |
+| Prior activation (`drift_history`) | `DRIFT_SEED_MIN_SAMPLES = 3` | 1+ day of history |
+
+**Consequence:** for the first several hours of service lifetime, `rate` is
+neither stable nor fully validated. `extrapolation source` in telemetry reports
+which of the three sources (`short_vote`, `slope`, `rate`) currently drives the
+prediction; until it becomes `rate` for good, the system is in warmup.
+
+### 0.3 Sensitivity to physical drift changes
+
+The design deliberately trades **adaptivity** for **stability**:
+
+- `rate` is clamped to **±1σ of the historical prior** (`RATE_CLAMP_SIGMA_K = 1.0`)
+  when the prior is available. A real drift shift larger than 1σ will not be
+  tracked by sign-constancy alone — it must wait for `drift_confirm` to open
+  after 750 applied rounds.
+- `drift_confirm` pulls `rate` toward `slope` with `α = 0.5` — geometric
+  convergence, ~5–7 rounds to halve a divergence, but does not react to a
+  step-like drift change faster than the regression window allows.
+- If the physical clock drifts away from its historical operating point
+  (temperature swing, power profile change, ageing), the correction stability
+  degrades: predictions lag, `post-gate` rejects grow, and the colony sees
+  wider `offsets spread`.
+
+**Do not deploy on:**
+
+- Laptops with aggressive power management (drift changes on every CPU
+  frequency transition).
+- Virtual machines with unstable host TSC (drift changes on migration /
+  steal-time spikes).
+- Environments where a real drift shift must be tracked within minutes.
+
+### 0.4 What the service does well
+
+- Holds time **stably** under high network noise (74% reject observed with
+  ≤1 ms residual, see §2.7 of the Chrony comparison).
+- Compensates **per-server constant bias** via the colony integrator.
+- Provides **formal accuracy guarantees** to consumers via
+  `get_utc_ns_with_precision` / `get_clock_snapshot`.
+- Survives **long reject streaks** without dead-lock (`force-apply`).
+- Does **not** jump on single outliers.
+
+### 0.5 What it does NOT promise
+
+- Sub-millisecond accuracy without a LAN stratum-1 source.
+- Rapid adaptation to physical drift changes.
+- Correct operation on a clock whose drift is not representative of its own
+  history (`drift_history` table).
 
 ## Part I. The physics of the process
 
@@ -136,12 +211,46 @@ Used wherever there is a **risk of a single outlier** (bad server, DNS glitch, r
 
 | Where | What is median | Why |
 |---|---|---|
-| `short_vote` (`_compute_history_votes`) | the last 15 `_recent_observed` (including rejected) | The median is robust to a single anomaly — one "jump" won't pull the prediction. |
 | `noise_ref_ns` | σ_avg of live instances | One "frenzied" instance must not spoil the reference noise. |
 | `median(spreads)` (spread-gate) | history of stdev(offsets) | Same — one outlier does not block reproduction. |
 | `median_mean` (bias estimation) | per-server means of `proposed` | Robust "common center" — a stuck server does not drag the whole estimate. |
 | `median_delay`, `median_sigma` (score) | delays / σ of servers | Normalization for favorite scoring. |
 | `median` in `_compute_drift_prior` | ppm history from DB | Robust prior estimate. |
+
+#### 4.3b. OLS over a short window — `short_vote`
+
+Since the last revision, `short_vote` is **not a median** but a mini-version of
+`drift_prediction` over the shorter window:
+
+```python
+predict(t_ref) = base_value + slope · (t_ref − base_time)
+```
+
+where:
+- source = `_recent_observed` (all consensus_offset, including gate-rejected),
+- window = `HISTORY_VOTE_SHORT_WINDOW = 50`,
+- `base_value`, `base_time` = freshest point in the window (its `consensus_offset`
+  and its `t_ref_mono`),
+- slope = OLS over the same window (ns/ns), after a MAD-trim to suppress
+  single outliers.
+
+Physics:
+
+- Unlike a rolling median, OLS **sees the drift**. The median gives the
+  center of the window — for a −9 ppm drift over a 25-minute window that is
+  already ~7 ms stale. Combined with additional `rate · (t_ref − last_apply)`
+  extrapolation, this **double-counted** the drift and drove the prediction
+  away from reality whenever the gate was closed for a long time.
+- OLS over the same window fixes both: the base point is fresh (window is
+  fed every round regardless of gate), and the slope is measured directly,
+  so no external extrapolation is needed for `short_vote`.
+- The short window is fed independently of `applied_offsets`, so
+  `short_vote` never freezes when the gate is stuck.
+
+Robustness: the source contains rejected points by design. Before OLS a
+MAD-trim removes points further than `DRIFT_OUTLIER_K · 1.4826 · MAD` from
+the window median. This preserves the outlier resistance the median used to
+provide while keeping drift sensitivity.
 
 #### 4.4 Standard deviation (stdev)
 
@@ -151,7 +260,7 @@ Used where a **measure of the width of the cloud** is needed:
 |---|---|---|
 | Instance threshold `new_raw` | σ(diffs) × `diff_sigma` | How much the instance "breathes" — to widen/narrow the filter. |
 | Instance `σ_avg` (`_capture_sigma_locked`) | **mean** of per-server σ(dev_ns) | Estimate of the "typical" server noise of this instance. Frozen once. |
-| `σ_consensus` (`_noise_sigma_ns`) | σ of first differences / √2 | Robust estimate of consensus decision noise without a trend. |
+| `σ_consensus` (`_noise_sigma_ns`) | σ of first differences / √2 | Robust estimate of consensus decision noise without a trend. Window: up to `HISTORY_MAX_LEN = 250` applied points. |
 | σ(delays) (`ntp_spread_ns`) | over all delays of the round | Network diagnostics. |
 
 #### 4.5 MAD (median absolute deviation)
@@ -175,7 +284,8 @@ slope = Σ(dx·dy) / Σ(dx²)         # ns/ns
 drift_slope = slope · round_ns    # ns/round
 ```
 
-Applied to `applied_offsets` (only those approved by the post-gate). Physics: on a long window (300 rounds ≈ 2.5 h) the slope is **the true rate of the clock's departure** from UTC, robust to single glitches.
+Applied to `applied_offsets` (only those approved by the post-gate). 
+Physics: on a long window (`DRIFT_WINDOW = 750` rounds ≈ 6.25 h) the slope is **the true rate of the clock's departure** from UTC, robust to single glitches.
 
 #### 4.7 Summary table
 
@@ -185,12 +295,10 @@ Applied to `applied_offsets` (only those approved by the post-gate). Physics: on
 | `raw_snapshot[srv]` | arithmetic | attempts of a single server | attempts are equivalent |
 | `own_reference_offset` | **weighted 1/delay** | accepted servers of the instance | fast servers get more trust |
 | `consensus_offset` | **arithmetic** | **L² matrix cells** | balance time × ensemble |
-| `short_vote` | **median** | last 15 observed | resistance to a single outlier |
-| `drift_slope` | **OLS** | 300 applied | true drift rate |
-| instance `σ_avg` | mean of per-server σ | all ✓ servers | typical noise |
-| `σ_consensus` | σ of first differences | 100 applied | robust consensus noise |
-| per-server `σ_s` | MAD | raw history | resistant to outliers |
-| `colony_bias[srv]` | **arith. over time, median over servers** | 33+ rounds | common center minus server noise |
+| `short_vote` | **OLS** | 50 observed (MAD-trimmed) | sees drift, no freezing on rejected |
+| `drift_slope` | **OLS** | up to 750 applied | true drift rate |
+| `σ_consensus` | σ of first differences | up to 250 applied | robust consensus noise |
+| `colony_bias[srv]` | arith. over time, median over servers | ≥ 187 raw rounds | common center minus server noise |
 | `noise_ref_ns` | **median** of σ_avg | instances | one faulty instance does not spoil the reference |
 
 ### 5. The signal path: from NTP packet to stabilized time
@@ -199,7 +307,7 @@ Step-by-step — **how a physical sample becomes UTC**:
 
 ```
    ┌────────────────────────────────────────────────────────────┐
-   │  Step 1. Network exchange                                   │
+   │  Step 1. Network exchange                                  │
    │  Each server is polled n_attempts times, spaced by 1 s.    │
    │  We get sample = (delay, mid_mono, t2_utc, 0).             │
    │  proposed = t2_utc − mid_mono — the server's "proposal".   │
@@ -208,57 +316,67 @@ Step-by-step — **how a physical sample becomes UTC**:
                              ▼
    ┌────────────────────────────────────────────────────────────┐
    │  Step 2. Compensation of the known server bias             │
-   │  proposed[srv] −= colony_bias[srv]                          │
+   │  proposed[srv] −= colony_bias[srv]                         │
    │  (the gradually accumulated correction, see §9.4)          │
    └────────────────────────────────────────────────────────────┘
                              │
                              ▼
    ┌────────────────────────────────────────────────────────────┐
-   │  Step 3. Per-instance filter                                │
+   │  Step 3. Per-instance filter                               │
    │  inst takes attempt_idx = k (position in ordered).         │
-   │  Collects available = {srv: smp[k]}.                        │
-   │  For each server:                                           │
-   │    dev = proposed − own_reference_offset                    │
-   │    accepted, if |dev| ≤ own_threshold_ns.                   │
-   │  → new_offset = delay-weighted mean(proposed over accepted) │
-   │  → own_reference_offset := new_offset                       │
-   │  → own_threshold_ns evolves from σ(diffs)                   │
+   │  Collects available = {srv: smp[k]}.                       │
+   │  For each server:                                          │
+   │    dev = proposed − own_reference_offset                   │
+   │    accepted, if |dev| ≤ own_threshold_ns.                  │
+   │  → new_offset = delay-weighted mean(proposed over accepted)│
+   │  → own_reference_offset := new_offset                      │
+   │  → own_threshold_ns evolves from σ(diffs)                  │
    └────────────────────────────────────────────────────────────┘
                              │
                              ▼
    ┌────────────────────────────────────────────────────────────┐
-   │  Step 4. Consensus matrix                                   │
-   │  Each instance contributes a row of accepted proposed.      │
-   │  We collect L rows → L×L matrix.                            │
-   │  Drift compensation: proposed −= rate·(mid − t_ref_mono).   │
-   │  consensus_offset = arithmetic mean over all L² cells.      │
+   │  Step 4. Consensus matrix                                  │
+   │  Each instance contributes a row of accepted proposed.     │
+   │  We collect L rows → L×L matrix.                           │
+   │  Drift compensation: proposed −= rate·(mid − t_ref_mono).  │
+   │  consensus_offset = arithmetic mean over all L² cells.     │
    └────────────────────────────────────────────────────────────┘
                              │
                              ▼
    ┌────────────────────────────────────────────────────────────┐
-   │  Step 5. Prediction and post-gate                           │
-   │  prediction = drift_prediction (OLS) or short_vote (median) │
-   │  delta = consensus_offset − prediction                      │
-   │  limit = POST_GATE_K · σ_consensus                          │
-   │  If |delta| > limit → rejected (see §8)                     │
-   │  Otherwise → applied (written to applied_offsets)           │
+   │  Step 5. Prediction and post-gate                          │
+   │  prediction = drift_prediction or short_vote               │
+   │                                                            │
+   │  short_vote — OLS over _recent_observed (window 50):       │
+   │    base = freshest observed, slope from same window        │
+   │    → extrapolates itself internally, NOT via rate          │
+   │                                                            │
+   │  drift_prediction — OLS over applied_offsets:              │
+   │    base = last applied, extrapolated to t_ref:             │
+   │    • n_app <  DRIFT_WINDOW → extrap_rate = drift_slope     │
+   │    • n_app >= DRIFT_WINDOW → extrap_rate = rate            │
+   │                                                            │
+   │  delta = consensus_offset − prediction                     │
+   │  limit = POST_GATE_K · σ_consensus                         │
+   │  If |delta| > limit → rejected (see §8)                    │
+   │  Otherwise → applied (written to applied_offsets)          │
    └────────────────────────────────────────────────────────────┘
                              │
                              ▼
    ┌────────────────────────────────────────────────────────────┐
-   │  Step 6. PLL                                                │
-   │  predicted = anchor_offset + rate·(t − anchor_mono)         │
-   │  phase_err = new_target_offset − predicted                  │
-   │  anchor_offset := predicted + KP·phase_err                  │
-   │  rate ← corrected (sign-constancy + drift-confirm)          │
+   │  Step 6. PLL                                               │
+   │  predicted = anchor_offset + rate·(t − anchor_mono)        │
+   │  phase_err = new_target_offset − predicted                 │
+   │  anchor_offset := predicted + KP·phase_err                 │
+   │  rate ← corrected (sign-constancy + drift-confirm)         │
    └────────────────────────────────────────────────────────────┘
                              │
                              ▼
    ┌────────────────────────────────────────────────────────────┐
-   │  Step 7. Publication of the clock model                     │
-   │  get_utc_ns():  utc = mono + anchor_offset +                │
-   │                       rate·(mono − anchor_mono)             │
-   │  Lock-free. Used by external consumers.                     │
+   │  Step 7. Publication of the clock model                    │
+   │  get_utc_ns():  utc = mono + anchor_offset +               │
+   │                       rate·(mono − anchor_mono)            │
+   │  Lock-free. Used by external consumers.                    │
    └────────────────────────────────────────────────────────────┘
 ```
 
@@ -324,22 +442,36 @@ Each round:
 
 **a) Sign-constancy** (`_apply_rate_sign_constancy_step_locked`).
 
-If `phase_err` within a 30-value window is **persistently of one sign** (t-statistic > 2.5, runs-z < −2), then our `rate` estimate is biased, and we systematically "undershoot" or "overshoot". The correction step:
+If `phase_err` within `RATE_DETECT_WINDOW_N = 83`-value window is
+**persistently of one sign** (t-statistic > 2.5, runs-z < −2), then our
+`rate` estimate is biased. The correction step:
 
 ```
 step_ppm = base + confidence·(max − base)
 rate += direction · step_ppm · 1e-6
 ```
 
-Where `base`, `max` are proportional to `σ_prior` (or fall back to 0.02/0.1 ppm). This is **not a PI controller**, but a discrete "spring" that pulls `rate` in the required direction.
+Clamp: if a prior is available (`_rate_prior_active = True`), the new rate is
+bounded to `[prior − 1σ, prior + 1σ]` ppm, where σ is `_rate_clamp_sigma_ppm` and `RATE_CLAMP_SIGMA_K = 1.0`. 
+If no prior is available, only the physical limit ±100 ppm applies.
+
+Where `base`, `max` are proportional to `σ_prior` (or fall back to 0.02/0.1 ppm).
+This is **not a PI controller**, but a discrete "spring" that pulls `rate` in the required direction.
+
 
 **b) Drift confirmation** (`_apply_drift_confirmation_locked`).
 
-`rate` is a fast but runaway-prone integrator. `drift_slope` from OLS is slow but stable. If they diverge by more than 3 ppm:
+`rate` is a fast but runaway-prone integrator. `drift_slope` from OLS is
+slow but stable. If they diverge by more than 3 ppm:
 
 ```
 rate ← α·rate + (1 − α)·slope,   α = DRIFT_CONFIRM_ALPHA
 ```
+
+Active only when `n_app ≥ DRIFT_WINDOW = 750` and `DRIFT_CONFIRM_ALPHA < 1.0`.
+
+This is insurance against `rate` "running away" due to a long series of one-sided `phase_err`.
+
 
 This is insurance against `rate` "running away" due to a long series of one-sided `phase_err`.
 
@@ -370,7 +502,7 @@ limit            = POST_GATE_K · σ_consensus
 - If `|delta| ≤ limit` → **applied** (the normal path, §7).
 - If `|delta| > limit` → **rejected** with a caveat:
   - `_consecutive_rejects += 1`;
-  - if the counter reaches `POST_GATE_FORCE_APPLY_AFTER = 50` → **forced apply** (§8.5);
+  - if the counter reaches `POST_GATE_FORCE_APPLY_AFTER = 125` → **forced apply** (§8.5);
   - otherwise `applied = False`, and the returned tuple carries `rejected_offset_ns` (raw `consensus_offset`) and `rejected_prediction_ns` (the gate's opinion).
 
 The gate's physical meaning: "what the consensus just measured is **too far** from my verified trajectory. Most likely this is an outlier, not a real clock excursion."
@@ -380,7 +512,7 @@ The gate's physical meaning: "what the consensus just measured is **too far** fr
 | Not updated | Why this is correct |
 |---|---|
 | `applied_offsets.appendleft(...)` — not called | The "clean" trajectory stays uncontaminated. `σ_consensus`, `drift_slope` (OLS), and `drift_prediction` are all computed from it. If we stuffed rejected outliers in, both σ and the OLS slope would break. |
-| `drift_slope` (OLS over 300 applied) | Does not see the rejected value. OLS is sensitive to a single outlier. |
+| `drift_slope` (OLS over up to 750 applied) | Does not see the rejected value. OLS is sensitive to a single outlier. |
 | `drift_prediction` base point | Stays at the last applied offset. It is **extrapolated** via `rate·(t_ref − _last_apply_mono)` so it does not freeze in time. |
 | Drift persist to DB (`append_drift_sample`) | The reject branch **returns before** reaching it. |
 | `_last_drift_persist_tick` | Not reset. |
@@ -393,7 +525,7 @@ The gate's physical meaning: "what the consensus just measured is **too far** fr
 self._recent_observed.appendleft(consensus_offset)
 ```
 
-This is crucial. `_recent_observed` is a separate window of "all observations, including rejected". `short_vote = median(15)` is computed from it. As a result: the gate's own prediction does not freeze — the median sees fresh data even when `applied_offsets` is stuck.
+This is crucial. `_recent_observed` is a separate window of "all observations, including rejected". `short_vote = median(50)` is computed from it. As a result: the gate's own prediction does not freeze — the median sees fresh data even when `applied_offsets` is stuck.
 
 **(b) A record is written to `_slew_error_history`.** A `SlewRecord` with `rejected_offset_ns ≠ None`, `ref_ns = predicted_now`, and `diff_ns = rejected_offset_ns − predicted_now`. Pure telemetry — it does not enter PLL logic.
 
@@ -407,8 +539,8 @@ phase_err_reject = rejected_offset_ns − predicted_now
 
 | streak | What anchor does | Physics |
 |---|---|---|
-| **streak ≤ 1** | `anchor_offset := rejected_prediction_ns`; `anchor_mono := best_mono` | "This is a single outlier. I do not trust the raw consensus_offset, and I do not shift toward it. I put the anchor at the point that the **verified trajectory** (the gate's prediction) considers correct." The clock keeps running along the old model. |
-| **streak ≥ 2** | `anchor_offset := predicted_now + PLL_KP_REJECT · phase_err_reject` | "The streak is confirmed — the gate is stale. I pull the anchor by 30% (`PLL_KP_REJECT = 0.30`) toward the **raw** consensus_offset, but do not jump all the way." Equivalent to `0.7·predicted_now + 0.3·rejected_offset_ns`. |
+| **streak ≤ 1** | `anchor_offset := rejected_prediction_ns`; `anchor_mono := best_mono` | "This is a single outlier. I do not trust the raw `consensus_offset`, and I do not shift toward it. I put the anchor at the point that the **verified trajectory** (the gate's prediction) considers correct." The clock keeps running along the old model. |
+| **streak ≥ 2** | `anchor_offset := predicted_now + PLL_KP_REJECT · phase_err_reject` | "The streak is confirmed — the gate is stale. I pull the anchor by 30% (`PLL_KP_REJECT = 0.30`) toward the **raw** `consensus_offset`, but do not jump all the way." Equivalent to `0.7·predicted_now + 0.3·rejected_offset_ns`. |
 
 The key difference: `rejected_prediction_ns` is the gate's prediction (from `applied_offsets` with rate extrapolation), while `predicted_now` is the PLL's own model prediction (`anchor + rate·dt`). They are usually close, but during a long reject series they diverge — the PLL starts to "catch up" to reality via P-correction, while the gate's prediction stays in the past.
 
@@ -436,8 +568,8 @@ With `THRESHOLD_SHRINK_FLOOR = 0.99`:
 |---|---|---|
 | 1 | ×1.01 | barely noticeable |
 | 4 | ×1.04 | gate slightly wider |
-| 10 | ×1.11 | noticeably wider |
-| 50 (force-apply) | ×1.65 | gate wide open |
+| 25 | ×1.29 | noticeably wider |
+| 125 (force-apply) | ×3.49 | gate wide open |
 
 Plus `short_vote` gradually shifts toward the rejected values (via `_recent_observed`), and `drift_prediction` is extrapolated via `rate`. Together this **prevents the gate from sticking**: sooner or later `|delta|` falls below the new `limit`.
 
@@ -445,17 +577,21 @@ Plus `short_vote` gradually shifts toward the rejected values (via `_recent_obse
 
 ```python
 if streak >= REJECT_RATE_RESET_STREAK:
-    rate_ppm  = self._rate * 1e6
-    prior_ppm = self._rate_prior * 1e6
-    if abs(rate_ppm − prior_ppm) > REJECT_RATE_RESET_MIN_DIVERGE_PPM:
-        new_ppm = (1 − GAIN)·rate_ppm + GAIN·prior_ppm
-        self._rate = new_ppm * 1e-6
-        self._phase_err_window.clear()
+    if self._rate_prior_active:                     # ← guard
+        rate_ppm  = self._rate * 1e6
+        prior_ppm = self._rate_prior * 1e6
+        if abs(rate_ppm − prior_ppm) > REJECT_RATE_RESET_MIN_DIVERGE_PPM:
+            new_ppm = (1 − GAIN)·rate_ppm + GAIN·prior_ppm
+            self._rate = new_ppm * 1e-6
+            self._phase_err_window.clear()
 ```
 
-With `GAIN = 1.0` this is a **hard reset** `rate := rate_prior`. Logic: 4 rejects in a row means the clock model (and its `rate`) has drifted too far from what history confirms. Safer to return to the DB prior than to keep extrapolating from a skewed estimate.
+The reset fires **only when a prior exists**. Without a prior (empty
+`drift_history`), the reset is skipped — there is nothing to reset to, and
+resetting to 0 would destroy warmup progress.
 
-The developer's note in the code warns directly: if this happens, check hardware/temperature and **clear the `drift_history` table** — the prior itself may be wrong.
+`_maybe_reset_rate_on_cold_start_locked` similarly returns early when no
+prior is active.
 
 **(g) The clock snapshot is published.** If `rate` changed (via sign-constancy or reset-to-prior) or the dt branch was taken, `_publish_clock_and_metrics_locked()` recomputes TTL and accuracy for the new rate/anchor and invalidates `_precision_cache`. Otherwise external consumers of `get_clock_snapshot(precision_ns=...)` would receive stale numbers.
 
@@ -475,7 +611,7 @@ Telemetry only. Meaning: on a single outlier, "the truth" is the gate's predicti
 
 If the gate passes — `self._consecutive_rejects = 0`. Then: σ_consensus returns to its normal form (`grow = 1`), `applied_offsets` starts receiving points again, `drift_slope` begins to "see" them, and the PLL proceeds normally (`predicted + KP·phase_err`).
 
-#### 8.5 Force-apply after 50 consecutive rejects
+#### 8.5 Force-apply after `POST_GATE_FORCE_APPLY_AFTER = 125` consecutive rejects
 
 ```python
 if self._consecutive_rejects >= POST_GATE_FORCE_APPLY_AFTER:
@@ -484,7 +620,10 @@ if self._consecutive_rejects >= POST_GATE_FORCE_APPLY_AFTER:
     # applied remains True
 ```
 
-This is **insurance against a dead lock**. Physics: if 50 rounds in a row (~25 minutes at a 30-second interval) were rejected, then `drift_prediction`/`short_vote` are **hopelessly lagging** the real clock excursion (e.g. an external time step, or a sudden drift change). Force-apply means: "enough. Accept `consensus_offset` as is, reset the counter, rebuild the prediction from the new applied". Then σ_consensus is recomputed and the gate restarts with fresh data.
+This is **insurance against a dead lock**. Physics: if 125 rounds in a row (~62 minutes at a 30-second interval) were rejected, then `drift_prediction` / `short_vote` are **hopelessly lagging** the real clock excursion.
+Force-apply means: "enough. Accept `consensus_offset` as is, reset the counter, rebuild the prediction from the new applied".
+Then σ_consensus is recomputed and the gate restarts with fresh data.
+
 
 #### 8.6 Reject vs accept: summary table
 
@@ -495,15 +634,15 @@ This is **insurance against a dead lock**. Physics: if 50 rounds in a row (~25 m
 | `_consecutive_rejects` | reset to 0 | += 1 |
 | `drift_slope` (OLS) | recomputed over applied | not recomputed |
 | `drift_prediction` | updated to the last applied + extrapolation | stays at the old one + extrapolation via rate |
-| `short_vote` | median(15 observed) — including the current | median(15 observed) — **including the rejected** |
+| `short_vote` | OLS(50 observed) — including the current | OLS(50 observed) — **including the rejected** |
 | σ_consensus | `_noise_sigma_ns(applied)` | `_noise_sigma_ns(applied) × (1/0.99)^streak` |
 | anchor_offset | `predicted + KP·phase_err` | `streak ≤ 1`: gate prediction; `streak ≥ 2`: `0.7·predicted + 0.3·rejected` |
 | `_phase_err_window` | appendleft(phase_err) | appendleft(phase_err_reject) |
 | rate: sign-constancy | applied | applied (if dt is sufficient) |
 | rate: drift-confirm | applied | **not applied** |
-| rate: reset-to-prior | — | when `streak ≥ 4` and diverg > 1 ppm |
+| rate: reset-to-prior | — | only if `_rate_prior_active` is True |
 | `_target_offset` | new_target_offset | gate prediction (streak≤1) or raw (streak≥2) |
-| Drift persist to DB | yes, once every ~300 ticks | **no** |
+| Drift persist to DB | yes, once every ≥ `DRIFT_WINDOW` ticks | **no** |
 | Colony bias | updated | updated |
 | Publishing the clock snapshot | yes | yes (if rate/anchor changed) |
 
@@ -512,12 +651,12 @@ This is **insurance against a dead lock**. Physics: if 50 rounds in a row (~25 m
 The gate protects the PLL from two extremes:
 
 1. **A single outlier** (server blinked, DNS glitch, random interference). The gate says "no", the anchor stays on the verified trajectory, and the clock does not twitch.
-2. **A real step / excursion** (sleep-resume, system clock step, sudden drift change). The gate also says "no" at first, but then:
+2. **A real step / excursion**. The gate also says "no" at first, but then:
    - `short_vote` gradually sees the new points,
    - σ_consensus expands,
    - `streak ≥ 2` starts P-correction toward the raw consensus,
-   - `streak ≥ 4` resets `rate` to prior,
-   - `streak ≥ 50` — force-apply.
+   - `streak ≥ 4` resets `rate` to prior (only if `_rate_prior_active`),
+   - `streak ≥ 125` — force-apply.
 
 Thus the system **does not jump on every outlier**, yet **does not stick forever** in the face of a real event. The trade-off between robustness and adaptivity is governed by three numbers: `POST_GATE_K`, `REJECT_RATE_RESET_STREAK`, `POST_GATE_FORCE_APPLY_AFTER`.
 
@@ -534,7 +673,7 @@ COLD START → warmup → MATURE → (reproduce | deathbed) → death
 - **Cold start.** `own_reference_offset = None`. First round: the server with the minimum delay (argmin(delay)) is taken.
 - **Warmup.** History of `✓`-acceptances per server accumulates. Upon reaching `SIGMA_WARMUP_RECORDS = 5` per server — capture of `σ_avg`.
 - **MATURE.** The instance works: filters, updates `own_reference_offset`, evaluates a favorite, participates in the matrix.
-- **Reproduction.** By favorite dominance (σ_favorite < 0.7·σ_others) or by "deathbed" (accept_rate < 0.05 over 5 windows).
+- **Reproduction.** By favorite dominance (σ_favorite < 0.7·σ_others) or by "deathbed" (accept_rate < 0.10 over 5 windows).
 - **Death.** `low_accept_windows ≥ 5` → the instance dies.
 - **Divine birth.** If the population drops below `MIN_POPULATION = 5`, a new independent root is created, banning favorites of the stuck instances.
 
@@ -560,13 +699,25 @@ The arithmetic mean over L² cells is a **balanced estimate of true UTC**.
 
 Some servers lie by a constant amount (e.g. +3 ms). This is not noise — this is a **bias**. It is estimated as follows:
 
-1. From `_raw_proposed_history` (before bias application), the `mean` over time is taken for each server.
-2. The `median` of that mean across servers is computed — the "common center".
-3. `delta = mean_s − median_mean`.
-4. If `|delta| > K · σ_s` — the bias is confirmed; otherwise the server is just noisy, not shifted.
-5. `bias[srv] ← (1−k)·bias[srv] + k·delta`, clamped to ±50 ms.
+1. **Activation threshold.** The integrator runs only when
+   `len(_raw_proposed_history) ≥ HISTORY_MAX_LEN // MIN_BAIS_HIST_DIVIDER`
+   (≈ 187 rounds with `HISTORY_MAX_LEN = 250`). Below this, no bias is
+   estimated — the sample of server means would be too noisy.
+2. From `_raw_proposed_history` (before bias application), the `mean` over time is taken for each server.
+3. The `median` of that mean across servers is computed — the "common center".
+4. `delta = mean_s − median_mean`.
+5. If `|delta| > K_THRESHOLD · σ_s` — the bias is confirmed; otherwise the server is just noisy, not shifted.
+6. `bias[srv] ← (1−k)·bias[srv] + k·delta`, clamped to `±COLONY_BIAS_MAX_NS` (50 ms).
 
 Thereafter every new sample of this server is corrected by `bias[srv]`. Physics: we **subtract the server's systematic error** and work only with its noise.
+
+Additionally, servers that leave the active set decay:
+
+```
+bias[srv] ← bias[srv] · COLONY_BIAS_DECAY   (0.99 per round)
+```
+
+and are deleted once `|bias| < COLONY_BIAS_DECAY_FLOOR` (10 µs). This prevents stale bias entries from pinning a server that has since recalibrated.
 
 #### 9.5 Spread-gate — when the colony may reproduce
 
@@ -595,7 +746,7 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  Consensus.atom_round(...)                                   │
-│  ┌── _refresh_bans_locked()  (favorite ownership)           │
+│  ┌── _refresh_bans_locked()  (favorite ownership)            │
 │  │ ┌── _process_round_locked()                               │
 │  │ │    for k, inst in ordered:                              │
 │  │ │      available = samples[attempt_idx=k]                 │
@@ -604,28 +755,29 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 │  │ │      ref := new_offset; thr evolves                     │
 │  │ │      matrix_rows.append(row)                            │
 │  │ ├── _compute_history_votes()                              │
-│  │ │    short_vote     = median(15 observed)                 │
-│  │ │    drift_slope    = OLS(300 applied)                    │
-│  │ │    drift_pred     = last_applied + rate·Δt              │
+│  │ │    short_vote     = median(50 observed)                 │
+│  │ │    drift_slope    = OLS(up to 750 applied)              │
+│  │ │    drift_pred     = last_applied + extrap_rate·Δt       │
+│  │ │      (extrap_rate = 0 | slope | rate)                   │
 │  │ ├── _build_consensus_matrix()                             │
 │  │ │    size L, compact = diverse_cells                      │
 │  │ │    consensus_offset = mean(L² cells)                    │
-│  │ ├── post-gate                                              │
-│  │ │    delta = consensus − pred; limit = K·σ_consensus       │
-│  │ │    |delta| > limit → rejected (see §8)                   │
+│  │ ├── post-gate                                             │
+│  │ │    delta = consensus − pred; limit = K·σ_consensus      │
+│  │ │    |delta| > limit → rejected (see §8)                  │
 │  │ └── _check_triggers_locked()                              │
 │  │      σ_avg capture, reproduction, death, spread-gate      │
-│  └─────────────────────────────────────────────────────────┘
+│  └───────────────────────────────────────────────────────────┘
 └─────────────────────────────┬────────────────────────────────┘
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  _apply_new_sync_locked(...)                                 │
-│  not applied? → reject-streak logic (see §8.3)              │
-│  primary sync? → anchor=best_utc, rate=prior                │
-│  |phase_err|>100ms? → reset                                 │
-│  otherwise: predicted, phase_err, anchor += KP·phase_err,   │
-│             sign-constancy, drift-confirmation              │
-│             publish clock snapshot, persist drift           │
+│  not applied? → reject-streak logic (see §8.3)               │
+│  primary sync? → anchor=best_utc, rate=prior                 │
+│  |phase_err|>100ms? → reset                                  │
+│  otherwise: predicted, phase_err, anchor += KP·phase_err,    │
+│             sign-constancy, drift-confirmation               │
+│             publish clock snapshot, persist drift            │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -670,7 +822,7 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
                               │
               ┌───────────────┴───────────────┐
               ▼                               ▼
-     streak < 50                     streak ≥ 50
+     streak < 125                    streak ≥ 125
               │                               │
               ▼                               ▼
    applied = False                  force-apply
@@ -681,6 +833,7 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
        streak ≤ 1 → gate pred        from the new applied
        streak ≥ 2 → 0.7·pred + 0.3·raw
    · rate reset to prior if streak ≥ 4
+     (only if _rate_prior_active)
    · sign-constancy on phase_err_reject
    · drift-confirm skipped
    · no drift persist to DB
@@ -702,7 +855,7 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
             ▲                              │
             │                              ├── dominant_favorite → spawn
             │                              │
-            │                              ├── deathbed → spawn + die
+            │                              ├── deathbed (accept < 0.10) → spawn + die
             │                              │
             │                              └── low_accept_windows ≥ 5
             │                                       │
@@ -729,9 +882,10 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 | `QUERY_ATTEMPT_SPACING_SEC` | 1.0 | Spacing between attempts within a round. |
 | `QUERY_ATTEMPT_SPACING_NS` | 1_000_000_000 | Same in ns. |
 | `NTP_QUERY_TIMEOUT_SEC` | 2 | Timeout of a single NTP request. |
+| `NTP_QUERY_TIMEOUT_SAFE_SEC` | 2 | Protective timeout for NTP request batch. |
 | `DNS_QUERY_TIMEOUT_SEC` | 5 | DNS timeout. |
-| `NTP_RESOLVING_TIMEOUT_NS` | 3.6e12 (1 h) | DNS re-resolution period. |
-| `VALIDATE_ORIGIN` | `'1'` from env | Origin echo check. |
+| `NTP_RESOLVING_TIMEOUT_NS` | 3600 · 1e9 | DNS re-resolution period (1 h). |
+| `VALIDATE_ORIGIN` | env `'1'` | Origin echo check. |
 
 ### Cycle and threads
 
@@ -745,7 +899,8 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 | `WATCHDOG_STOP_JOIN_SEC` | 3.0 | Watchdog join timeout. |
 | `SYNC_THREAD_STOP_JOIN_SEC` | 15.0 | Overall stop timeout. |
 | `PRE_START_JOIN_SEC` | 5.0 | Join timeout for "leftover" threads. |
-| `KEEP_AWAKE_REFRESH_SEC` | 30 | ES_SYSTEM_REQUIRED re-set. |
+| `KEEP_AWAKE_ENABLED` | env `'1'` | Disable via `TIME_SYNC_KEEP_AWAKE=0`. |
+| `KEEP_AWAKE_REFRESH_SEC` | 30 | `ES_SYSTEM_REQUIRED` re-set frequency. |
 
 ### PLL
 
@@ -758,22 +913,23 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 | `PLL_RATE_LIMIT` | 100e-6 (±100 ppm) | Drift estimate limit. |
 | `PHASE_JUMP_THRESHOLD_NS` | 100_000_000 (100 ms) | Reset anchor + rate. |
 | `PHASE_MEDIUM_JUMP_NS` | 20_000_000 (20 ms) | Boosted KP threshold. |
-| `RATE_SPRING_BASE_PPM` | 0.02 | Base rate step (fallback). |
+| `RATE_SPRING_BASE_PPM` | 0.02 | Base rate step (fallback when no prior σ). |
 | `RATE_SPRING_MAX_PPM` | 0.10 | Maximum rate step (fallback). |
 | `RATE_SPRING_SIGMA_FRACTION_BASE` | 0.05 | Base step = 0.05·σ_prior. |
 | `RATE_SPRING_SIGMA_FRACTION_MAX` | 0.25 | Max step = 0.25·σ_prior. |
-| `RATE_SPRING_T_SCALE` | 3.0 | Confidence = (|t|−T)/SCALE. |
+| `RATE_SPRING_T_SCALE` | 3.0 | Confidence = (\|t\|−T)/SCALE. |
 | `RATE_PRIOR_PULL` | 0.00 | Extra pull of rate toward prior. |
-| `RATE_CLAMP_FROM_PRIOR_PPM` | 2.0 | ±window around prior. |
-| `RATE_DETECT_WINDOW_N` | 30 | phase_errors window. |
-| `RATE_DETECT_MIN_N` | 20 | Minimum for statistics. |
-| `RATE_T_THRESHOLD` | 2.5 | Threshold of |t| of the mean. |
+| `RATE_CLAMP_SIGMA_K` | **1.0** | Clamp of rate to ±1σ around the prior (active only if prior present). |
+| `RATE_DETECT_WINDOW_N` | `HISTORY_MAX_LEN // 3` = **83** | phase_errors window. |
+| `RATE_DETECT_MIN_N` | `HISTORY_MAX_LEN // 5` = **50** | Minimum for statistics. |
+| `RATE_T_THRESHOLD` | 2.5 | Threshold of \|t\| of the mean. |
 | `RATE_Z_THRESHOLD` | −2.0 | Runs z: negative = sign sticking. |
 
 ### Colony bias
 
 | Name | Value |
 |---|---|
+| `MIN_BAIS_HIST_DIVIDER` | **4/3** (divisor of `HISTORY_MAX_LEN` → 187 raw rounds before the integrator runs) |
 | `COLONY_BIAS_GAIN` | 0.05 |
 | `COLONY_BIAS_MAX_NS` | 50_000_000 (50 ms) |
 | `COLONY_BIAS_DECAY` | 0.99 |
@@ -786,7 +942,7 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 |---|---|
 | `DRIFT_CONFIRM_RATE_DIVERGE_PPM` | 3.0 |
 | `DRIFT_CONFIRM_ALPHA` | 0.5 |
-| `DRIFT_SEED_MIN_SAMPLES` | 5 |
+| `DRIFT_SEED_MIN_SAMPLES` | 3 |
 | `DRIFT_COLD_START_DIVERGE_PPM` | 3.0 |
 | `DRIFT_OUTLIER_K` | 3.0 |
 
@@ -808,14 +964,16 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 | Name | Value |
 |---|---|
 | `THRESHOLD_MIN_NS` | 1_000 (1 µs) |
-| `COLONY_THRESHOLD_FLOOR_NS` | 2_500_000 (2.5 ms) |
+| `COLONY_THRESHOLD_FLOOR_NS` | 2_500_000 (2.5 ms) — first floor |
+| `COLONY_THRESHOLD_SECOND_FLOOR_NS` | **2_000_000 (2 ms)** — second floor, active only while accept rate > threshold |
+| `COLONY_THRESHOLD_FLOOR_ACCEPT_RATE` | **0.90** — accept rate threshold for second floor |
 | `THRESHOLD_SHRINK_FLOOR` | 0.99 |
 | `COHERENCE_THRESHOLD_NS` | 5_000_000 (5 ms) |
-| `HISTORY_MAX_LEN` | 100 |
-| `ACCEPT_WINDOW_SIZE` | 16 |
+| `HISTORY_MAX_LEN` | **250** |
+| `ACCEPT_WINDOW_SIZE` | 16 (= `PER_SERVER_HISTORY`) |
 | `DEATH_LOW_WINDOWS` | 5 |
-| `DEATH_ACCEPT_THRESHOLD` | 0.05 |
-| `REPRODUCTION_LAG_L` | 5 |
+| `DEATH_ACCEPT_THRESHOLD` | **0.10** |
+| `REPRODUCTION_LAG_L` | 5 (= `DEATH_LOW_WINDOWS`) |
 | `FAVORITE_HYST` | 0.15 |
 
 ### Dominance / warmup
@@ -823,8 +981,8 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 | Name | Value |
 |---|---|
 | `ALPHA_SIGNIFICANCE` | 0.1 |
-| `DOMINANT_MIN_HISTORY` | 16 |
-| `SIGMA_WARMUP_RECORDS` | 5 |
+| `DOMINANT_MIN_HISTORY` | 16 (= `ACCEPT_WINDOW_SIZE`) |
+| `SIGMA_WARMUP_RECORDS` | 5 (= `SPREAD_HISTORY_MIN`) |
 | `SIGMA_WARMUP_TIMEOUT_MULT` | 3 |
 | `SIGMA_WARMUP_MIN_SURVIVORS` | 2 |
 | `WARMUP_MIN_SURVIVORS` | 2 |
@@ -838,7 +996,7 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 | Name | Value |
 |---|---|
 | `MIN_POPULATION` | 5 |
-| `DIVINE_QUEUE_MAX` | 5 |
+| `DIVINE_QUEUE_MAX` | 5 (= `MIN_POPULATION`) |
 | `DIVINE_ACCEPT_RATE_THRESHOLD` | 0.1 |
 | `MAX_POPULATION_RATIO` | 0.7 |
 | `MAX_POPULATION_MIN_SERVERS` | 7 |
@@ -847,26 +1005,27 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 
 | Name | Value |
 |---|---|
-| `HISTORY_VOTE_SHORT_WINDOW` | 15 |
-| `HISTORY_VOTE_MIN_SAMPLES` | 5 |
-| `DRIFT_WINDOW` | 300 |
-| `DRIFT_MIN_SAMPLES` | 30 |
+| `HISTORY_VOTE_SHORT_WINDOW` | `HISTORY_MAX_LEN // 5` = **50** |
+| `SHORT_VOTE_MIN_SAMPLES` | `HISTORY_VOTE_SHORT_WINDOW // 2` = **25** (new) |
+| `HISTORY_VOTE_MIN_SAMPLES` | 5 (= `SPREAD_HISTORY_MIN`) |
+| `DRIFT_WINDOW` | `HISTORY_MAX_LEN · 3` = **750** |
+| `DRIFT_MIN_SAMPLES` | `HISTORY_MAX_LEN // 3` = **83** |
 
 ### Consensus gate
 
 | Name | Value |
 |---|---|
 | `POST_GATE_K` | 1.0 |
-| `POST_GATE_FORCE_APPLY_AFTER` | 50 |
+| `POST_GATE_FORCE_APPLY_AFTER` | `HISTORY_MAX_LEN // 2` = **125** |
 | `REJECT_RATE_RESET_STREAK` | 4 |
 | `REJECT_RATE_RESET_GAIN` | 1.0 |
 | `REJECT_RATE_RESET_MIN_DIVERGE_PPM` | 1.0 |
 | `DISABLE_POST_GATE` | 0 |
-| `DISABLE_SHORT_VOTE` | = DISABLE_POST_GATE |
-| `DISABLE_DRIFT_VOTE` | = DISABLE_POST_GATE |
+| `DISABLE_SHORT_VOTE` | = `DISABLE_POST_GATE` |
+| `DISABLE_DRIFT_VOTE` | = `DISABLE_POST_GATE` |
 | `CONSENSUS_MATRIX_MIN` | 2 |
-| `SPREAD_HISTORY_LEN` | 16 |
-| `SPREAD_HISTORY_MIN` | 5 |
+| `SPREAD_HISTORY_LEN` | 16 (= `ACCEPT_WINDOW_SIZE`) |
+| `SPREAD_HISTORY_MIN` | 5 (= `REPRODUCTION_LAG_L`) |
 | `REPRODUCTION_SPREAD_MULT` | 2.0 |
 
 ### Environment flags
@@ -875,7 +1034,6 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 |---|---|---|
 | `TIME_SYNC_KEEP_AWAKE` | `'1'` | `0` — disable keep-awake. |
 | `TIME_SYNC_VALIDATE_ORIGIN` | `'1'` | `0` — disable origin echo. |
-| `TIME_SYNC_MODE` | — | Sprint 2, not implemented. |
 
 ---
 
@@ -893,41 +1051,71 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 | `_anchor_offset` | 0 | int | UTC reference at the anchor. |
 | `_anchor_mono` | 0 | int | Anchor point (mono_ns). |
 | `_rate` | 0.0 | float | Drift (dimensionless). |
-| `_clock_snapshot` | `(0,0,0.0)` | tuple | Lock-free snapshot. |
+| `_clock_snapshot` | `(0,0,0.0)` | tuple | Lock-free snapshot `(anchor_mono, anchor_offset, rate)`. |
 | `_clock_snapshot_ttl_ns` | 120e9 | int | Snapshot TTL. |
 | `_clock_snapshot_accuracy_ns` | 5e6 | int | Snapshot accuracy. |
-| `_clock_snapshot_full` | 5-tuple | tuple | Atomic snapshot. |
+| `_clock_snapshot_full` | 5-tuple | tuple | Atomic snapshot `(anchor_mono, anchor_offset, rate, ttl_ns, accuracy_ns)`. |
 | `_precision_cache` | OrderedDict | LRU | Precision cache. |
 | `_target_offset` | 0 | int | Target offset. |
 | `_last_phase_error` | None | Optional[int] | Last phase_err. |
-| `_slew_error_history` | deque(100) | SlewRecord | Consensus history. |
-| `_colony_bias` | `{}` | dict | Accumulated bias. |
-| `_raw_proposed_history` | deque(100) | tuple | Raw history for bias. |
+| `_slew_error_history` | deque(250) | deque[SlewRecord] | Consensus history. |
+| `_colony_bias` | `{}` | dict[str,int] | Accumulated bias per server. |
+| `_raw_proposed_history` | deque(250) | deque[tuple] | Raw history for the bias integrator. |
 | `_consensus` | Consensus | — | The colony. |
-| `_rate_prior` | 0.0 | float | Prior from the DB. |
+| `_rate_prior` | 0.0 | float | Prior from the DB (or 0.0). |
+| `_rate_prior_active` | **False** | bool | True if prior passed sanity (`n ≥ DRIFT_SEED_MIN_SAMPLES`, `σ < PLL_RATE_LIMIT`). |
+| `_rate_clamp_sigma_ppm` | **None** | Optional[float] | Prior σ in ppm, or None if no prior. Drives 1σ clamp. |
 | `_rate_spring_base_ppm` | computed | float | Base rate step. |
 | `_rate_spring_max_ppm` | computed | float | Max rate step. |
 | `_last_drift_persist_tick` | 0 | int | Persist pause. |
+| `_min_pll_update_interval_ns` | 15e9 | int | Stuck-update cutoff. |
+| `_phase_err_window` | deque(83) | deque[int] | Sign-constancy window. |
+| `_delay_history` | deque(20) | deque[int] | Round delays. |
+| `_per_server_delay` | defaultdict | dict[str, deque(16)] | Per-server min-delay history. |
+| `dns_fail_servers` | `set()` | set[str] | Servers with failed DNS. |
+| `ntp_servers_last_resolved_ns` | −3.6e12 | int | DNS resolution timestamp. |
+| `_threads` | `{}` | dict[int, Thread] | Sync threads by slot. |
+| `_watchdog_thread` | None | Optional[Thread] | Watchdog. |
+| `_keep_awake_thread` | None | Optional[Thread] | Keep-awake. |
+| `running` | False | bool | Service lifecycle. |
+| `is_synced_event` | Event | — | First sync flag. |
+| `_stop_event` | Event | — | Stop signal. |
+| `_last_success_mono_ns` | 0 | int | Last successful round. |
+| `_last_stalled_servers` | `()` | tuple | Stalled servers, for diagnostics. |
+| `_mono_floor_ns` | 0 | int | Monotonic floor for `get_utc_ns_monotonic`. |
+| `_mono_floor_lock` | Lock | — | Floor lock. |
+| `_diff_sigma` | 1.0 | float | σ multiplier for instance threshold. |
+| `_last_diff_threshold` | None | Optional[int] | Seed for new instances. |
+| `_last_cold_gen` | 0 | int | Colony generation marker. |
+| `_executors_shutdown` | False | bool | Executor lifecycle. |
+| `_NTP_poll_executor` | pool | ThreadPoolExecutor | NTP poll pool. |
+| `_DNS_poll_executor` | pool | ThreadPoolExecutor | DNS pool. |
 
 ### Consensus
 
 | Name | Init | Type |
 |---|---|---|
+| `sync_interval` | int | int |
+| `servers` | list | list[str] |
+| `max_population` | int | int |
+| `divine_queue_max` | max(5, max_pop) | int |
+| `diff_sigma` | float | float |
 | `population` | `[init_pop]` | list[AlgorithmInstance] |
 | `_next_id` | init_pop | int |
 | `_tick` | 0 | int |
 | `reproduction_allowed` | True | bool |
-| `_spreads` | deque(16) | deque |
+| `_spreads` | deque(16) | deque[float] |
 | `_mean_spread_ns` | None | Optional[float] |
 | `noise_ref_ns` | None | Optional[float] |
-| `_recent_observed` | deque(300) | deque[int] |
-| `applied_offsets` | deque(300) | deque[Tuple[int,int]] |
+| `_recent_observed` | deque(**750**) | deque[Tuple[int, int]] — **stores `(value, t_ref_mono)`** |
+| `applied_offsets` | deque(**750**) | deque[Tuple[int,int]] |
 | `_last_short_vote` | None | Optional[int] |
 | `_last_drift_prediction` | None | Optional[int] |
-| `_last_drift_slope` | None | Optional[float] |
+| `_last_short_slope` | **None** | Optional[float] — short-window slope (ns/round), telemetry only |
 | `_last_apply_mono_ns` | 0 | int |
 | `_consecutive_rejects` | 0 | int |
-| `_occupied` | `set()` | set |
+| `_occupied` | `set()` | set[str] |
+| `_prev_favorites` | `{}` | dict |
 | `cold_start_generation` | 0 | int |
 | `_lineage_queue` | `[id...]` | list[int] |
 
@@ -938,15 +1126,16 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 | `id` | n | int |
 | `lineage_id` | n / parent | int |
 | `favorite` | None | Optional[str] |
-| `banned_servers` | `set(_occupied)` | set |
-| `own_history` | deque(100) | SlewRecord |
-| `own_history_rejected` | deque(100) | SlewRecord |
+| `banned_servers` | `set(_occupied)` | set[str] |
+| `own_history` | deque(250) | deque[SlewRecord] |
+| `own_history_rejected` | deque(250) | deque[SlewRecord] |
 | `own_reference_offset` | None | Optional[int] |
 | `own_threshold_ns` | None | Optional[int] |
 | `own_sigma_avg_ns` | None | Optional[int] |
 | `armed_lock_until_tick` | `-1e9` | int |
-| `warmup_excluded` | `set()` | set |
+| `warmup_excluded` | `set()` | set[str] |
 | `warmup_started_tick` | `_tick` | int |
+| `warmup_stuck_logged` | False | bool |
 | `accept_window` | deque(16) | deque[bool] |
 | `low_accept_windows` | 0 | int |
 | `deathbed_used` | False | bool |
@@ -960,11 +1149,11 @@ If instance opinions diverge too much (`median(spreads) ≥ 2·median(σ_avg)`),
 
 ### NamedTuple
 
-**ServerMeta**: leap, version, mode, stratum, poll, precision, root_delay_raw, root_disp_raw, ref_id, ref_ts_ns, last_update_mono_ns. Derived: `root_delay_ns`, `root_disp_ns` (16.16 fixed-point).
+**ServerMeta**: `leap, version, mode, stratum, poll, precision, root_delay_raw, root_disp_raw, ref_id, ref_ts_ns, last_update_mono_ns`. Derived: `root_delay_ns`, `root_disp_ns` (16.16 fixed-point).
 
-**SlewRecord**: timestamp_ns, diff_ns, threshold_ns, instance_id, favorite, servers, ref_ns, is_cold_start, matrix, matrix_meta, is_stale, rejected_offset_ns.
+**SlewRecord**: `timestamp_ns, diff_ns, threshold_ns, instance_id, favorite, servers, ref_ns, is_cold_start, matrix, matrix_meta, is_stale, rejected_offset_ns`.
 
-**ClockSnapshot**: anchor_mono_ns, anchor_offset_ns, rate, ttl_ns, accuracy_ns.
+**ClockSnapshot**: `anchor_mono_ns, anchor_offset_ns, rate, ttl_ns, accuracy_ns`.
 
 ---
 
@@ -978,13 +1167,82 @@ svc.wait_for_first_sync(timeout=30)
 svc.stop()
 
 svc.get_utc_ns()                                 # lock-free UTC ns, raw UTC estimate, may step backward
-svc.get_utc_ns_monotonic()						 # lock-free UTC ns with monotonic adds, guaranteed non-decreasing; may briefly lead UTC
+svc.get_utc_ns_monotonic()                       # lock-free UTC ns with monotonic floor, guaranteed non-decreasing
 svc.get_utc_ns_with_precision(precision_ns)      # UTC ns | None (strict SLA)
 svc.get_clock_snapshot()                         # ClockSnapshot | None
 svc.get_clock_snapshot(precision_ns=500_000)     # TTL fits precision
 TimeSyncService.utc_from_snapshot(snap, now_mono)  # pure function
 svc.get_sync_telemetry()                         # full dump
 ```
+
+### `get_sync_telemetry()` — return contract
+
+Top-level keys:
+
+| Key | Type | Notes |
+|---|---|---|
+| `precise_ns` | int | Model UTC. |
+| `system_ns` | int | OS UTC. |
+| `offset_ns` | int | `precise_ns − system_ns`. |
+| `offset_spread_ns` | int \| None | Robust σ of applied_offsets. |
+| `slew_error_ns` | int | Model vs target. |
+| `slew_errors_ns` | list[SlewRecord] | Consensus-level history (instance_id is None). |
+| `ntp_spread_ns` | int \| None | σ of delays across the round. |
+| `diff_threshold_ns` | int \| None | Mean instance threshold. |
+| `population` | dict | Consensus snapshot (see below). |
+| `instances` | dict[int, dict] | Per-instance telemetry. |
+| `colony_bias_ns` | dict[str, int] | Per-server bias. |
+| `colony_noise_ns` | dict[str, int] | Per-server robust jitter. |
+| `per_server_delay` | dict[str, dict] | Per-server min-delay stats. |
+| `rate_ppm` | float | Current PLL rate. |
+| `phase_error_ns` | int \| None | Last phase error. |
+| `second_sync_thread_delay` | int | Thread offset. |
+| `server_meta` | dict[str, dict] | NTP packet metadata. |
+| `extrapolation_diag` | dict | Variant A / clamp diagnostics (see below). |
+
+### `extrapolation_diag` — new diagnostic block
+
+```python
+{
+    'source': 'short_vote' | 'slope' | 'rate',
+    'n_app': int,
+    'rate_prior_active': bool,
+    'rate_clamp_lo_ppm': float | None,
+    'rate_clamp_hi_ppm': float | None,
+    'rate_clamp_sigma_ppm': float | None,
+    'rate_prior_ppm': float | None,
+    'short_slope_ns_per_round': float | None,      # NEW
+}
+```
+
+`source` reports which of the three prediction backends drives the extrapolation:
+
+| `source` | Condition | Effect on gate |
+|---|---|---|
+| `short_vote` | `n_app < DRIFT_MIN_SAMPLES` | gate uses `short_vote` alone (no extrapolation). |
+| `slope` | `DRIFT_MIN_SAMPLES ≤ n_app < DRIFT_WINDOW` | drift_prediction is extrapolated by slope. |
+| `rate` | `n_app ≥ DRIFT_WINDOW` | drift_prediction is extrapolated by `self._rate` (validated by drift-confirm). |
+
+`rate_prior_active = False` means:
+
+- no DB prior passed sanity checks, or
+- prior σ was not usable.
+
+In that case `rate_clamp_*` are `None` — the rate is limited only by `PLL_RATE_LIMIT`.
+
+### `population` — snapshot keys
+
+| Key | Type |
+|---|---|
+| `population` | int |
+| `tick` | int |
+| `reproduction_allowed` | bool |
+| `spread_ns` | float \| None |
+| `favorites` | list[str \| None] |
+| `occupied` | list[str] |
+| `lineage_queue` | list[int] |
+| `reproduction_gate` | dict (`history_len`, `history_min`, `median_spread_ns`, `noise_ref_ns`, `threshold_ns`, `ratio`) |
+| `history_vote` | dict (`short_vote_ns`, `short_slope_ns_per_round`, `drift_prediction_ns`, `drift_slope_ns_per_round`, `applied_len`, `last_applied_ns`) |
 
 ### UTC restoration from a snapshot
 
@@ -1002,9 +1260,7 @@ provided that the consensus has not degraded more than at the moment of the snap
 
 ### Monotonic UTC — `get_utc_ns_monotonic()`
 
-`get_utc_ns()` returns a raw estimate of UTC. It is monotonic while the
-underlying clock model `(anchor_mono, anchor_offset, rate)` is unchanged,
-but the model **may step backward** in the following cases:
+`get_utc_ns()` returns a raw estimate of UTC. It is monotonic while the underlying clock model `(anchor_mono, anchor_offset, rate)` is unchanged, but the model **may step backward** in the following cases:
 
 | Scenario | Magnitude | Frequency |
 |---|---|---|
@@ -1012,8 +1268,7 @@ but the model **may step backward** in the following cases:
 | Phase-jump reset (`\|phase_err\| > PHASE_JUMP_THRESHOLD_NS`) | > 100 ms | rare (sleep/resume, OS step, NTP glitch) |
 | Service stop / restart | up to hundreds of ms | on demand |
 
-Consumers that assume monotonicity (logging pipelines, TSO, rate-limiters,
-cache TTL) require a **separate** API that guarantees non-decreasing output.
+Consumers that assume monotonicity (logging pipelines, TSO, rate-limiters, cache TTL) require a **separate** API that guarantees non-decreasing output.
 
 #### Guarantee
 
@@ -1025,17 +1280,14 @@ get_utc_ns_monotonic() at t2  ≥  get_utc_ns_monotonic() at t1
 
 #### Mechanism
 
-Flat floor: the maximum value ever returned is stored; a raw value below
-the floor is replaced by the floor until real time catches up.
+Flat floor: the maximum value ever returned is stored; a raw value below the floor is replaced by the floor until real time catches up.
 
 - On a backward step, the caller observes a **pause**, not a backward jump.
-- During the pause, the returned value may briefly **lead** true UTC by up
-  to the magnitude of the step.
+- During the pause, the returned value may briefly **lead** true UTC by up to the magnitude of the step.
 
 #### Reset
 
-The floor is zeroed in `start()` and `stop()`. It does not persist across
-service restarts.
+The floor is zeroed in `start()` and `stop()`. It does not persist across service restarts.
 
 #### Thread-safety
 
@@ -1052,22 +1304,17 @@ Takes a small dedicated lock. Safe to call from any thread.
 | Strict SLA precision | `get_utc_ns_with_precision(ns)` |
 | TSO / distributed transactions | `get_utc_ns_monotonic()` with a skew budget |
 
-**Rule:** never measure elapsed time via `get_utc_ns()` — always via
-`time.monotonic_ns()`.
+**Rule:** never measure elapsed time via `get_utc_ns()` — always via `time.monotonic_ns()`.
 
 #### Non-goals
 
-`get_utc_ns()` is deliberately **not** made monotonic. It is an estimate
-of UTC; its job is to be *correct*, not monotonic. A floor inside
-`get_utc_ns()` would:
+`get_utc_ns()` is deliberately **not** made monotonic. It is an estimate of UTC; its job is to be *correct*, not monotonic. A floor inside `get_utc_ns()` would:
 
 - mask genuine model errors,
-- accumulate one-sided bias if the model is repeatedly wrong in one
-  direction,
+- accumulate one-sided bias if the model is repeatedly wrong in one direction,
 - break the `accuracy_ns ≤ precision_ns` guarantee of `ClockSnapshot`.
 
-The split into two APIs mirrors the model used by Google TrueTime, AWS
-ClockBound, and PTP.
+The split into two APIs mirrors the model used by Google TrueTime, AWS ClockBound, and PTP.
 
 ---
 
@@ -1089,8 +1336,8 @@ ClockBound, and PTP.
 | `t_ref_mono` | arithmetic over all samples of the round | neutral round center |
 | `inst.own_reference_offset` | **weighted 1/delay** over accepted servers | fast servers get more trust |
 | `consensus_offset` | **arithmetic over L² matrix cells** | balance time × ensemble |
-| `short_vote` | **median** of the last 15 observed | resistance to a single outlier |
-| `drift_slope` | **OLS** over 300 applied | true drift rate |
+| `short_vote` | **OLS** over the last 50 observed (MAD-trimmed) | sees drift, base = freshest point |
+| `drift_slope` | **OLS** over up to 750 applied | true drift rate |
 | instance `σ_avg` | mean of per-server σ(dev) | typical server noise |
 | `σ_consensus` | σ of first differences/√2 | robust consensus noise |
 | per-server `σ_s` | MAD of first differences | server noise without outliers |
@@ -1101,13 +1348,15 @@ ClockBound, and PTP.
 
 | Aspect | accept | reject |
 |---|---|---|
+| `short_vote` | OLS(50 observed) incl. current | OLS(50 observed) incl. rejected — **same source, both use `_recent_observed`** |
 | `applied_offsets` | updated | **untouched** |
 | `_recent_observed` | updated | updated (same) |
 | σ_consensus | plain | × (1/0.99)^streak |
 | anchor | `predicted + KP·phase_err` | `streak ≤ 1`: gate prediction; `streak ≥ 2`: `0.7·predicted + 0.3·raw` |
-| rate | sign-constancy + drift-confirm | sign-constancy only; reset-to-prior at streak ≥ 4 |
+| rate: reset-to-prior | — | only if `_rate_prior_active` is True |
 | drift persist to DB | yes | no |
-| force-apply | — | after 50 consecutive rejects |
+| force-apply | — | after 125 consecutive rejects |
+---
 
 
 
@@ -1144,12 +1393,12 @@ These are not differences in tuning, but in underlying approach.
 |---|---|---|
 | Method | **Direct linear regression** over the history of a source | **PI-PLL + sign-constancy + drift-confirmation + prior from DB** |
 | Output | Offset and rate estimated jointly | Offset and rate estimated separately; rate is a filtered integrator |
-| Convergence to a drift change | **Fast** (tens of samples) | **Slow** (hundreds of rounds, bounded to ±2 ppm around prior) |
+| Convergence to a drift change | **Fast** (tens of samples) | **Slow** (hundreds of rounds, bounded to ±1σ of the prior when active) |
 | Robustness | Moderate — regression is sensitive to clustered outliers | **High** — multi-layer protection |
 
 Chrony trusts the regression: if the slope shifts, the clock's rate has likely changed. This is fast and accurate in clean conditions.
 
-T.B.O.T does not trust any single source of truth about rate. It keeps the rate within a narrow corridor around the prior and admits changes only through three independent triggers. This is slower but more resistant to "phantom" drift changes caused by network noise.
+T.B.O.T does not trust any single source of truth about rate. It keeps the rate within a narrow corridor around the prior (when a prior is available) and admits changes only through three independent triggers. This is slower but more resistant to "phantom" drift changes caused by network noise.
 
 **Consequence:** Chrony performs better on rapid temperature/load changes. T.B.O.T performs better when drift is stable but the network is not.
 
@@ -1212,17 +1461,16 @@ T.B.O.T maintains `_colony_bias[srv]` — a separate integrator per server with 
 
 Chrony defends itself with an intersection algorithm and a median. T.B.O.T uses **four independent layers**:
 
-1. Instance threshold (±2.5–7 ms)
+1. Instance threshold (±2.0–2.5 ms)
 2. Post-gate (K·σ_consensus)
-3. Reject-streak reset of rate to prior
-4. Force-apply after 50 rejects
+3. Reject-streak reset of rate to prior (only when `_rate_prior_active` is True)
+4. Force-apply after 125 rejects
 
 The first layer is local, the second is global, the third stabilizes, the fourth guarantees no dead-lock. No comparable composition exists in mainstream NTP implementations.
 
 ### 2.3 Dead-lock guarantee
 
-`POST_GATE_FORCE_APPLY_AFTER = 50` — if the gate sticks, after 50 rounds the system **will** apply the consensus and rebuild the prediction. Chrony in a similar situation (prolonged noise) simply converges slowly; ntpd may enter a "panic threshold" and refuse to correct the clock.
-
+`POST_GATE_FORCE_APPLY_AFTER = 125` — if the gate sticks, after 125 rounds (~62 minutes at a 30-second interval) the system **will** apply the consensus and rebuild the prediction.
 The T.B.O.T behavior is explicit: "enough rejection, accept reality and rebuild."
 
 ### 2.4 Ergodic consensus matrix
@@ -1276,7 +1524,11 @@ Chrony supports NTP, PTP (hardware and software), and reference clocks (GPS, PPS
 
 ### 3.6 Adaptation to drift changes
 
-`RATE_CLAMP_FROM_PRIOR_PPM = 2.0` — a ±2 ppm window around the prior. If the actual drift changes (e.g. a laptop switching power profiles), Chrony catches up in minutes; T.B.O.T takes tens of minutes, or may not adapt at all if the new operating point lies outside the window.
+`RATE_CLAMP_SIGMA_K = 1.0` — clamp of rate to ±1σ of the prior. Active only when a prior is available (`_rate_prior_active = True`). 
+Without a prior, rate is unclamped and can reach the physical ±100 ppm limit; this preserves warmup progress but sacrifices short-term stability.
+
+For comparison, Chrony converges to a new drift operating point in a matter of minutes after the regression window has enough samples post-change.
+T.B.O.T relies on `drift_confirm` activating only after `DRIFT_WINDOW = 750` applied rounds; until then, sign-constancy is the only mechanism pulling rate, and it is bounded to the prior corridor (if present).
 
 ### 3.7 No source specialization
 
@@ -1341,3 +1593,25 @@ A task to "build a general-purpose replacement for Chrony" would not be winnable
 2. Formal accuracy guarantee for clock snapshots.
 3. Robust prior from a time series rather than a single value.
 4. Force-apply as a dead-lock protection mechanism.
+
+
+
+## Support the Project ☕
+
+If this project has saved you time or helped in your work, you can support its development using cryptocurrency:
+
+| Network / Token | Wallet Address |
+| :--- | :--- |
+| **💚 USDT (TRC-20)** | TCnh86qJvsmRdkKajafcFqzbvY2Eiqw4UE |
+| **🔷 EVM (ETH / BSC / Polygon)** | 0x650C779ABf16e2D697957E73f53F781cdBA49Ecc |
+| **₿ BTC** | bc1qwekqfc0epnmfkm4n4sfd3s6d4ku69pw5xphtg0 |
+
+*Please double-check the network before sending funds.*
+
+## Author
+
+Created and maintained by [sergson](https://github.com/sergson)
+
+## License
+
+GNU General Public License v3.0
