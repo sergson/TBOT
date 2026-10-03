@@ -864,10 +864,10 @@ class Consensus:
     def _instance_accept_rate(inst: AlgorithmInstance,
                               extra_accept: bool = False) -> Optional[float]:
         """
-        Accept rate по accept_window.
-        extra_accept=True — учесть текущий раунд как принятый.
-        Нужно потому, что обновление threshold происходит до
-        inst.accept_window.append(True).
+        Accept rate based on `accept_window`.
+        `extra_accept=True` — count the current round as accepted.
+        This is necessary because the threshold update occurs before
+        `inst.accept_window.append(True)`.
         """
         w = inst.accept_window
         n = len(w)
@@ -878,7 +878,6 @@ class Consensus:
         if extra_accept:
             accepted += 1
             if n >= ACCEPT_WINDOW_SIZE:
-                # append(True) вытеснит самый старый элемент
                 if w[0]:
                     accepted -= 1
                 n = ACCEPT_WINDOW_SIZE
@@ -2432,10 +2431,10 @@ class TimeSyncService:
             }
 
         # --- Diagnostics ---
-        # Which source drives drift_prediction extrapolation:
-        #   'short_vote' — drift_prediction ещё не готов, gate использует SV
-        #   'slope'      — n_app < DRIFT_WINDOW, экстраполяция по slope
-        #   'rate'       — n_app >= DRIFT_WINDOW, экстраполяция по self._rate
+        # Source driving drift_prediction extrapolation:
+        #   'short_vote' — drift_prediction not yet ready; gate uses SV
+        #   'slope'      — n_app < ​​DRIFT_WINDOW; extrapolation based on slope
+        #   'rate'       — n_app >= DRIFT_WINDOW; extrapolation based on self._rate
         with self._consensus._lock:
             n_app = len(self._consensus.applied_offsets)
 
@@ -4530,7 +4529,7 @@ def build_medium_telemetry_content():
     if precise_ns is None or sys_ns is None:
         return "Time sync not available (first sync pending)"
 
-    # ---- Извлечение полей (совпадает с полной телеметрией) ----
+    # ---- Field extraction (matches full telemetry) ----
     offset_ns         = telemetry.get('offset_ns')
     slew_error_ns     = telemetry.get('slew_error_ns')
     slew_errors_ns    = telemetry.get('slew_errors_ns') or []
@@ -4571,7 +4570,7 @@ def build_medium_telemetry_content():
     diff_threshold_str = (f"±{_fmt_ms(diff_threshold_ns)}"
                           if diff_threshold_ns is not None else "N/A")
 
-    # ---- Компактный рендер истории ----
+   # ---- Compact history render ----
     def render_history_compact(records, limit=HISTORY_MAX_LEN):
         if not records:
             return "      (empty)"
@@ -4579,7 +4578,7 @@ def build_medium_telemetry_content():
             "      " + _fmt_record_compact(rec) for rec in records[:limit]
         )
 
-    # ---- Dominant analysis (без изменений — уже компактен) ----
+    # ---- Dominant analysis ---
     def render_dominant_analysis(_inst, _current_tick):
         _hist = _inst.get('own_history') or []
         cur_fav = _inst.get('favorite')
@@ -4855,7 +4854,7 @@ def build_medium_telemetry_content():
         history_vote_str = "\n".join(lines)
 
 
-    # ---- Colony summary (компактный matrix_str) ----
+    # ---- Colony summary ----
     if not population:
         colony_str = "N/A"
     else:
@@ -5483,8 +5482,8 @@ def build_full_telemetry_content():
 
             def _cv_perc(rec):
                 """CV = 100 * stdev / mean.
-                sd может быть None при Size=2 (единственный интервал, stdev не считается).
-                Возвращает None — вызывающая сторона должна отобразить N/A.
+                sd may be None when Size=2 (a single interval; stdev is not calculated).
+                Returns None — the caller should display N/A.
                 """
                 mean, sd = rec.matrix_meta[1][0], rec.matrix_meta[1][1]
                 if not mean or sd is None:
