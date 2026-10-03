@@ -57,7 +57,6 @@ def _emit_deferred_logs(logs: List[Tuple[str, str]]) -> None:
 
 #Default NTP servers, similar to testing
 DEFAULT_NTP_SERVERS=[
-            'krgnss.krzem.ru',
             'ntp1.niiftri.irkutsk.ru',
             'time.google.com',
             'ntp3.vniiftri.ru',
