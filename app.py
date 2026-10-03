@@ -12,8 +12,6 @@ from core.database import DATA_DIR, cleanup_orphan_databases, update_bot_config
 import atexit
 import signal
 import logging
-import statistics
-from datetime import datetime, timezone
 
 from core import (
     load_modules, init_config_db, add_bot, get_all_bots, get_bot_config,
@@ -22,7 +20,8 @@ from core import (
 )
 
 from core.logger import LOGGER_OBJS, LOGGER_LEVELS, LOG_RETENTION_DAYS_DEFAULT
-from core.time_sync import (time_sync_service, build_short_telemetry_content, build_full_telemetry_content,
+from core.time_sync import (time_sync_service, build_short_telemetry_content,
+                            build_medium_telemetry_content, build_full_telemetry_content,
                             DEFAULT_INITIAL_INTERVAL_SEC, KEEP_AWAKE_REFRESH_SEC)
 
 class SettingsStorage:
@@ -367,7 +366,7 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
         new_logs = logs_clicks
 
     elif triggered_id == 'time-btn':
-        phase = time_clicks % 3  # ← was % 2
+        phase = time_clicks % 4
         if phase == 1:
             # First click → short
             time_style = {'display': 'block'}
@@ -377,6 +376,14 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
             time_content = build_short_telemetry_content()
             time_mode = 'short'
         elif phase == 2:
+            # Second click → medium
+            time_style = {'display': 'block'}
+            new_add = 0
+            new_settings = 0
+            new_logs = 0
+            time_content = build_medium_telemetry_content()
+            time_mode = 'medium'
+        elif phase == 3:
             # Second click → full
             time_style = {'display': 'block'}
             new_add = 0
@@ -790,6 +797,8 @@ def on_tick_1s(n, current_mood, logs_style, time_mode):
     time_out = no_update
     if time_mode == 'short':
         time_out = build_short_telemetry_content()
+    elif time_mode == 'medium':
+        time_out = build_medium_telemetry_content()
     elif time_mode == 'full':
         time_out = build_full_telemetry_content()
 
