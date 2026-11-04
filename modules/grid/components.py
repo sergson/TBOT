@@ -6,13 +6,17 @@
 
 import json
 import os
+import concurrent.futures
 import pandas as pd
 import plotly.graph_objects as go
 import asyncio
-from dash import dcc, html, dash_table, Output, Input, State, MATCH, ALL, no_update, callback_context
+from dash import dcc, html, Output, Input, State, MATCH, ALL, no_update, callback_context
 from core import auto_reg, colors, styles, graphics
+from core import styles as ui_compact
+from core.styles import input_field, dropdown_field
 from core.database import get_all_bots, get_bot_config, DBSQLite3
 from core.logger import perf_logger
+import time
 
 logger = perf_logger.get_logger("grid_bot_ui", "analytics")
 
@@ -49,12 +53,12 @@ def prepare_config_for_save(raw_config: dict) -> dict:
         cleaned['use_analyst_close'] = 1 if (isinstance(val, list) and 1 in val) else 0
     numeric_fields = ['leverage', 'max_averaging_count', 'smart_averaging_count',
                       'poll_interval_sec', 'execution_timeout_sec', 'execution_reserve_sec']
+    numeric_fields.extend(['history_days', 'history_positions_limit'])
     for f in numeric_fields:
         if f in cleaned and cleaned[f] is not None:
             cleaned[f] = int(cleaned[f])
-    if 'smart_averaging_count' in cleaned and 'max_averaging_count' in cleaned:
-        if cleaned['smart_averaging_count'] > cleaned['max_averaging_count']:
-            cleaned['smart_averaging_count'] = cleaned['max_averaging_count']
+    if cleaned.get('smart_averaging_count') > cleaned.get('max_averaging_count'):
+        cleaned['smart_averaging_count'] = cleaned['max_averaging_count']
     float_fields = {
         'averaging_threshold_pnl': 20.0,
         'breakeven_pnl': 4.0,
@@ -66,18 +70,39 @@ def prepare_config_for_save(raw_config: dict) -> dict:
             cleaned[f] = default
         else:
             cleaned[f] = float(cleaned[f])
-
-    if cleaned.get('smart_averaging_count') > cleaned.get('max_averaging_count'):
-        cleaned['smart_averaging_count'] = cleaned['max_averaging_count']
+    try:
+        cleaned['history_days'] = max(1, min(365,
+                                             int(cleaned.get('history_days') or 7)))
+    except (TypeError, ValueError):
+        cleaned['history_days'] = 7
+    try:
+        cleaned['history_positions_limit'] = max(10, min(1000,
+                                                         int(cleaned.get('history_positions_limit') or 100)))
+    except (TypeError, ValueError):
+        cleaned['history_positions_limit'] = 100
 
     if 'execution_reserve_ratio' in cleaned:
         ratio = float(cleaned.pop('execution_reserve_ratio'))
         timeout = int(cleaned.get('execution_timeout_sec', 0))
         if timeout > 0:
-            # округление до целых секунд
+            # rounding to the nearest second
             cleaned['execution_reserve_sec'] = int(timeout * ratio)
         else:
             cleaned['execution_reserve_sec'] = 0
+
+    #Nnormalization of exchange_provider.
+    provider = cleaned.get('exchange_provider', 'ccxt')
+    if provider not in ('ccxt', 'tbotex'):
+        provider = 'ccxt'
+    cleaned['exchange_provider'] = provider
+
+    # Dust-threshold. Clamp to [0.001, 0.1] — a safeguard against typos
+	# (0.5, or 50%, would cause actual partial closes to "collapse").
+    try:
+        v = float(cleaned.get('close_dust_fraction') or 0.02)
+    except (TypeError, ValueError):
+        v = 0.01
+    cleaned['close_dust_fraction'] = max(0.001, min(0.1, v))
 
     cleaned.pop('bot_type', None)
     return cleaned
@@ -99,11 +124,11 @@ def form_component(current_bot_id=None):
     collector_bot_id = None
     collector_table = None
     analyst_bot_id = None
-    use_analyst_close = 1
+    use_analyst_close = 0
     leverage = 10
     averaging_strategy = "sum_prev"
-    averaging_threshold_pnl = 20
-    max_averaging_count = 7
+    averaging_threshold_pnl = 70
+    max_averaging_count = 3
     smart_averaging_count = 2
     breakeven_pnl = 4.0
     close_pnl = 50.0
@@ -111,8 +136,8 @@ def form_component(current_bot_id=None):
     poll_interval_sec = 30
     execution_timeout_sec = 0
     recalc_strategy = "recalc_grid"
-    execution_reserve_sec = 30
-    execution_reserve_ratio = 0.1
+    execution_reserve_ratio = 1 / 3
+    close_dust_fraction = 0.02
 
     editing = current_bot_id is not None
     cfg = {}
@@ -137,11 +162,13 @@ def form_component(current_bot_id=None):
             execution_reserve_sec = cfg.get('execution_reserve_sec', 0)
             if execution_timeout_sec > 0:
                 ratio = execution_reserve_sec / execution_timeout_sec
-                # выбрать ближайшую допустимую долю
+                #select the nearest permissible share
                 available_ratios = [0.1, 1 / 7, 1 / 3, 0.5]
                 execution_reserve_ratio = min(available_ratios, key=lambda x: abs(x - ratio))
             else:
-                execution_reserve_ratio = 0.1
+                execution_reserve_ratio = 1 / 3
+            close_dust_fraction = float(
+                cfg.get('close_dust_fraction', close_dust_fraction) or 0.01)
 
     if editing:
         liquidation_order_type = cfg.get('liquidation_order_type', 'market')
@@ -149,96 +176,165 @@ def form_component(current_bot_id=None):
         liquidation_order_type = 'market'
 
     return html.Div([
-        html.Label("Collector Bot"),
-        dcc.Dropdown(
-            id={"type": "grid-field", "field": "collector_bot_id"},
+        dropdown_field(
+            {"type": "grid-field", "field": "collector_bot_id"},
+            "Collector Bot",
             options=collector_options,
             value=collector_bot_id,
-            placeholder="Select collector",
-            disabled=editing
+            disabled=editing,
+            inline=True,
         ),
-        html.Label("Collector Table Name (optional)"),
-        dcc.Dropdown(
-            id={"type": "grid-field", "field": "collector_table"},
+        dropdown_field(
+            {"type": "grid-field", "field": "collector_table"},
+            "Collector Table Name (optional)",
             options=[],
             value=collector_table,
-            placeholder="Auto-select first table",
+            inline=True,
         ),
-        html.Label("Analyst Bot (optional)"),
-        dcc.Dropdown(
-            id={"type": "grid-field", "field": "analyst_bot_id"},
+        dropdown_field(
+            {"type": "grid-field", "field": "analyst_bot_id"},
+            "Analyst Bot (optional)",
             options=analyst_options,
             value=analyst_bot_id,
-            placeholder="Select analyst",
-            disabled=editing
+            disabled=editing,
+            inline=True,
         ),
-        html.Label("Use analyst signal for closing"),
-        dcc.RadioItems(
-            id={"type": "grid-field", "field": "use_analyst_close"},
-            options=[{"label": "Yes", "value": 1}, {"label": "No", "value": 0}],
-            value=use_analyst_close
+        html.Div([
+            html.Label("Use analyst signal for closing",
+                       style=ui_compact.LABEL_INLINE_STYLE),
+            dcc.RadioItems(
+                id={"type": "grid-field", "field": "use_analyst_close"},
+                options=[{"label": "Yes", "value": 1}, {"label": "No", "value": 0}],
+                value=use_analyst_close,
+            ),
+        ], style=ui_compact.FIELD_ROW_INLINE_STYLE),
+        input_field(
+            {"type": "grid-field", "field": "leverage"},
+            "Leverage",
+            type="number", min=1, max=500, value=leverage,inline=True
         ),
-        html.Label("Leverage"),
-        dcc.Input(id={"type": "grid-field", "field": "leverage"}, type="number", min=1, max=500, value=leverage),
-        html.Label("Averaging Strategy"),
-        dcc.Dropdown(
-            id={"type": "grid-field", "field": "averaging_strategy"},
+        dropdown_field(
+            {"type": "grid-field", "field": "averaging_strategy"},
+            "Averaging Strategy",
             options=[
                 {"label": "Equal volumes [1,1,1,...]", "value": "equal"},
                 {"label": "Sum previous [1,2,4,8,16,32,...]", "value": "sum_prev"},
                 {"label": "Double [2,4,8,16,32,64...]", "value": "double"},
                 {"label": "Triple [1,3,9,27,81,...]", "value": "triple"},
             ],
-            value=averaging_strategy,
+            value=averaging_strategy, inline=True,
         ),
-        html.Label("Averaging Threshold PNL (%)"),
-        dcc.Input(id={"type": "grid-field", "field": "averaging_threshold_pnl"}, type="number", value=averaging_threshold_pnl, min=1, max=90, step=1),
-        html.Label("Max Averaging Count"),
-        dcc.Input(id={"type": "grid-field", "field": "max_averaging_count"}, type="number", value=max_averaging_count, min=1, max=50000),
-        html.Label("Smart Averaging Count"),
-        dcc.Input(id={"type": "grid-field", "field": "smart_averaging_count"}, type="number", value=smart_averaging_count, min=0, max=50000),
-        html.Label("PNL at which price stop-loss stops moving into loss (Break‑even PNL %)"),
-        dcc.Input(id={"type": "grid-field", "field": "breakeven_pnl"}, type="number", value=breakeven_pnl, min=0, step=0.01),
-        html.Label("Target close PNL (must be ≥ Break‑even) %"),
-        dcc.Input(id={"type": "grid-field", "field": "close_pnl"}, type="number", value=close_pnl, min=0.01, step=0.01),
-        html.Label("Liquidation PNL (%)"),
-        dcc.Input(id={"type": "grid-field", "field": "liquidation_pnl"}, type="number", value=liquidation_pnl, min=1, step=1),
-        html.Label("Liquidation Order Type"),
-        dcc.Dropdown(
-            id={"type": "grid-field", "field": "liquidation_order_type"},
+        input_field(
+            {"type": "grid-field", "field": "averaging_threshold_pnl"},
+            "Averaging Threshold PNL (%)",
+            type="number", value=averaging_threshold_pnl, min=1, max=95, step=1, inline=True
+        ),
+        input_field(
+            {"type": "grid-field", "field": "max_averaging_count"},
+            "Max Averaging Count",
+            type="number", value=max_averaging_count, min=1, max=500, inline=True
+        ),
+        input_field(
+            {"type": "grid-field", "field": "smart_averaging_count"},
+            "Smart Averaging Count",
+            type="number", value=smart_averaging_count, min=0, max=500, inline=True
+        ),
+        input_field(
+            {"type": "grid-field", "field": "breakeven_pnl"},
+            "PNL at which price stop-loss stops moving into loss (Break‑even PNL %)",
+            type="number", value=breakeven_pnl, min=0, step=0.01, inline=True
+        ),
+        input_field(
+            {"type": "grid-field", "field": "close_pnl"},
+            "Target close PNL (must be ≥ Break‑even) %",
+            type="number", value=close_pnl, min=0.01, step=0.01, inline=True
+        ),
+        input_field(
+            {"type": "grid-field", "field": "liquidation_pnl"},
+            "Liquidation PNL (%)",
+            type="number", value=liquidation_pnl, min=1, step=1, inline=True
+        ),
+        dropdown_field(
+            {"type": "grid-field", "field": "liquidation_order_type"},
+            "Liquidation Order Type",
             options=[
                 {"label": "Market", "value": "market"},
                 {"label": "Limit", "value": "limit"},
             ],
-            value=liquidation_order_type,
+            value=liquidation_order_type, inline=True,
         ),
-        html.Label("Interval between checks of signal generation conditions, main cycle pause (seconds)"),
-        dcc.Input(id={"type": "grid-field", "field": "poll_interval_sec"}, type="number", value=poll_interval_sec, min=10, max=3600),
-        html.Label("Signal lifetime; after this time unexecuted signal triggers recalculation strategy (seconds)"),
-        dcc.Input(id={"type": "grid-field", "field": "execution_timeout_sec"}, type="number", value=execution_timeout_sec, min=0, max=3600),
-        html.Label("Signal Recalc Strategy"),
-        dcc.Dropdown(
-            id={"type": "grid-field", "field": "recalc_strategy"},
+        dropdown_field(
+            {"type": "grid-field", "field": "close_dust_fraction"},
+            "Close dust threshold (fraction of position size)",
+            options=[
+                {"label": "Small (0.5%) — strict",        "value": 0.005},
+                {"label": "Default (1%) — recommended",   "value": 0.01},
+                {"label": "Medium (2%) — high precision", "value": 0.02},
+                {"label": "Large (5%) — exotic pairs",    "value": 0.05},
+            ],
+            value=close_dust_fraction,
+            clearable=False, inline=True,
+            help_text=("Any remaining position smaller than this fraction "
+						"of the target closing size is considered an artifact "
+						"of rounding precision and is collapsed to zero. "
+						"Increase this value only if you observe a phantom residual."),
+        ),
+        input_field(
+            {"type": "grid-field", "field": "poll_interval_sec"},
+            "Interval between checks of signal generation conditions, main cycle pause (seconds)",
+            type="number", value=poll_interval_sec, min=10, max=3600, inline=True
+        ),
+        input_field(
+            {"type": "grid-field", "field": "execution_timeout_sec"},
+            "Signal lifetime; after this time unexecuted signal triggers recalculation strategy (seconds)",
+            type="number", value=execution_timeout_sec, min=0, max=3600, inline=True
+        ),
+        dropdown_field(
+            {"type": "grid-field", "field": "recalc_strategy"},
+            "Signal Recalc Strategy",
             options=[
                 {"label": "No recalc", "value": "none"},
                 {"label": "Recalc grid", "value": "recalc_grid"},
                 {"label": "Market order nearest", "value": "market_order"},
             ],
-            value=recalc_strategy,
+            value=recalc_strategy, inline=True,
         ),
-        html.Label("Anticipation ratio (fraction of execution_timeout_sec)"),
-        dcc.Dropdown(
-            id={"type": "grid-field", "field": "execution_reserve_ratio"},
+        input_field(
+            {"type": "grid-field", "field": "history_days"},
+            "History window (days, history chart)",
+            type="number", value=cfg.get('history_days', 7) if editing else 7,
+            min=1, max=365, inline=True,
+            help_text="History chart shows deals within this window. "
+                      "1–365 days; default 7.",
+        ),
+        input_field(
+            {"type": "grid-field", "field": "history_positions_limit"},
+            "Max positions shown in deals table",
+            type="number",
+            value=cfg.get('history_positions_limit', 100) if editing else 100,
+            min=10, max=1000, inline=True,
+            help_text="Limits how many past positions are visible in "
+                      "manage_deals table; 10–1000, default 100.",
+        ),
+        dropdown_field(
+            {"type": "grid-field", "field": "execution_reserve_ratio"},
+            "Signal look-ahead window (how early grid creates signals)",
             options=[
-                {"label": "1/10", "value": 1 / 10},
-                {"label": "1/7", "value": 1 / 7},
-                {"label": "1/3", "value": 1 / 3},
-                {"label": "1/2", "value": 1 / 2},
+                {"label": "Small (1/10 of timeout) — only very fast moves", "value": 1 / 10},
+                {"label": "Medium (1/7) — balanced", "value": 1 / 7},
+                {"label": "Large (1/3) — eager, may create false signals", "value": 1 / 3},
+                {"label": "Very large (1/2) — aggressive", "value": 1 / 2},
             ],
             value=execution_reserve_ratio,
-            clearable=False,
+            clearable=False, inline=True,
         ),
-    ])
+        html.Div(
+            "Grid extrapolates price up to this fraction of execution_timeout_sec ahead "
+            "and creates signals early, so the execution bot has time to place the order "
+            "before price reaches the level. Bigger = earlier signals, more false positives.",
+            style=ui_compact.HELP_STYLE,
+        ),
+    ], style=ui_compact.STYLE_FORM)
 
 # ----------------------------------------------------------------------
 # Build position charts
@@ -248,6 +344,7 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict) -> go.Figure:
     fig = go.Figure()
     price_df = pd.DataFrame()
     y_values = []
+    start_ts = None
 
     # Valid timestamp threshold (nanoseconds, approx year 2001)
     min_valid_ts = 1_000_000_000_000_000  # 1e15
@@ -256,14 +353,21 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict) -> go.Figure:
     try:
         # Get price history
         price_manager = env['price.history']
-        price_recs = price_manager.search([], order='timestamp ASC')
+        candles_limit = int(config.get('candles_limit', 2000) or 2000)
+        price_recs = price_manager.search(
+            [], order='timestamp DESC', limit=candles_limit)  # DESC
         if price_recs:
             data = price_recs.read()
             price_df = pd.DataFrame(data)
             if not price_df.empty:
-                price_df = price_df[price_df['timestamp'] >= min_valid_ts].copy()
+                price_df = price_df.sort_values('timestamp') \
+                    .reset_index(drop=True)  # ASC
+                price_df = price_df[
+                    price_df['timestamp'] >= min_valid_ts
+                    ].copy()
                 if not price_df.empty:
-                    price_df['datetime'] = pd.to_datetime(price_df['timestamp'], unit='ns', utc=True)
+                    price_df['datetime'] = pd.to_datetime(
+                        price_df['timestamp'], unit='ns', utc=True)
                     fig.add_trace(graphics.price_line(
                         price_df['datetime'], price_df['high'],
                         'Price high',
@@ -288,16 +392,18 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict) -> go.Figure:
 
         levels_manager = env['levels.signals']
 
-        # Position direction from entry
-        entry_recs = levels_manager.search([
-            ('position_id', '=', pos_id),
-            ('signal_number', '=', 0)
-        ], limit=1)
-        if not entry_recs:
+        # ONE search — filter in memory (was 6 separate search)
+        all_levels = levels_manager.search([('position_id', '=', pos_id)])
+        if not all_levels:
             return fig
-        entry_rec = entry_recs[0]
-        sign = 1 if entry_rec.signal_direction == 'buy' else -1
-        entry_ts = entry_rec.signal_timestamp
+        levels_rows = all_levels.read()
+
+        entry_rows = [r for r in levels_rows if r['signal_number'] == 0]
+        if not entry_rows:
+            return fig
+        entry_rec = entry_rows[0]
+        sign = 1 if entry_rec['signal_direction'] == 'buy' else -1
+        entry_ts = entry_rec['signal_timestamp']
 
         # Determine starting point (10 candles before entry)
         start_ts = None
@@ -309,55 +415,52 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict) -> go.Figure:
         x_min = price_df['datetime'].min() if not price_df.empty else None
         x_max = price_df['datetime'].max() if not price_df.empty else None
 
-        # Liquidation
-        liq_recs = levels_manager.search([
-            ('position_id', '=', pos_id),
-            ('signal_number', '=', -1)
-        ], order='id ASC', limit=1)
-        if liq_recs and x_min is not None:
-            liq_price = liq_recs[0].signal_price
+        # Liquidation (in-memory filter)
+        liq_rows = [r for r in levels_rows if r['signal_number'] == -1]
+        liq_rows.sort(key=lambda r: r['id'])
+        if liq_rows and x_min is not None:
+            liq_price = liq_rows[0]['signal_price']
             if liq_price is not None:
                 y_values.append(liq_price)
                 fig.add_trace(graphics.hline(
                     x_min, x_max, liq_price,
                     f'Liquidation: {liq_price:.2f}',
-                    colors.RED, width=2, dash='solid'
-                ))
+                    colors.RED, width=2, dash='solid'))
 
-        # Last executed trade (as in old code)
-        real_records = levels_manager.search([
-            ('position_id', '=', pos_id),
-            ('real_flag', '=', True)
-        ], order='id DESC')
+        # Real executions — ONE pass (merged real_records  real_exec_recs)
+        real_rows = [r for r in levels_rows if r['real_flag']]
+        real_rows.sort(key=lambda r: r['id'], reverse=True)
         last_real = None
-        for rec in real_records:
-            vol = rec.real_position_volume if rec.real_position_volume is not None else rec.signal_position_volume
+        for rec in real_rows:
+            vol = rec.get('real_position_volume')
+            if vol is None:
+                vol = rec.get('signal_position_volume')
             if vol is None or vol > 0:
                 last_real = rec
                 break
 
         if last_real and x_min is not None:
-            effective_avg = last_real.real_avg_entry_price if last_real.real_avg_entry_price is not None else last_real.avg_entry_price
+            effective_avg = (last_real.get('real_avg_entry_price')
+                             if last_real.get('real_avg_entry_price')
+                             is not None
+                             else last_real.get('avg_entry_price'))
             if effective_avg is not None and effective_avg > 0:
                 leverage = config.get('leverage', 1) or 1
                 breakeven_pnl = config.get('breakeven_pnl', 0) or 0
                 close_pnl = config.get('close_pnl', 0) or 0
-
-                be_price = effective_avg * (1 + sign * breakeven_pnl / 100.0 / leverage)
-                close_price = effective_avg * (1 + sign * close_pnl / 100.0 / leverage)
-
+                be_price = effective_avg * (
+                    1 + sign * breakeven_pnl / 100.0 / leverage)
+                close_price = effective_avg * (
+                    1 + sign * close_pnl / 100.0 / leverage)
                 y_values.extend([be_price, close_price])
-
                 fig.add_trace(graphics.hline(
                     x_min, x_max, be_price,
                     f'Break-even: {be_price:.2f}',
-                    colors.GREEN, width=1, dash='dash'
-                ))
+                    colors.GREEN, width=1, dash='dash'))
                 fig.add_trace(graphics.hline(
                     x_min, x_max, close_price,
                     f'Close PNL: {close_price:.2f}',
-                    colors.GREEN, width=2, dash='solid'
-                ))
+                    colors.GREEN, width=2, dash='solid'))
 
         # Averaging levels (unexecuted, signal_flag=0)
         level_recs = levels_manager.search([
@@ -369,8 +472,6 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict) -> go.Figure:
             level_prices = [r.signal_price for r in level_recs if r.signal_price is not None]
             if level_prices:
                 y_values.extend(level_prices)
-                min_lev = min(level_prices)
-                max_lev = max(level_prices)
                 first = True
                 for price in level_prices:
                     trace = graphics.hline(
@@ -486,12 +587,14 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict) -> go.Figure:
         env.close()
 
     # Apply saved relayout
-    stored = relayout_store.get(str(bot_id))
-    if stored:
+    stored = relayout_store.get(f"{bot_id}:grid-graph")
+    if stored and isinstance(stored, dict):
         try:
-            fig.update_layout(stored)
+            normalized = graphics.normalize_dash_relayout(stored)
+            if normalized:
+                fig.update_layout(normalized)
         except Exception as e:
-            logger.warning(f"Failed to apply relayout: {e}")
+            logger.warning(f"Failed to apply relayout: {e}; stored={stored!r}")
 
     # X range
     start_dt = None
@@ -523,14 +626,11 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict) -> go.Figure:
 
     graphics.apply_layout(
         fig,
-        title=f"Grid Bot {bot_id}",
         uirevision='grid',
-        show_rangeslider=False,
         hovermode='x unified',
         xaxis_range=[start_dt, end_dt] if start_dt is not None and end_dt is not None else None,
         yaxis_range=yaxis_range,
-        legend_bordercolor=colors.BLACK,
-        title_font_size=styles.FONT_SIZE_BOTHEADER
+        compact=True,
     )
     return fig
 
@@ -546,16 +646,28 @@ def build_history_figure(bot_id: int, config: dict, relayout_store: dict) -> go.
     x_min_range = None
     x_max_range = None
 
+    history_days = int(config.get('history_days', 7) or 7)
+    now_ns = int(time.time() * 1e9)
+    cutoff_ns = now_ns - history_days * 86400 * 1_000_000_000
+
     try:
         # Price history
         price_manager = env['price.history']
-        recs = price_manager.search([], order='timestamp ASC')
+        candles_limit = int(config.get('candles_limit', 2000) or 2000)
+        recs = price_manager.search(
+            [('timestamp', '>=', cutoff_ns)],
+            order='timestamp DESC', limit=candles_limit)  # DESC
         if recs:
             df_price = pd.DataFrame(recs.read())
             if not df_price.empty:
-                df_price = df_price[df_price['timestamp'] >= min_valid_ts].copy()
-                if not df_price.empty:
-                    df_price['datetime'] = pd.to_datetime(df_price['timestamp'], unit='ns', utc=True)
+                df_price = df_price.sort_values('timestamp') \
+                    .reset_index(drop=True)  # ASC
+                df_price = df_price[
+                    df_price['timestamp'] >= min_valid_ts
+                    ].copy()
+                if not df_price.empty:  # ← guard
+                    df_price['datetime'] = pd.to_datetime(
+                        df_price['timestamp'], unit='ns', utc=True)
                     fig.add_trace(graphics.price_line(
                         df_price['datetime'], df_price['high'],
                         'Price high',
@@ -571,7 +683,7 @@ def build_history_figure(bot_id: int, config: dict, relayout_store: dict) -> go.
 
         # Deals history
         deals_manager = env['deals.history']
-        deals = deals_manager.search([], order='history_id DESC')
+        deals = deals_manager.search([('signal_timestamp', '>=', cutoff_ns)],order='history_id DESC')
         if deals:
             df = pd.DataFrame(deals.read())
             df = df[df['signal_timestamp'] >= min_valid_ts].copy()
@@ -695,15 +807,76 @@ def build_history_figure(bot_id: int, config: dict, relayout_store: dict) -> go.
 
     graphics.apply_layout(
         fig,
-        title="Historical Deals",
         uirevision='grid_history',
         hovermode=None,
         xaxis_range=[x_min_range, x_max_range] if x_min_range is not None and x_max_range is not None else None,
-        legend_bordercolor=None,
-        title_font_size=styles.FONT_SIZE_BOTHEADER
+        compact=True,
     )
 
+    stored = relayout_store.get(f"{bot_id}:grid-graph")
+    if stored and isinstance(stored, dict):
+        try:
+            normalized = graphics.normalize_dash_relayout(stored)
+            if normalized:
+                fig.update_layout(normalized)
+        except Exception as e:
+            logger.warning(f"Failed to apply relayout: {e}; stored={stored!r}")
+
     return fig
+
+# ----------------------------------------------------------------------
+# F-grid.9.2: position consistency indicator
+# ----------------------------------------------------------------------
+def _render_position_consistency(bot_id):
+    """Show expected vs real position volume."""
+    db_path = f"data/bot_{bot_id}.db"
+    try:
+        env = DBSQLite3(db_path)
+    except Exception:
+        return None
+    try:
+        settings = env['bot.settings'].search(
+            [('key', '=', 'current_position_id')], limit=1)
+        if not settings:
+            return None
+        pos_id = settings[0].value.strip("'\"")
+        rows = env['levels.signals'].search([
+            ('position_id', '=', pos_id),
+            ('real_flag', '=', True),
+        ])
+        total_in = sum(float(r.real_vol_rate or 0)
+                       for r in rows if (r.signal_number or 0) >= 0)
+        total_out = sum(float(r.real_vol_rate or 0)
+                        for r in rows if (r.signal_number or 0) < 0)
+        current_vol = max(0.0, total_in - total_out)
+
+        # Order based on the actual 'fill' event, rather than the order in which the rows were created —
+		# otherwise, a partial-close with a lower ID would show a "false" mismatch.
+        executed = env['levels.signals'].search([
+            ('position_id', '=', pos_id),
+            ('real_flag', '=', True),
+            ('real_position_volume', '>', 0),
+        ], order='real_timestamp DESC', limit=1)
+        if not executed:
+            return None
+        expected_vol = float(executed[0].real_position_volume or 0)
+        if abs(expected_vol - current_vol) < 1e-9:
+            return None
+        return html.Div([
+            html.Span("⚠ Position volume mismatch: ",
+                      style={'fontWeight': 'bold', 'color': colors.DARK_RED}),
+            html.Span(f"expected={expected_vol:.8f}, "
+                      f"current={current_vol:.8f}",
+                      style={'fontSize': 'small'}),
+        ], style={'fontSize': '11px', 'marginTop': '2px'})
+    except Exception as e:
+        logger.debug(f"position consistency {bot_id}: {e}")
+        return None
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
 
 # ----------------------------------------------------------------------
 # Render bot block in UI
@@ -714,40 +887,54 @@ def render_grid_block(bot_id: int, config: dict, relayout_store: dict):
     status_btn_id = {"type": "status-btn", "index": bot_id}
     delete_btn_id = {"type": "delete", "index": bot_id}
     close_btn_id = {"type": "grid-close-btn", "index": bot_id}
+    force_reset_btn_id = {"type": "grid-force-reset-btn", "index": bot_id}
     edit_btn_id = {"type": "edit-btn", "index": bot_id}
 
     fig = build_figure(bot_id, config, relayout_store)
     hist_fig = build_history_figure(bot_id, config, relayout_store)
 
     graph = dcc.Graph(id=graph_id, figure=fig, config={"scrollZoom": True, "displayModeBar": True},
-                      style={"height": "450px"})
+                      style={"height": "300px", "marginTop": styles.MARGIN_ZERO})
     history_graph = dcc.Graph(id=history_graph_id, figure=hist_fig,
                               config={"scrollZoom": True, "displayModeBar": True},
-                              style={"height": "400px", "marginTop": styles.MARGIN_NORMAL})
+                              style={"height": "300px", "marginTop": styles.MARGIN_ZERO})
 
     prev_btn = html.Button("◀ Prev", id={'type': 'deals-prev-btn', 'index': bot_id},
-                           disabled=True, style={'marginRight': styles.MARGIN_NORMAL})
+                           disabled=True, style={'marginRight': '4px'})
     next_btn = html.Button("Next ▶", id={'type': 'deals-next-btn', 'index': bot_id},
-                           disabled=True, style={'marginLeft': styles.MARGIN_NORMAL})
+                           disabled=True, style={'marginLeft': '4px'})
     pos_indicator = html.Span("Position 0/0", id={'type': 'deals-pos-indicator', 'index': bot_id})
     nav_bar = html.Div([prev_btn, pos_indicator, next_btn],
-                       style={'marginBottom': styles.MARGIN_NORMAL, 'display': 'flex', 'alignItems': 'center'})
+                       style={'marginBottom': '0', 'display': 'flex',
+                              'alignItems': 'center'})
 
     deals_container = html.Div(id={'type': 'deals-container', 'index': bot_id})
     pos_store = dcc.Store(id={'type': 'deals-pos-store', 'index': bot_id}, data={'position_id': None})
 
-    settings_preview = html.Div([
-        html.P(f"Collector: {config.get('collector_bot_id')} (table: {config.get('collector_table', 'auto')})"),
-        html.P(f"Analyst: {config.get('analyst_bot_id')} | Use for close: {bool(config.get('use_analyst_close',1))}"),
-        html.P(f"Leverage: {config.get('leverage')} | Strategy: {config.get('averaging_strategy')} | Threshold: {config.get('averaging_threshold_pnl')}% | Max avg: {config.get('max_averaging_count')} | Smart avg: {config.get('smart_averaging_count')}"),
-        html.P(f"Break-even: {config.get('breakeven_pnl')}% | Close: {config.get('close_pnl')}% | Liq: {config.get('liquidation_pnl')}%"),
-        html.P(f"Poll: {config.get('poll_interval_sec')}s | Timeout: {config.get('execution_timeout_sec')}s | Recalc: {config.get('recalc_strategy')} | Reserve: {config.get('execution_reserve_sec')}s"),
-    ], style={
-            "fontSize": "small",
-            "lineHeight": "1",
-            "padding": styles.PADDING_ZERO,
-            "backgroundColor": colors.LIGHT_BG
-            })
+    settings_preview = graphics.info_panel([
+        ("Collector",
+         f"{config.get('collector_bot_id')} "
+         f"(table: {config.get('collector_table', 'auto')})"),
+        ("Analyst",
+         f"{config.get('analyst_bot_id')} | "
+         f"Use for close: {bool(config.get('use_analyst_close', 0))}"),
+        ("Grid",
+         f"Leverage {config.get('leverage')} | "
+         f"Strategy {config.get('averaging_strategy')} | "
+         f"Threshold {config.get('averaging_threshold_pnl')}% | "
+         f"Max avg {config.get('max_averaging_count')} | "
+         f"Smart avg {config.get('smart_averaging_count')}"),
+        ("PNL",
+         f"Break-even {config.get('breakeven_pnl')}% | "
+         f"Close {config.get('close_pnl')}% | "
+         f"Liq {config.get('liquidation_pnl')}%"),
+        ("Loop",
+         f"Poll {config.get('poll_interval_sec')}s | "
+         f"Timeout {config.get('execution_timeout_sec')}s | "
+         f"Recalc {config.get('recalc_strategy')} | "
+         f"Reserve {config.get('execution_reserve_sec')}s"),
+        ("", _render_position_consistency(bot_id)),
+    ])
 
     title_text = f"#{bot_id} Grid Bot  ←  Collector Bot #{config.get('collector_bot_id')}"
 
@@ -763,17 +950,20 @@ def render_grid_block(bot_id: int, config: dict, relayout_store: dict):
                 html.Button("Stop" if config.get("status") == "running" else "Start",
                             id=status_btn_id, n_clicks=0),
                 html.Button("Close Position", id=close_btn_id, n_clicks=0,
-                            style={"marginLeft": styles.MARGIN_NORMAL, "backgroundColor": colors.LIGHT_RED}),
-                html.Button("Edit", id=edit_btn_id, n_clicks=0, style={"marginLeft": styles.MARGIN_NORMAL}),
-                html.Button("Delete", id=delete_btn_id, n_clicks=0, style={"marginLeft": styles.MARGIN_NORMAL}),
-            ], style={"marginBottom": styles.MARGIN_NORMAL}),
-            html.Hr(),
+                            style={"backgroundColor": colors.LIGHT_RED}),
+                html.Button("Force Reset", id=force_reset_btn_id, n_clicks=0,
+                            title="Discard current plan locally, no signal to execution",
+                            style={"backgroundColor": colors.LIGHT_GRAY}),
+                html.Button("Edit", id=edit_btn_id, n_clicks=0),
+                html.Button("Delete", id=delete_btn_id, n_clicks=0),
+            ], style=styles.STYLE_BUTTON_ROW),
+            html.Hr(style={"margin": "1px 0"}),
             graph,
             history_graph,
             nav_bar,
             deals_container,
             pos_store
-        ])
+        ], style=styles.STYLE_BOTCARD_BODY)
     ], open=True, style=styles.STYLE_BOTCARD)
 
 # ----------------------------------------------------------------------
@@ -833,6 +1023,10 @@ class GridTypeMeta:
         )
         def update_history_graph(n, graph_id, relayout_store):
             bot_id = graph_id['index']
+            bots = get_all_bots()
+            bot = next((b for b in bots if b['id'] == bot_id), None)
+            if not bot or bot['status'] != 'running':
+                return no_update
             config = get_bot_config(bot_id)
             if not config:
                 return no_update
@@ -876,6 +1070,60 @@ class GridTypeMeta:
             perf_logger.set_mood('happy')
             return no_update
 
+        # ------------------ Force Reset (local, no execution) -----------------
+        @app.callback(
+            Output('bots-trigger', 'data', allow_duplicate=True),
+            Input({'type': 'grid-force-reset-btn', 'index': ALL}, 'n_clicks'),
+            [State({'type': 'grid-force-reset-btn', 'index': ALL}, 'id'),
+             State('bots-trigger', 'data')],
+            prevent_initial_call=True
+        )
+        def force_reset_position(n_clicks_list, ids_list, trigger):
+            ctx = callback_context
+            if not ctx.triggered:
+                return no_update
+            triggered = ctx.triggered[0]
+            dict_str = triggered['prop_id'].split('.')[0]
+            btn_id = json.loads(dict_str)
+            bot_id = btn_id['index']
+
+            matched = False
+            for i, id_dict in enumerate(ids_list):
+                if (id_dict['index'] == bot_id and
+                        n_clicks_list[i] and n_clicks_list[i] > 0):
+                    matched = True
+                    try:
+                        if bot_id in bot_manager.bots:
+                            bot = bot_manager.bots[bot_id]
+                            if hasattr(bot, 'force_reset_position'):
+                                future = asyncio.run_coroutine_threadsafe(
+                                    bot.force_reset_position(), loop
+                                )
+                                try:
+                                    future.result(timeout=10)
+                                except concurrent.futures.TimeoutError:
+                                    logger.warning(
+                                        f"force_reset_position for bot "
+                                        f"{bot_id} timed out (>10s) — "
+                                        f"operation still running in "
+                                        f"background")
+                                except Exception as e:
+                                    logger.error(
+                                        f"Error in force_reset_position for "
+                                        f"bot {bot_id}: {e!r}",
+                                        exc_info=True)
+                    except Exception as e:
+                        logger.error(
+                            f"Force reset dispatch failed for bot "
+                            f"{bot_id}: {e!r}",
+                            exc_info=True,
+                        )
+                    break
+            if not matched:
+                return no_update
+            perf_logger.set_mood('happy')
+            return trigger + 1
+
         # ------------------ Deals table + navigation (single callback) -----------------
         @app.callback(
             Output({'type': 'deals-container', 'index': MATCH}, 'children'),
@@ -902,16 +1150,22 @@ class GridTypeMeta:
                 env = DBSQLite3(db_path)
                 try:
                     deals_manager = env['deals.history']
-                    all_records = deals_manager.search([], order='history_id DESC')
-                    if not all_records:
-                        return html.Div("No deals yet"), no_update, True, True, "No deals"
-                    df_all = pd.DataFrame(all_records.read())
-                    if 'moved_to_history_at' not in df_all.columns:
-                        positions = df_all['position_id'].unique().tolist()
-                    else:
-                        df_group = df_all.groupby('position_id')['moved_to_history_at'].max().reset_index()
-                        df_group = df_group.sort_values('moved_to_history_at', ascending=False)
-                        positions = df_group['position_id'].tolist()
+                    positions_limit = int(
+                        (get_bot_config(bot_id) or {}).get(
+                            'history_positions_limit', 100) or 100)
+                    try:
+                        rows = deals_manager.execute(
+                            "SELECT position_id, MAX(moved_to_history_at) AS ts "
+                            "FROM deals_history GROUP BY position_id "
+                            "ORDER BY ts DESC LIMIT ?",
+                            [positions_limit])
+                        positions = [r['position_id'] for r in rows]
+                    except Exception:
+                        # Fallback for tables without moved_to_history_at
+                        rows = deals_manager.execute(
+                            "SELECT DISTINCT position_id FROM deals_history "
+                            "LIMIT ?", [positions_limit])
+                        positions = [r['position_id'] for r in rows]
                 finally:
                     env.close()
 
@@ -946,7 +1200,9 @@ class GridTypeMeta:
                         df = pd.DataFrame(recs.read())
                         for col in ['signal_timestamp', 'real_timestamp']:
                             if col in df.columns:
-                                df[col] = pd.to_datetime(df[col], unit='ns', utc=True).dt.strftime('%Y-%m-%d %H:%M:%S')
+                                df[col] = pd.to_datetime(
+                                    df[col], unit='ns', utc=True
+                                ).dt.strftime('%Y-%m-%d %H:%M:%S')
                         columns = [
                             {"name": "History ID", "id": "history_id"},
                             {"name": "#", "id": "signal_number"},
@@ -962,11 +1218,13 @@ class GridTypeMeta:
                             {"name": "S Pos Vol", "id": "signal_position_volume"},
                             {"name": "R Pos Vol", "id": "real_position_volume"},
                         ]
-                        table = dash_table.DataTable(
-                            data=df.to_dict("records"), columns=columns,
-                            style_table={"overflowX": "auto"},
-                            style_cell={"textAlign": "center", "padding": "5px"},
-                            page_size=len(df),
+                        # Keep only the columns we actually display — df.to_dict
+                        # would otherwise include Json fields like
+                        # signal_volume_rates, which DataTable cannot render.
+                        display_ids = [c["id"] for c in columns if c["id"] in df.columns]
+                        df = df[display_ids]
+                        table = graphics.compact_table(
+                            df.to_dict("records"), columns,
                             style_data_conditional=[
                                 {
                                     "if": {"filter_query": "{signal_number} = -1 && {real_pnl} > 0"},
@@ -984,7 +1242,7 @@ class GridTypeMeta:
                                     "if": {"filter_query": "{signal_number} = -2 && {real_pnl} < 0"},
                                     "backgroundColor": colors.LIGHT_RED
                                 },
-                            ]
+                            ],
                         )
                     else:
                         table = html.Div("No data for this position")
@@ -996,7 +1254,8 @@ class GridTypeMeta:
                 indicator_text = f"Position {current_idx + 1} of {total}"
 
                 new_store_data = {'position_id': current_pos}
-                return html.Div([html.H4(f"Deals History – {current_pos}"), table]), new_store_data, \
+                return html.Div([html.H5(f"Deals History – {current_pos}",
+                    style={'margin': ui_compact.MARGIN_ZERO}), table]), new_store_data, \
                     prev_disabled, next_disabled, indicator_text
 
             except Exception as e:

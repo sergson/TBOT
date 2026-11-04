@@ -9,7 +9,8 @@ import json
 import os
 import time
 import threading
-from typing import Optional, List, Dict, Any, Union, Tuple
+from collections import defaultdict
+from typing import Optional, List, Dict, Any, Tuple, Type, cast
 from .logger import perf_logger
 
 logger = perf_logger.get_logger('database', 'database')
@@ -29,6 +30,8 @@ DRIFT_HISTORY_MAX = 100
 # Field classes
 # ----------------------------------------------------------------------
 class Field:
+    autoincrement = False
+
     def __init__(self, required=False, default=None, primary_key=False, unique=False, index=False, string=None):
         self.required = required
         self.default = default
@@ -103,7 +106,7 @@ class Json(Field):
 # ----------------------------------------------------------------------
 # Model registry and metaclass
 # ----------------------------------------------------------------------
-MODEL_REGISTRY: Dict[str, type] = {}
+MODEL_REGISTRY: Dict[str, Type["Model"]] = {}
 
 class ModelMeta(type):
     def __new__(mcls, name, bases, attrs):
@@ -112,7 +115,7 @@ class ModelMeta(type):
         _inherit = attrs.get('_inherit')
 
         # Collect field definitions from class attributes (and bases)
-        fields = {}
+        fields: Dict[str, Field] = {}
         for base in reversed(bases):
             base_fields = getattr(base, '_fields', {})
             fields.update(base_fields)
@@ -125,34 +128,43 @@ class ModelMeta(type):
                 base_model = MODEL_REGISTRY.get(_inherit)
                 if not base_model:
                     raise ValueError(f"Cannot inherit from unknown model '{_inherit}'")
-                base_model._fields.update(fields)
+                base_model.get_fields().update(fields)
                 logger.debug(f"Model extension applied to '{_inherit}' with fields: {list(fields.keys())}")
                 return base_model
             else:
                 if _name in MODEL_REGISTRY:
                     existing = MODEL_REGISTRY[_name]
-                    existing._fields.update(fields)
+                    existing.get_fields().update(fields)
                     logger.debug(f"Model '{_name}' extended with fields: {list(fields.keys())}")
                     return existing
 
-                cls._name = _name
-                cls._fields = fields
+                model_cls = cast("Type[Model]", cls)
+                model_cls._name = _name
+                model_cls._fields = fields
 
                 # NEW: do not auto-generate _table if the model is dynamic
                 if not getattr(cls, '_dynamic', False):
                     if not getattr(cls, '_table', None):
-                        cls._table = _name.replace('.', '_')
+                        model_cls._table = _name.replace('.', '_')
                 # else: keep _table as is (possibly None)
 
-                MODEL_REGISTRY[_name] = cls
+                MODEL_REGISTRY[_name] = model_cls
                 logger.debug(f"Registered model '{_name}' -> table '{cls._table}' with fields: {list(fields.keys())}")
         return cls
 
 class Model(metaclass=ModelMeta):
-    _name = None
-    _table = None
-    _fields = {}
+    _name: Optional[str] = None
+    _table: Optional[str] = None
+    _fields: Dict[str, Field] = {}
 
+    @classmethod
+    def get_fields(cls) -> Dict[str, "Field"]:
+        """Return a reference to the dict of fields (can be mutated)."""
+        return cls._fields
+
+    @classmethod
+    def get_table(cls) -> Optional[str]:
+        return cls._table
 # ----------------------------------------------------------------------
 # Domain parser
 # ----------------------------------------------------------------------
@@ -188,20 +200,20 @@ def _domain_to_sql(domain: list) -> Tuple[str, list]:
     def parse_expression(index):
         if index >= len(domain):
             raise ValueError("Unexpected end of domain")
-        token = domain[index]
-        if isinstance(token, str) and token in ('&', '|', '!'):
-            if token == '!':
-                cond, params, next_idx = parse_expression(index + 1)
-                return f"NOT ({cond})", params, next_idx
+        _token = domain[index]
+        if isinstance(_token, str) and _token in ('&', '|', '!'):
+            if _token == '!':
+                condition, parameters, next_idx = parse_expression(index + 1)
+                return f"NOT ({condition})", parameters, next_idx
             else:
                 left_cond, left_params, idx1 = parse_expression(index + 1)
                 right_cond, right_params, idx2 = parse_expression(idx1)
-                op = 'AND' if token == '&' else 'OR'
+                op = 'AND' if _token == '&' else 'OR'
                 return f"({left_cond} {op} {right_cond})", left_params + right_params, idx2
-        elif isinstance(token, (tuple, list)) and len(token) == 3:
-            return _parse_condition(token)[0], _parse_condition(token)[1], index + 1
+        elif isinstance(_token, (tuple, list)) and len(_token) == 3:
+            return _parse_condition(_token)[0], _parse_condition(_token)[1], index + 1
         else:
-            raise ValueError(f"Invalid domain element: {token}")
+            raise ValueError(f"Invalid domain element: {_token}")
 
     # Check for logical operators
     has_logical = any(isinstance(item, str) and item in ('&', '|', '!') for item in domain)
@@ -237,6 +249,8 @@ class Record:
         return self._data[key]
     def __setitem__(self, key, value):
         self._data[key] = value
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
     def write(self, vals):
         self._manager.write_records([self], vals)
     def unlink(self):
@@ -288,10 +302,10 @@ class ModelManager:
         self.env = env
         self.model_name = model_name
         self.model_class = model_class
-        self.table_name = table_name or model_class._table
+        self.table_name = table_name or model_class.get_table()
         if self.table_name is None:
             raise ValueError(f"Model '{model_name}' requires table_name")
-        self.fields = model_class._fields
+        self.fields = model_class.get_fields()
 
         # Determine primary key
         self.primary_key_field = None
@@ -400,48 +414,147 @@ class ModelManager:
             cur = self.env.conn.execute(f"SELECT COUNT(*) FROM {self.table_name} WHERE {cond}", params)
             return cur.fetchone()[0]
 
-    def browse(self, ids: Union[int, List[int]]) -> Recordset:
+    def browse(self, ids):
         if not isinstance(ids, (list, tuple)):
             ids = [ids]
         if not ids:
             return Recordset(self, [])
-        # Filter out None (e.g., if lastrowid is not supported)
         ids = [i for i in ids if i is not None]
         if not ids:
             return Recordset(self, [])
-        domain = [(self.primary_key_field, 'in', ids)]
-        return self.search(domain)
+        chunk_size = 500
+        all_records: List[Record] = []
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i:i + chunk_size]
+            rs = self.search([(self.primary_key_field, 'in', chunk)])
+            all_records.extend(rs._records)
+        by_id = {r[self.primary_key_field]: r for r in all_records}
+        ordered = [by_id[i] for i in ids if i in by_id]
+        return Recordset(self, ordered)
 
     def create(self, vals_list: List[dict]) -> Recordset:
         if not vals_list:
             return Recordset(self, [])
+
         complete_vals_list = []
         for vals in vals_list:
+            v = dict(vals)
             for field_name, field in self.fields.items():
-                if field_name not in vals and field.default is not None:
-                    vals[field_name] = field.default
-            complete_vals_list.append(vals)
-        created_ids = []
+                if field_name not in v and field.default is not None:
+                    v[field_name] = field.default
+            complete_vals_list.append(v)
+
+        groups: Dict[frozenset, List[dict]] = defaultdict(list)
+        for vals in complete_vals_list:
+            prepared = self._prepare_values(vals)
+            groups[frozenset(prepared.keys())].append(prepared)
+
+        pk_field = self.fields[self.primary_key_field]
+        is_autoincrement = getattr(pk_field, 'autoincrement', False)
+        created_ids: List = []
+
         with self.env.transaction():
-            for vals in complete_vals_list:
-                prepared = self._prepare_values(vals)
-                cols = ','.join(prepared.keys())
-                placeholders = ','.join(['?'] * len(prepared))
-                sql = f"INSERT INTO {self.table_name} ({cols}) VALUES ({placeholders})"
-                with self.env.lock:
-                    cur = self.env.conn.execute(sql, list(prepared.values()))
-                    # Check if primary key is autoincrement
-                    pk_field = self.fields[self.primary_key_field]
-                    if getattr(pk_field, 'autoincrement', False):
-                        created_ids.append(cur.lastrowid)
-                    else:
-                        # Use primary key value from inserted data
-                        pk_val = prepared.get(self.primary_key_field)
-                        if pk_val is None:
-                            raise ValueError(
-                                f"Primary key '{self.primary_key_field}' not provided for model '{self.model_name}'")
-                        created_ids.append(pk_val)
+            for keyset, items in groups.items():
+                created_ids.extend(
+                    self._insert_group(keyset, items, is_autoincrement))
+
         return self.browse(created_ids)
+
+    def _insert_group(self, keyset, items, is_autoincrement):
+        if not items:
+            return []
+        if not keyset:
+            return self._insert_per_row_default(items, is_autoincrement)
+        ordered = sorted(keyset)
+        cols = ','.join(ordered)
+        ph = ','.join(['?'] * len(ordered))
+        sql = f"INSERT INTO {self.table_name} ({cols}) VALUES ({ph})"
+        values = [tuple(p[c] for c in ordered) for p in items]
+        try:
+            with self.env.transaction():
+                cur = self.env.conn.executemany(sql, values)
+                if is_autoincrement:
+                    last = cur.lastrowid
+                    n = len(values)
+                    if last is None or last < n:
+                        # lastrowid is misleading — let’s read MAX(id) directly from the table
+                        max_cur = self.env.conn.execute(
+                            f"SELECT MAX({self.primary_key_field}) "
+                            f"FROM {self.table_name}")
+                        max_id = max_cur.fetchone()[0] or 0
+                        if max_id <= 0:
+                            raise _SuspiciousLastrowid(last, n)
+                        last = max_id
+                        first_id = last - n + 1
+                        if first_id <= 0:
+                            raise _SuspiciousLastrowid(last, n)
+                    else:
+                        first_id = last - n + 1
+                        if first_id <= 0:
+                            raise _SuspiciousLastrowid(last, n)
+            if is_autoincrement:
+                return list(range(first_id, last + 1))
+            return self._extract_explicit_ids(items)
+        except _SuspiciousLastrowid as e:
+            if self.env.strict_batch:
+                raise RuntimeError(
+                    f"executemany on {self.table_name}: {e}") from e
+            logger.warning(
+                f"{self.table_name}: {e}; retrying per-row")
+            return self._insert_per_row(sql, keyset, items, is_autoincrement)
+        except sqlite3.ProgrammingError as e:
+            if self.env.strict_batch:
+                raise
+            logger.warning(
+                f"{self.table_name}: executemany failed ({e}); "
+                f"retrying per-row")
+            return self._insert_per_row(sql, keyset, items, is_autoincrement)
+
+    def _insert_per_row(self, sql, keyset, items, is_autoincrement):
+        ordered = sorted(keyset)
+        ids: List = []
+        for p in items:
+            cur = self.env.conn.execute(sql, tuple(p[c] for c in ordered))
+            if is_autoincrement:
+                if cur.lastrowid is None:
+                    raise RuntimeError(
+                        f"{self.table_name}: lastrowid is None")
+                ids.append(cur.lastrowid)
+            else:
+                pk_val = p.get(self.primary_key_field)
+                if pk_val is None:
+                    raise ValueError(
+                        f"Primary key '{self.primary_key_field}' not "
+                        f"provided for model '{self.model_name}'")
+                ids.append(pk_val)
+        return ids
+
+    def _insert_per_row_default(self, items, is_autoincrement):
+        if not is_autoincrement:
+            raise ValueError(
+                f"Cannot insert empty-keyset rows into {self.table_name}: "
+                f"non-AUTOINCREMENT primary key "
+                f"'{self.primary_key_field}' must be supplied")
+        sql = f"INSERT INTO {self.table_name} DEFAULT VALUES"
+        ids: List = []
+        for _ in items:
+            cur = self.env.conn.execute(sql)
+            if cur.lastrowid is None:
+                raise RuntimeError(
+                    f"{self.table_name}: lastrowid None after DEFAULT VALUES")
+            ids.append(cur.lastrowid)
+        return ids
+
+    def _extract_explicit_ids(self, items):
+        ids: List = []
+        for p in items:
+            pk_val = p.get(self.primary_key_field)
+            if pk_val is None:
+                raise ValueError(
+                    f"Primary key '{self.primary_key_field}' not provided "
+                    f"for model '{self.model_name}'")
+            ids.append(pk_val)
+        return ids
 
     def write_records(self, records: List[Record], vals: dict):
         if not records or not vals:
@@ -449,30 +562,37 @@ class ModelManager:
         prepared = self._prepare_values(vals)
         set_clause = ', '.join([f"{col}=?" for col in prepared.keys()])
         ids = [r[self.primary_key_field] for r in records]
-        placeholders = ','.join(['?'] * len(ids))
-        sql = f"UPDATE {self.table_name} SET {set_clause} WHERE {self.primary_key_field} IN ({placeholders})"
+        chunk_size = 500
         with self.env.transaction():
-            with self.env.lock:
-                self.env.conn.execute(sql, list(prepared.values()) + ids)
+            for i in range(0, len(ids), chunk_size):
+                chunk = ids[i:i + chunk_size]
+                placeholders = ','.join(['?'] * len(chunk))
+                sql = (f"UPDATE {self.table_name} SET {set_clause} "
+                       f"WHERE {self.primary_key_field} IN ({placeholders})")
+                self.env.conn.execute(sql, list(prepared.values()) + chunk)
         for r in records:
-            r._data.update(vals)
+            for k, v in vals.items():
+                r[k] = v
 
     def unlink_records(self, records: List[Record]):
         if not records:
             return
         ids = [r[self.primary_key_field] for r in records]
-        placeholders = ','.join(['?'] * len(ids))
-        sql = f"DELETE FROM {self.table_name} WHERE {self.primary_key_field} IN ({placeholders})"
+        chunk_size = 500
         with self.env.transaction():
-            with self.env.lock:
-                self.env.conn.execute(sql, ids)
+            for i in range(0, len(ids), chunk_size):
+                chunk = ids[i:i + chunk_size]
+                placeholders = ','.join(['?'] * len(chunk))
+                sql = (f"DELETE FROM {self.table_name} "
+                       f"WHERE {self.primary_key_field} IN ({placeholders})")
+                self.env.conn.execute(sql, chunk)
 
     def read_records(self, records: List[Record], fields: List[str] = None) -> List[dict]:
         if fields is None:
             fields = list(self.fields.keys())
         result = []
         for r in records:
-            data = {f: r[f] for f in fields if f in r._data}
+            data = {f: r[f] for f in fields if f in r}
             result.append(data)
         return result
 
@@ -489,14 +609,18 @@ class ModelManager:
 # DBSQLite3 environment
 # ----------------------------------------------------------------------
 class DBSQLite3:
-    def __init__(self, db_path: str, registry: Dict[str, type] = None):
+    def __init__(self, db_path: str,
+                 registry: Optional[Dict[str, Type[Model]]] = None):
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.registry = registry or MODEL_REGISTRY
-        self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30,
+                                    isolation_level=None)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=30000")
         self.lock = threading.RLock()
+        self.tx_depth = 0
+        self.strict_batch = os.environ.get('TBOT_DB_STRICT_BATCH', '0') == '1'
         self._managers: Dict[str, ModelManager] = {}
         self._dynamic_managers: Dict[Tuple[str, str], ModelManager] = {}
 
@@ -505,12 +629,11 @@ class DBSQLite3:
             model_cls = self.registry.get(model_name)
             if not model_cls:
                 raise KeyError(f"Model '{model_name}' not found in registry")
-            if model_cls._table is None:
+            if model_cls.get_table() is None:
                 raise KeyError(
                     f"Model '{model_name}' is dynamic; use get_model_manager() with table name"
                 )
             manager = ModelManager(self, model_name, model_cls)
-            manager._init_table()
             self._managers[model_name] = manager
         return self._managers[model_name]
 
@@ -523,7 +646,6 @@ class DBSQLite3:
             if not model_cls:
                 raise KeyError(f"Model '{model_name}' not in registry")
             manager = ModelManager(self, model_name, model_cls, table_name=table_name)
-            manager._init_table()
             self._dynamic_managers[key] = manager
         return self._dynamic_managers[key]
 
@@ -550,23 +672,60 @@ class DBSQLite3:
             return [row[0] for row in cur.fetchall()]
 
 class _TransactionContext:
+    """Nested-transaction-aware context.
+
+    depth 0 -> BEGIN / COMMIT / ROLLBACK
+    depth >0 -> SAVEPOINT sp_N / RELEASE sp_N / (ROLLBACK TO + RELEASE) sp_N
+
+    Under isolation_level=None, sqlite3 does not auto-begin. All DML in
+    ModelManager goes through `with self.env.transaction()`.
+    """
+
     def __init__(self, env: DBSQLite3):
         self.env = env
+        self._my_depth = -1
 
     def __enter__(self):
-        self.env.lock.acquire()          # acquire lock
-        self.env.conn.execute("BEGIN")
+        self.env.lock.acquire()
+        try:
+            depth = self.env.tx_depth
+            if depth == 0:
+                self.env.conn.execute("BEGIN")
+            else:
+                self.env.conn.execute(f"SAVEPOINT sp_{depth}")
+            self._my_depth = depth
+            self.env.tx_depth = depth + 1
+        except Exception:
+            self.env.lock.release()
+            raise
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        depth = self._my_depth
         try:
-            if exc_type is None:
-                self.env.conn.commit()
+            if depth == 0:
+                if exc_type is None:
+                    self.env.conn.execute("COMMIT")
+                else:
+                    self.env.conn.execute("ROLLBACK")
             else:
-                self.env.conn.rollback()
+                if exc_type is None:
+                    self.env.conn.execute(f"RELEASE sp_{depth}")
+                else:
+                    self.env.conn.execute(f"ROLLBACK TO sp_{depth}")
+                    self.env.conn.execute(f"RELEASE sp_{depth}")
         finally:
-            self.env.lock.release()      # release lock
+            self.env.tx_depth = depth
+            self.env.lock.release()
         return False
+
+
+class _SuspiciousLastrowid(Exception):
+    def __init__(self, lastrowid, n):
+        self.lastrowid = lastrowid
+        self.n = n
+        super().__init__(
+            f"suspicious lastrowid={lastrowid!r} after executemany(n={n})")
 
 # ----------------------------------------------------------------------
 # Original core database functions (preserved)
@@ -695,7 +854,7 @@ def save_setting(key: str, value: str):
 
 def cleanup_orphan_databases():
     import glob, re
-    db_files = glob.glob('data/bot_*.db')
+    db_files = glob.glob(os.path.join(DATA_DIR, 'bot_*.db'))
     active_ids = set()
     with sqlite3.connect(DB_CONFIG) as conn:
         rows = conn.execute('SELECT id FROM bots').fetchall()
@@ -708,6 +867,40 @@ def cleanup_orphan_databases():
                 logger.info(f"Removed orphan database {f}")
             except Exception as e:
                 logger.error(f"Failed to remove {f}: {e}")
+
+def cleanup_orphan_bots() -> List[int]:
+    """Remove entries for bots from `config.db` if their corresponding 
+	per-bot configuration database is missing.
+
+    This complements `cleanup_orphan_databases()`: the latter removes `.db` 
+	files that have no corresponding entries, while this function removes 
+	entries that have no corresponding `.db` files. It is called from 
+	`BotManager.load_bots()` before the iteration begins; otherwise, 
+	`_create_instance()` would log a "config not found" error and 
+	leave a "dead" entry in `bots` indefinitely.
+    Returns a list of the `bot_id`s that were removed.
+    """
+    if not os.path.isdir(DATA_DIR):
+        logger.error(
+            f"cleanup_orphan_bots: DATA_DIR {DATA_DIR!r} does not "
+            f"exist — skipping to avoid purging all bot records")
+        return []
+    removed: List[int] = []
+    with sqlite3.connect(DB_CONFIG, timeout=30) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        rows = conn.execute('SELECT id, type, name FROM bots').fetchall()
+        for bot_id, bot_type, bot_name in rows:
+            db_path = os.path.join(DATA_DIR, f'bot_{bot_id}.db')
+            if not os.path.exists(db_path):
+                conn.execute('DELETE FROM bots WHERE id = ?', (bot_id,))
+                removed.append(bot_id)
+                logger.warning(
+                    f"cleanup_orphan_bots: removed bot "
+                    f"id={bot_id} type={bot_type!r} "
+                    f"name={bot_name!r} (missing {db_path})")
+        if removed:
+            conn.commit()
+    return removed
 
 # ----------------------------------------------------------------------
 # TimeSync config DB

@@ -70,8 +70,7 @@ DEFAULT_NTP_SERVERS=[
             'ntp.se',
             'ntp.metas.ch',
             'ntp.nic.kz',
-            'time.nist.gov',
-            'ntp1.inrim.it'
+            'time.apple.com',
         ]
 
 # Windows Modern Standby: by default we ask the system not to go into
@@ -878,6 +877,7 @@ class Consensus:
         if extra_accept:
             accepted += 1
             if n >= ACCEPT_WINDOW_SIZE:
+		# append(True) will displace the oldest element
                 if w[0]:
                     accepted -= 1
                 n = ACCEPT_WINDOW_SIZE
@@ -2431,8 +2431,8 @@ class TimeSyncService:
             }
 
         # --- Diagnostics ---
-        # Source driving drift_prediction extrapolation:
-        #   'short_vote' — drift_prediction not yet ready; gate uses SV
+        # Source used for drift_prediction extrapolation:
+        #   'short_vote' — drift_prediction is not yet ready; the gate uses SV (short vote)
         #   'slope'      — n_app < ​​DRIFT_WINDOW; extrapolation based on slope
         #   'rate'       — n_app >= DRIFT_WINDOW; extrapolation based on self._rate
         with self._consensus._lock:
@@ -4529,7 +4529,7 @@ def build_medium_telemetry_content():
     if precise_ns is None or sys_ns is None:
         return "Time sync not available (first sync pending)"
 
-    # ---- Field extraction (matches full telemetry) ----
+	# ---- Field extraction (matches full telemetry) ----
     offset_ns         = telemetry.get('offset_ns')
     slew_error_ns     = telemetry.get('slew_error_ns')
     slew_errors_ns    = telemetry.get('slew_errors_ns') or []
@@ -4569,8 +4569,8 @@ def build_medium_telemetry_content():
 
     diff_threshold_str = (f"±{_fmt_ms(diff_threshold_ns)}"
                           if diff_threshold_ns is not None else "N/A")
-
-   # ---- Compact history render ----
+						  
+# ---- Compact history render ----
     def render_history_compact(records, limit=HISTORY_MAX_LEN):
         if not records:
             return "      (empty)"
@@ -4578,7 +4578,7 @@ def build_medium_telemetry_content():
             "      " + _fmt_record_compact(rec) for rec in records[:limit]
         )
 
-    # ---- Dominant analysis ---
+# ---- Dominant analysis (unchanged — already compact) ----
     def render_dominant_analysis(_inst, _current_tick):
         _hist = _inst.get('own_history') or []
         cur_fav = _inst.get('favorite')
@@ -4854,7 +4854,7 @@ def build_medium_telemetry_content():
         history_vote_str = "\n".join(lines)
 
 
-    # ---- Colony summary ----
+# ---- Colony summary (compact matrix_str) ----
     if not population:
         colony_str = "N/A"
     else:
@@ -5482,7 +5482,7 @@ def build_full_telemetry_content():
 
             def _cv_perc(rec):
                 """CV = 100 * stdev / mean.
-                sd may be None when Size=2 (a single interval; stdev is not calculated).
+                'sd' may be None when Size=2 (a single interval; stdev cannot be calculated).
                 Returns None — the caller should display N/A.
                 """
                 mean, sd = rec.matrix_meta[1][0], rec.matrix_meta[1][1]

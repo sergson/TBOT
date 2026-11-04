@@ -112,3 +112,190 @@ details.mood-normal .header-indicator::before {
 .bot-header-stopped {
     background-color: #ffebee;
 }
+
+
+/* ==================================================================== */
+/* UI-Compact v2 — v10 §3 (адаптация под Dash 3.x / Radix UI)          */
+/* ==================================================================== */
+
+/* --- radio / checklist --- */
+.dash-radio-items,
+.dash-checklist {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    font-size: 14px;
+}
+
+.dash-radio-items label,
+.dash-checklist label {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin: 0;
+    font-size: 14px;
+}
+
+/* --- buttons inside #bots-container: 18px row height --- */
+#bots-container button {
+    height: 18px;
+    line-height: 1;
+    font-size: 14px;
+    padding: 0 8px;
+    box-sizing: border-box;
+}
+
+/* --- password fields: leave room for the show/hide icon --- */
+#bots-container input[type="password"] {
+    padding-right: 16px;
+}
+
+/* --- dcc.Graph compact layout --- */
+.dash-graph {
+    margin: 0;
+}
+
+.compact-chart .legend text {
+    font-size: 11px;
+}
+
+/* --- DataTable: ellipsis for long cells --- */
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td,
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner th {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner tr {
+    height: 18px !important;
+    min-height: 18px !important;
+}
+
+/* --- <hr> inside sticky header must not be compressed --- */
+#sticky-header hr {
+    margin: 2px 0;
+    transform: none;
+}
+
+/* ==================================================================== */
+/* Выпадающее меню Dash 3.x (Radix UI) — замена .Select__*              */
+/* ГЛОБАЛЬНО, без скоупа — чтобы работало в любом месте страницы        */
+/* ==================================================================== */
+
+/* ===== Кнопка-триггер (закрытое состояние) ===== */
+.dash-dropdown {
+    height: 18px !important;
+    min-height: 18px !important;
+    padding: 0 6px !important;
+    display: flex !important;
+    align-items: center !important;
+    line-height: 18px !important;
+    font-size: 14px !important;
+    border-color: #ccc !important;
+    box-shadow: none !important;
+}
+
+/* Внутренний grid-контейнер кнопки */
+.dash-dropdown .dash-dropdown-grid-container {
+    height: 18px !important;
+    display: flex !important;
+    align-items: center !important;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+
+/* Текст выбранного значения */
+.dash-dropdown .dash-dropdown-value {
+    height: 18px !important;
+    line-height: 18px !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    display: flex !important;
+    align-items: center !important;
+}
+
+.dash-dropdown .dash-dropdown-value-item,
+.dash-dropdown .dash-dropdown-value-item > span {
+    line-height: 18px !important;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+
+/* Стрелка и крестик очистки */
+.dash-dropdown .dash-dropdown-clear,
+.dash-dropdown .dash-dropdown-trigger-icon {
+    height: 15px !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    text-decoration: none !important;
+}
+
+/* ===== Выпадающее меню (портал — без скоупа) ===== */
+.dash-dropdown-content {
+    padding: 0 !important;
+    font-size: 14px !important;
+    z-index: 10 !important;
+}
+
+/* Строка поиска */
+.dash-dropdown-search-container {
+    height: 22px !important;
+    min-height: 22px !important;
+    padding: 0 6px !important;
+    display: flex !important;
+    align-items: center !important;
+}
+
+.dash-dropdown-search {
+    height: 18px !important;
+    line-height: 18px !important;
+    padding: 0 4px !important;
+    font-size: 14px !important;
+}
+
+.dash-dropdown-search-icon {
+    flex-shrink: 0;
+}
+
+/* ===== Контейнер списка ===== */
+.dash-options-list,
+.dash-dropdown-options {
+    padding: 0 !important;
+    margin: 0 !important;
+}
+
+/* Опции в списке */
+.dash-options-list-option,
+.dash-dropdown-option {
+    min-height: 18px !important;
+    height: 18px !important;
+    padding: 0 6px !important;
+    display: flex !important;
+    align-items: center !important;
+    line-height: 18px !important;
+    font-size: 14px !important;
+}
+
+.dash-options-list-option-text,
+.dash-options-list-option-text > span {
+    line-height: 18px !important;
+    padding: 0 !important;
+    font-size: 14px !important;
+}
+
+.dash-options-list-option-wrapper {
+    display: flex !important;
+    align-items: center !important;
+}
+
+.dash-options-list-option-checkbox {
+    width: 12px !important;
+    height: 12px !important;
+    margin: 0 !important;
+}
+
+/* Активная (выбранная) опция */
+.dash-options-list-option.selected {
+    background: #eef !important;
+}
