@@ -54,6 +54,8 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Callable, List, Optional, Tuple
 
+SESSION_MARKER = "=== SESSION START ==="
+
 # Default log retention days
 LOG_RETENTION_DAYS_DEFAULT = 2
 
@@ -453,6 +455,31 @@ class PerformanceLogger:
 
         atexit.register(self._shutdown)
 
+        try:
+            self._write_session_marker()
+        except Exception as e:
+            self._warn_stderr(f"[logger] marker write failed: {e}")
+
+    def _write_session_marker(self) -> None:
+        """Write a session-start marker to each module log file.
+
+        The marker delimits "this app session" from previous sessions in
+        the same physical log file (after a same-day restart, crash, or
+        an in-session date rollover).
+        """
+        try:
+            os.makedirs(self._log_dir, exist_ok=True)
+        except Exception:
+            return
+        today = datetime.now().strftime('%Y%m%d')
+        for mt in LOGGER_OBJS:
+            path = os.path.join(self._log_dir, f"{mt}_{today}.log")
+            try:
+                with open(path, 'a', encoding='utf-8') as f:
+                    f.write(f"\n{SESSION_MARKER}\n")
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -616,7 +643,7 @@ class PerformanceLogger:
     # ------------------------------------------------------------------
 
     def get_recent_logs(self, module_type: str = 'app',
-                        n_lines: int = 20) -> List[str]:
+                        n_lines: int = 50) -> List[str]:
         cache_key = (module_type, n_lines)
         now = time.monotonic()
         with self._recent_cache_lock:
@@ -643,51 +670,139 @@ class PerformanceLogger:
         return result
 
     @staticmethod
-    def _read_file_tail(path: str, n_lines: int) -> List[str]:
-        """Reads the last n_lines from file without loading it entirely."""
+    def _group_records(raw_lines: List[str]) -> List[Tuple[int, List[str]]]:
+        """Group log lines into records (header + optional traceback).
+
+        A record = one line with an HH:MM:SS.ns+00:00 prefix, followed by
+        zero or more lines without a timestamp (traceback / continuation).
+        Returns list of (ts_ns_since_midnight, [lines...]).
+        """
+        import re
+        _ts_re = re.compile(r'^(\d{2}):(\d{2}):(\d{2})\.(\d{9})\+00:00')
+        records: List[Tuple[int, List[str]]] = []
+        current: Optional[Tuple[int, List[str]]] = None
+        for line in raw_lines:
+            if line.strip() == SESSION_MARKER:
+                # Session boundary — finalize and reset
+                if current is not None:
+                    records.append(current)
+                    current = None
+                continue
+            m = _ts_re.match(line)
+            if m:
+                if current is not None:
+                    records.append(current)
+                h, mn, s, frac = m.groups()
+                ts_ns = ((int(h) * 3600 + int(mn) * 60 + int(s))
+                         * 1_000_000_000 + int(frac))
+                current = (ts_ns, [line])
+            else:
+                if current is not None:
+                    current[1].append(line)
+                # else: orphan line before any header — drop
+        if current is not None:
+            records.append(current)
+        return records
+
+    @staticmethod
+    def _filter_by_session(raw_lines: List[str]) -> List[str]:
+        """Keep only lines after the LAST session marker. If no marker,
+        return raw_lines unchanged (backward-compat / first run)."""
+        last_idx = -1
+        for i in range(len(raw_lines) - 1, -1, -1):
+            if raw_lines[i].strip() == SESSION_MARKER:
+                last_idx = i
+                break
+        if last_idx >= 0:
+            return raw_lines[last_idx + 1:]
+        return raw_lines
+
+    @classmethod
+    def _read_file_tail(cls, path: str, n_lines: int) -> List[str]:
         if not os.path.exists(path):
             return [f"Log file {os.path.basename(path)} not found"]
 
+        # Read enough to cover n_lines + traceback overhead (×3 buffer)
+        buf_lines = max(n_lines * 3, 150)
         size = os.path.getsize(path)
         if size <= 1024 * 1024:
             with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                tail = deque(f, maxlen=n_lines)
-            return [ln.rstrip('\n') for ln in tail] or ["No log entries yet"]
+                tail = deque(f, maxlen=buf_lines)
+            raw = [ln.rstrip('\n') for ln in tail]
+        else:
+            block_size = 8192
+            with open(path, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                pos = f.tell()
+                buf = b''
+                while pos > 0 and buf.count(b'\n') <= buf_lines:
+                    step = min(block_size, pos)
+                    pos -= step
+                    f.seek(pos)
+                    chunk = f.read(step)
+                    buf = chunk + buf
+            text = buf.decode('utf-8', errors='replace')
+            raw = text.splitlines()
 
-        # Large file — read in blocks from the end
-        block_size = 8192
-        with open(path, 'rb') as f:
-            f.seek(0, os.SEEK_END)
-            pos = f.tell()
-            buf = b''
-            while pos > 0 and buf.count(b'\n') <= n_lines:
-                step = min(block_size, pos)
-                pos -= step
-                f.seek(pos)
-                chunk = f.read(step)
-                buf = chunk + buf
-        text = buf.decode('utf-8', errors='replace')
-        lines = text.splitlines()
-        return lines[-n_lines:] if lines else ["No log entries yet"]
+        if not raw:
+            return ["No log entries yet"]
+
+        # Drop lines from previous sessions (before last marker)
+        raw = cls._filter_by_session(raw)
+        if not raw:
+            return ["No log entries yet"]
+
+        # Group headers + tracebacks into logical records
+        records = cls._group_records(raw)
+        if not records:
+            return ["No log entries yet"]
+
+        records = records[-n_lines:]
+        flat: List[str] = []
+        for _ts, rec_lines in records:
+            flat.extend(rec_lines)
+        return flat
 
     def _read_all_tails(self, n_lines: int) -> List[str]:
         today = datetime.now().strftime('%Y%m%d')
-        all_lines: List[str] = []
         try:
             entries = os.listdir(self._log_dir)
         except Exception:
             return ["No log entries yet"]
+
+        all_records: List[Tuple[int, List[str]]] = []
         for filename in entries:
-            if filename.endswith(f'_{today}.log'):
-                try:
-                    all_lines.extend(self._read_file_tail(
-                        os.path.join(self._log_dir, filename), n_lines))
-                except Exception:
-                    continue
-        if not all_lines:
+            if not filename.endswith(f'_{today}.log'):
+                continue
+            path = os.path.join(self._log_dir, filename)
+            try:
+                with open(path, 'r', encoding='utf-8',
+                          errors='replace') as f:
+                    # Read whole file — daily file is bounded by retention
+                    # and rotation, so it's manageable. If this becomes
+                    # a bottleneck, switch to a tail-read helper.
+                    raw = [ln.rstrip('\n') for ln in f]
+            except Exception:
+                continue
+
+            # Apply session filter per file
+            raw = self._filter_by_session(raw)
+            if not raw:
+                continue
+
+            all_records.extend(self._group_records(raw))
+
+        if not all_records:
             return ["No log entries yet"]
-        all_lines.sort()
-        return all_lines[-n_lines:]
+
+        # Sort by header timestamp, take last n logical records
+        all_records.sort(key=lambda r: r[0])
+        all_records = all_records[-n_lines:]
+
+        flat: List[str] = []
+        for _ts, rec_lines in all_records:
+            flat.extend(rec_lines)
+        return flat
 
     # ------------------------------------------------------------------
     # Cleanup

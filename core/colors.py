@@ -27,6 +27,7 @@ LIGHT_GREEN = '#D4EDDA'       # Noticeable, juicy light green
 LIGHT_RED = '#F8D7DA'         # Noticeable, pleasant light red
 LIGHT_BLUE = '#E3F2FD'
 LIGHT_GRAY = '#F5F5F5'
+LIGHT_YELLOW = '#FFF9C4'
 LIGHT_BG = '#F0F0F0'          # Light gray
 
 # === Dark shades for text ===

@@ -1,9 +1,10 @@
-# app.py (final version)
+# app.py (version 0.4.6)
 # Copyright (c) 2026 sergson (https://github.com/sergson)
 # Licensed under GNU General Public License v3.0
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
 # This software is for educational purposes only. Use at your own risk.
 
+import sys
 import dash
 from dash import dcc, html, Input, Output, State, ALL, MATCH, no_update, callback_context
 import os
@@ -94,15 +95,72 @@ else:
 
 load_modules("modules")
 
+# F0.7.8: register tbotex providers (empty for now — patch G populates).
+try:
+    from core.tbotex import load_tbotex_providers
+    _providers = load_tbotex_providers()
+    if _providers:
+        logger.info(f"tbotex providers loaded: {_providers}")
+except Exception as e:
+    logger.error(f"tbotex provider loading failed: {e}")
+
+# One-time migration of legacy feedback_state.
+# The migration must be performed BEFORE BotManager.load_bots(); 
+# otherwise, existing bots will see an outdated 'abandoned' status.
+def _migrate_feedback_states():
+    """Convert legacy 'abandoned' to 'delivery_failed'.
+    Filters already handle both values; this migration is for the sake of cleanliness.
+    """
+    import glob, sqlite3
+    from core.database import DATA_DIR
+    for db_path in glob.glob(f"{DATA_DIR}/bot_*.db"):
+        try:
+            with sqlite3.connect(db_path, timeout=30) as conn:
+                if conn.execute(
+                        "PRAGMA user_version").fetchone()[0] >= 1:
+                    continue
+                # N-10: skip non-execution DBs (no execution_orders table)
+                has_table = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='execution_orders'"
+                ).fetchone() is not None
+                if not has_table:
+                    conn.execute("PRAGMA user_version = 1")
+                    conn.commit()
+                    continue
+                cur = conn.execute(
+                    "UPDATE execution_orders "
+                    "SET feedback_state = 'delivery_failed' "
+                    "WHERE feedback_state = 'abandoned'")
+                if cur.rowcount:
+                    logger.info(
+                        f"Migrated {cur.rowcount} 'abandoned' rows "
+                        f"in {db_path}")
+                conn.execute("PRAGMA user_version = 1")
+                conn.commit()
+        except Exception as e:
+            logger.debug(f"Migration skipped for {db_path}: {e}")
+
+try:
+    _migrate_feedback_states()
+except Exception as e:
+    logger.warning(f"feedback_state migration failed: {e}")
+
 def shutdown_time_sync():
     time_sync_service.stop()
-atexit.register(shutdown_time_sync)
 
+atexit.register(shutdown_time_sync)
 bot_manager = BotManager()
 bot_manager.start_loop_in_thread()
 atexit.register(bot_manager.shutdown)
-signal.signal(signal.SIGINT, lambda s, f: bot_manager.shutdown())
-signal.signal(signal.SIGTERM, lambda s, f: bot_manager.shutdown())
+
+def _handle_shutdown_signal(sig, frame):
+    logger.warning(f"Received signal {sig}, exiting (atexit will stop bots)")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _handle_shutdown_signal)
+signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+
 bot_manager.load_bots()
 
 app = dash.Dash(__name__, title='T.B.O.T', update_title = '')
@@ -261,9 +319,9 @@ def reset_header_mood(n_intervals):
 
 @app.callback(
     [Output('header-mood', 'data', allow_duplicate=True),
-    Output('header-mood-reset-interval', 'disabled', allow_duplicate=True),
-    Output('header-mood-reset-interval', 'n_intervals', allow_duplicate=True),
-    Output('header-mood-command', 'data', allow_duplicate=True)],
+     Output('header-mood-reset-interval', 'disabled', allow_duplicate=True),
+     Output('header-mood-reset-interval', 'n_intervals', allow_duplicate=True),
+     Output('header-mood-command', 'data', allow_duplicate=True)],
     Input('header-mood-command', 'data'),
     prevent_initial_call=True
 )
@@ -285,11 +343,12 @@ def process_mood_command(command):
      Output('time-panel', 'style'),
      Output('time-btn', 'n_clicks'),
      Output('time-content', 'children', allow_duplicate=True),
-     Output('time-panel-mode', 'data')],
+     Output('time-panel-mode', 'data'),
+     Output('editing-bots', 'data', allow_duplicate=True)],
     [Input('add-bot-btn', 'n_clicks'),
      Input('settings-btn', 'n_clicks'),
      Input('logs-btn', 'n_clicks'),
-     Input('time-btn', 'n_clicks'),               # new
+     Input('time-btn', 'n_clicks'),
      Input('cancel-add-btn', 'n_clicks'),
      Input('close-settings-btn', 'n_clicks'),
      Input('save-bot-btn', 'n_clicks')],
@@ -299,11 +358,11 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
                  cancel_clicks, close_clicks, save_clicks):
     ctx = callback_context
     if not ctx.triggered:
-        return (no_update,) * 11
+        # fix: was 12, now 13 (added Output editing-bots).
+        return (no_update,) * 13
 
     triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
-    # Initialize all values
     add_style = {'display': 'none'}
     settings_style = {'display': 'none'}
     logs_style = {'display': 'none'}
@@ -316,8 +375,8 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
     new_settings = settings_clicks
     new_logs = logs_clicks
     new_time = time_clicks
+    editing_reset = no_update
 
-    # Button handling
     if triggered_id == 'add-bot-btn':
         if add_clicks % 2 == 1:
             add_style = {'display': 'block'}
@@ -325,19 +384,27 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
             new_logs = 0
             new_time = 0
             time_mode = 'closed'
+            # Close all edit forms to avoid having two forms
+            # with the same pattern ID.
+            editing_reset = {}
             type_options = []
+            _broker_exists = any(
+                b['type'] == 'broker' for b in get_all_bots())
             for _model_name in bot_registry.list_models():
                 if _model_name.endswith('.type'):
                     cls = bot_registry.get_model(_model_name)
                     display = getattr(cls, 'display_name', _model_name)
                     type_id = _model_name.split('.')[0]
+                    if type_id == 'broker' and _broker_exists:
+                        continue
                     type_options.append({'label': display, 'value': type_id})
             if not type_options:
                 form_content = html.Div("No bot types registered. Check modules.")
             else:
                 form_content = html.Div([
-                    html.H3('Add Bot'),
-                    dcc.Dropdown(id='bot-type-selector', options=type_options, value=type_options[0]['value']),
+                    html.H3('Add Bot', style={'margin': '1px 0 4px 0'}),
+                    dcc.Dropdown(id='bot-type-selector', options=type_options,
+                                 value=type_options[0]['value']),
                     html.Div(id='dynamic-bot-form')
                 ])
         else:
@@ -360,7 +427,7 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
             new_add = 0
             new_settings = 0
             new_time = 0
-            logs_content = '\n'.join(perf_logger.get_recent_logs('all', 20))
+            logs_content = '\n'.join(perf_logger.get_recent_logs('all', 50))
         else:
             logs_style = {'display': 'none'}
         new_logs = logs_clicks
@@ -368,7 +435,6 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
     elif triggered_id == 'time-btn':
         phase = time_clicks % 4
         if phase == 1:
-            # First click → short
             time_style = {'display': 'block'}
             new_add = 0
             new_settings = 0
@@ -376,7 +442,6 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
             time_content = build_short_telemetry_content()
             time_mode = 'short'
         elif phase == 2:
-            # Second click → medium
             time_style = {'display': 'block'}
             new_add = 0
             new_settings = 0
@@ -384,7 +449,6 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
             time_content = build_medium_telemetry_content()
             time_mode = 'medium'
         elif phase == 3:
-            # Second click → full
             time_style = {'display': 'block'}
             new_add = 0
             new_settings = 0
@@ -392,12 +456,10 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
             time_content = build_full_telemetry_content()
             time_mode = 'full'
         else:
-            # phase == 0 → close
             time_style = {'display': 'none'}
             time_mode = 'closed'
         new_time = time_clicks
 
-    # Closing forms
     elif triggered_id in ['cancel-add-btn', 'save-bot-btn']:
         add_style = {'display': 'none'}
         new_add = 0
@@ -408,7 +470,8 @@ def toggle_forms(add_clicks, settings_clicks, logs_clicks, time_clicks,
 
     return (add_style, form_content, settings_style, new_add, new_settings,
             logs_style, logs_content, new_logs,
-            time_style, new_time, time_content, time_mode)
+            time_style, new_time, time_content, time_mode,
+            editing_reset)
 
 @app.callback(
     Output('dynamic-bot-form', 'children'),
@@ -449,11 +512,24 @@ def save_bot(n_clicks, bot_type, field_values, field_ids, trigger):
             config[field] = val
 
     _meta_cls = bot_registry.get_model(f"{bot_type}.type")
-    if _meta_cls and hasattr(_meta_cls, 'prepare_new_config'):
-        config = _meta_cls.prepare_new_config(config)
 
-    bot_id = add_bot(bot_type, f"{bot_type} bot", config)
-    bot_manager.add_bot(bot_id)
+    bot_id = None
+    try:
+        if _meta_cls and hasattr(_meta_cls, 'prepare_new_config'):
+            config = _meta_cls.prepare_new_config(config)
+        bot_id = add_bot(bot_type, f"{bot_type} bot", config)
+        bot_manager.add_bot(bot_id)
+    except ValueError as e:
+        logger.warning(f"save_bot rejected: {e}")
+        perf_logger.set_mood('cancel')
+        if bot_id is not None:
+            try:
+                delete_bot(bot_id)
+            except Exception as ee:
+                logger.error(
+                    f"save_bot rollback failed for {bot_id}: {ee}")
+        return no_update, no_update
+
     perf_logger.set_mood('happy')
     return trigger + 1, {}
 
@@ -516,30 +592,34 @@ def render_bots(trigger, editing_bots, pathname, relayout_store):
 
 @app.callback(
     Output('relayout-store', 'data'),
-    Input({'type': 'graph', 'index': ALL}, 'relayoutData'),
+    Input({'type': 'grid-graph', 'index': ALL}, 'relayoutData'),
+    Input({'type': 'history-graph', 'index': ALL}, 'relayoutData'),
+    Input({'type': 'execution-graph', 'index': ALL}, 'relayoutData'),
+    Input({'type': 'collector-graph', 'index': ALL}, 'relayoutData'),
     State('relayout-store', 'data'),
     prevent_initial_call=True
 )
-def save_relayout(relayout_list, stored):
+def save_relayout(_grid, _hist, _exec, _coll, stored):
     ctx = callback_context
     if not ctx.triggered:
         return no_update
     triggered = ctx.triggered[0]
     try:
-        graph_id_str = triggered['prop_id'].split('.')[0]
-        graph_id = json.loads(graph_id_str)
+        prop_id = triggered['prop_id'].split('.')[0]
+        graph_id = json.loads(prop_id)
+        graph_type = graph_id['type']
         bot_id = graph_id['index']
         new_relayout = triggered['value']
-    except:
+    except (json.JSONDecodeError, KeyError, TypeError):
         return no_update
     if new_relayout is None or not isinstance(new_relayout, dict):
         return no_update
     stored = stored.copy() if stored else {}
-    stored[str(bot_id)] = new_relayout
+    stored[f"{bot_id}:{graph_type}"] = new_relayout
     return stored
 
 @app.callback(
-    Output({'type': 'status-btn', 'index': MATCH}, 'children'),
+    Output({'type': 'status-btn', 'index': MATCH}, 'children', allow_duplicate=True),
     [Input({'type': 'status-btn', 'index': MATCH}, 'n_clicks'),
      Input('bots-trigger', 'data')],
     [State({'type': 'status-btn', 'index': MATCH}, 'id')],
@@ -552,33 +632,75 @@ def toggle_bot(n_clicks, trigger, btn_id):
     if not bot:
         return "Start"
 
+    # A unified helper for displaying status.
+    def _label():
+        return "Stop" if bot['status'] in ('running', 'paused') else "Start"
+
     ctx = callback_context
     if not ctx.triggered:
-        return "Stop" if bot['status'] == 'running' else "Start"
+        return _label()
 
-    prop_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    raw_prop_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
-    if prop_id == 'bots-trigger':
-        return "Stop" if bot['status'] == 'running' else "Start"
+    # A flat (non-pattern) ID is provided as the string 'bots-trigger'.
+    if raw_prop_id == 'bots-trigger':
+        # Global refresh of the list (e.g., adding a new bot) —
+        # synchronize the signature only, no further actions.
+        return _label()
 
-    if prop_id == 'status-btn' and (not n_clicks or n_clicks <= 0):
-        return "Stop" if bot['status'] == 'running' else "Start"
-
-    # Actual click - perform action
+    # The pattern-matching ID arrives as a JSON string, e.g.,
+    # '{"index":5,"type":"status-btn"}'. We parse it to distinguish
+    # a "click on a status-btn" from other possible inputs.
     try:
-        if bot['status'] == 'running':
+        clicked_id = json.loads(raw_prop_id)
+    except (json.JSONDecodeError, TypeError):
+        clicked_id = {}
+
+    if (clicked_id.get('type') == 'status-btn'
+            and (not n_clicks or n_clicks <= 0)):
+        # The callback was triggered, but no actual click occurred — only
+        # a synchronization of the signature.
+        return _label()
+
+	# --- actual click ---
+    try:
+        if bot['status'] in ('running', 'paused'):
             bot_manager.stop_bot(bot_id)
             update_bot_status(bot_id, 'stopped')
             return "Start"
         else:
             bot_manager.start_bot(bot_id)
-            update_bot_status(bot_id, 'running')
+            # We do NOT force the 'running' state: bot.start() executes asynchronously
+            # and will set the status itself—either to 'running', or to 'paused' if
+            # it was restored from config['execution_paused'].
             return "Stop"
     except Exception as e:
         logger.error(f"Error toggling bot {bot_id}: {e}")
-        # Return current button text and error
-        current_text = "Stop" if bot['status'] == 'running' else "Start"
-        return current_text
+        # The state in the database did not change (the toggle failed) — we keep
+        # the correct label for the current status. For "paused," this is "Stop":
+        # the user should still be able to stop it.
+        return _label()
+
+@app.callback(
+    Output({'type': 'status-btn', 'index': MATCH}, 'children', allow_duplicate=True),
+    Input('global-interval', 'n_intervals'),
+    State({'type': 'status-btn', 'index': MATCH}, 'id'),
+    prevent_initial_call=True
+)
+def refresh_status_btn_text(n, btn_id):
+    """Periodically synchronizes the button label with the actual status.
+
+    The 'paused' status is displayed as "Stop": the user must be able
+    to stop the bot even while it is in a 'paused' state (a standard 'unpause'
+    is performed automatically via the 'paused_watchdog', but a manual 'Stop'
+    is always available).
+    """
+    bot_id = btn_id['index']
+    bots = get_all_bots()
+    bot = next((b for b in bots if b['id'] == bot_id), None)
+    if not bot:
+        return no_update
+    return "Stop" if bot['status'] in ('running', 'paused') else "Start"
 
 @app.callback(
     Output('bots-trigger', 'data', allow_duplicate=True),
@@ -612,29 +734,35 @@ def delete_bot_callback(n_clicks_list, ids_list, trigger):
 
 @app.callback(
     [Output('editing-bots', 'data', allow_duplicate=True),
-     Output('prev-edit-clicks', 'data')],
+     Output('prev-edit-clicks', 'data'),
+     Output('add-bot-form-container', 'style', allow_duplicate=True),
+     Output('add-bot-btn', 'n_clicks', allow_duplicate=True)],
     Input({'type': 'edit-btn', 'index': ALL}, 'n_clicks'),
     [State('editing-bots', 'data'),
-    State('prev-edit-clicks', 'data')],
+     State('prev-edit-clicks', 'data')],
     prevent_initial_call=True
 )
 def enter_edit_mode(n_clicks_list, editing, prev_clicks):
     ctx = callback_context
     if not ctx.triggered:
-        return no_update, no_update
+        return no_update, no_update, no_update, no_update
 
-    if not prev_clicks or len(prev_clicks) != len(n_clicks_list):
-        return no_update, n_clicks_list
+    current = [c if c is not None else 0 for c in (n_clicks_list or [])]
+    previous = [p if p is not None else 0 for p in (prev_clicks or [])]
 
-    for i, (cur, prev) in enumerate(zip(n_clicks_list, prev_clicks)):
+    if len(previous) != len(current):
+        return no_update, current, no_update, no_update
+
+    for i, (cur, prev) in enumerate(zip(current, previous)):
         if cur > prev:
             bots = get_all_bots()
             if i < len(bots):
                 bot_id = str(bots[i]['id'])
                 editing = editing or {}
                 editing[bot_id] = True
-                return editing, n_clicks_list
-    return no_update, n_clicks_list
+                return (editing, current,
+                        {'display': 'none'}, 0)
+    return no_update, current, no_update, no_update
 
 @app.callback(
     [Output('editing-bots', 'data', allow_duplicate=True),
@@ -679,11 +807,21 @@ def save_editing(n_clicks_list, btn_ids, field_values, field_ids, editing, trigg
     bot_type = bot['type']
     _meta_cls = bot_registry.get_model(f"{bot_type}.type")
 
-    if _meta_cls and hasattr(_meta_cls, 'process_edit_save'):
-        config = _meta_cls.process_edit_save(bot_id, new_fields, old_config)
-    else:
-        config = old_config.copy()
-        config.update(new_fields)
+    try:
+        if _meta_cls and hasattr(_meta_cls, 'process_edit_save'):
+            config = _meta_cls.process_edit_save(bot_id, new_fields, old_config)
+        else:
+            config = old_config.copy()
+            config.update(new_fields)
+    except ValueError as e:
+        # Strict validation ("hard guard") for immutable fields (exchange/market_type/symbol).
+        # The form remains open, the bot's status does not change, and no
+        # configuration files are written — the user is notified that the save
+        # operation was rejected (indicated by "mood=cancel" in the header).
+        # There is no need to update the bot.
+        logger.warning(f"Edit rejected for bot {bot_id}: {e}")
+        perf_logger.set_mood('cancel')
+        return no_update, no_update
 
     update_bot_config(bot_id, config)
 
@@ -791,7 +929,7 @@ def on_tick_1s(n, current_mood, logs_style, time_mode):
     # 2) Logs — only if the panel is open
     logs_out = no_update
     if logs_style and logs_style.get('display') != 'none':
-        logs_out = '\n'.join(perf_logger.get_recent_logs('all', 20))
+        logs_out = '\n'.join(perf_logger.get_recent_logs('all', 50))
 
     # 3) Time — only if the panel is open
     time_out = no_update

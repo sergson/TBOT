@@ -35,6 +35,47 @@ class BaseBot(ABC):
         # Explicitly initialize the settings table (created on first access)
         _ = self.env['bot.settings']
 
+        self.time_scale_normalizer = {
+            'tbot_utc_ns': lambda x: int(x)
+        }
+
+        # F0.7.9.A: native provider selection state. Default ccxt.
+        # Populated by _resolve_exchange_provider() in subclasses AFTER
+        # self.config and self.logger are set.
+        self.tbotex_provider_name = 'ccxt'
+        self._provider_factory = None
+
+    def _resolve_exchange_provider(self):
+        """F0.7.9.B: pick native provider for self.config.
+
+        Call from subclass AFTER self.config = get_bot_config(...) and
+        AFTER self.logger = perf_logger.get_logger(...).
+        """
+        from core.tbotex import get_provider, has_provider
+        provider_name = (self.config or {}).get('exchange_provider', 'ccxt')
+        self.tbotex_provider_name = provider_name
+        self._provider_factory = None
+
+        if provider_name == 'ccxt':
+            return
+
+        exchange = ((self.config or {}).get('exchange') or '').lower()
+        market_type = ((self.config or {}).get('market_type') or 'spot').lower()
+
+        if not has_provider(exchange, market_type):
+            self.logger.warning(
+                f"Bot {self.bot_id}: provider '{provider_name}' not "
+                f"registered for {exchange}/{market_type} — "
+                f"falling back to ccxt")
+            return
+
+        factory = get_provider(exchange, market_type)
+        if factory:
+            self._provider_factory = factory
+            self.logger.info(
+                f"Bot {self.bot_id}: using tbotex provider "
+                f"'{provider_name}' for {exchange}/{market_type}")
+
     @abstractmethod
     async def start(self):
         """Start the bot."""
@@ -65,11 +106,8 @@ class BaseBot(ABC):
         """Called after configuration changes via the web interface."""
         pass
 
-    def get_time_ns(self) -> int:
-        """
-Returns the exact UTC time if the service is available; otherwise, returns the system time."""
-        try:
-            return self.time_sync.get_utc_ns()
-        except Exception as e:
-            self.logger.Error(f"Time core synchronization error: {e}")
-            return time.time_ns()
+    @staticmethod
+    def get_time_ns() -> int:
+        if time_sync_service.is_synced_event.is_set():
+            return time_sync_service.get_utc_ns()
+        return time.time_ns()
