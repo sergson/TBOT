@@ -984,25 +984,68 @@ class SignalManager:
         })
         await self.bot._send_feedback_for_row(self.current_order)
 
+    async def _probe_net_position(self):
+        """Probe the actual signed net position on the exchange.
+
+        Returns:
+          - float: signed net position (0.0 == flat)
+          - None: probe failed or ambiguous (hedge mode / multiple non-zero)
+
+        Caller must fall back to _total_filled()-based estimate on None.
+        """
+        try:
+            positions = await self.bot.broker_handle.get(
+                "fetch_positions",
+                key_id=self.bot.config['broker_key_id'],
+                symbols=[self.plan['symbol']])
+        except Exception as e:
+            self.logger.warning(
+                f"{self._log_prefix()} position probe failed: {e}")
+            return None
+
+        if positions is None:
+            self.logger.warning(
+                f"{self._log_prefix()} position probe returned None")
+            return None
+
+        net = 0.0
+        nonzero = 0
+        for p in positions:
+            s = self._signed_position(p)
+            if abs(s) > 1e-12:
+                nonzero += 1
+            net += s
+
+        # hedge mode / multiple non-zero positions — ambiguous
+        if nonzero > 1:
+            self.logger.warning(
+                f"{self._log_prefix()} multiple non-zero positions — "
+                f"ambiguous, fallback")
+            return None
+
+        return net
+
     async def _maybe_market_close_remainder(self) -> bool:
         """Close the remainder with a 'reduce-only' market order.
 
-        Trigger: remaining = plan.amount_placed − _total_filled().
+        Trigger: actual exchange net position (via _probe_net_position),
+        not the book-keeping _total_filled().
 
           * remaining ≤ threshold (plan_vol × close_market_fraction):
             Attempt a market-close up to MAX_MARKET_CLOSE_ATTEMPTS times.
-          * remaining > threshold: a market-close is too costly/risky
-            (due to potential slippage on a large volume) — trigger an immediate 'force-complete' feedback;
-            the remainder will be accounted for during the next 'signal 0' event.
+          * remaining > threshold: market-close is too costly/risky
+            (slippage) — force-complete feedback; residual absorbed by
+            _reconcile_entry_position at next signal 0.
 
-        Returns True if the position is flat OR a 'force-complete' feedback has been sent
-        (which will trigger a grid reset). Returns False only during shutdown
-        (_cleaned / _stopping).
+        Returns True if flat OR force-complete feedback sent.
+        Returns False only during shutdown or for panic.
         """
         if DRY_RUN:
             return False
-            
         if not self.plan.get('reduce_only'):
+            return False
+        if self.plan.get('is_panic'):
+            # panic-close already sends its own feedback; never re-enter
             return False
         if self.current_order is None or self._cleaned:
             return False
@@ -1016,24 +1059,42 @@ class SignalManager:
         side = self.plan['side']
         original_order = self.current_order
 
+        # reduce-only sell closes long (+), reduce-only buy closes short (-)
+        expected_sign = 1 if side == 'sell' else -1
+
         for attempt in range(MAX_MARKET_CLOSE_ATTEMPTS):
             if self._cleaned or getattr(self.bot, '_stopping', False):
                 self.current_order = original_order
                 return False
 
-            filled_total = self._total_filled()
-            remaining = placed - filled_total
+            # --- NEW: trust the exchange, not order.filled ---
+            net = await self._probe_net_position()
 
-            # Already flat (including after a reconcile of the previous attempt)
+            if net is not None:
+                # protection: sign of exchange position must match close side
+                if abs(net) > 1e-12 and net * expected_sign < -1e-12:
+                    self.logger.error(
+                        f"{self._log_prefix()} market-close: exchange "
+                        f"position sign {net} does not match close side "
+                        f"{side} — force-complete only")
+                    self.current_order = original_order
+                    await self._force_complete_feedback()
+                    return True
+                remaining = abs(net)
+            else:
+                filled_total = self._total_filled()
+                remaining = placed - filled_total
+
+            # Already flat
             if remaining <= max(1e-12, placed * 1e-9):
                 self.logger.info(
-                    f"{self._log_prefix()} market-close: already flat "
-                    f"(total_filled={filled_total:.8f}/{placed:.8f})")
+                    f"{self._log_prefix()} market-close: exchange flat "
+                    f"(remaining={remaining:.8f}) — force-complete feedback")
                 self.current_order = original_order
+                await self._force_complete_feedback()
                 return True
 
-            # A large remaining position is not what we want. Closing at market would
-            # result in significant slippage; we’ll absorb it into the next signal 0.
+            # Large remaining — too costly for market-close
             if remaining > threshold:
                 self.logger.warning(
                     f"{self._log_prefix()} market-close: remaining="
@@ -1062,8 +1123,8 @@ class SignalManager:
                     reduce_only=True)
                 row.write({
                     'exchange_order_id': (order.get('id')
-                                           if isinstance(order, dict)
-                                           else None),
+                                          if isinstance(order, dict)
+                                          else None),
                     'exchange_state': 'open',
                     'last_sync_ns': self.get_time_ns(),
                 })
@@ -1093,8 +1154,8 @@ class SignalManager:
                     'reject_reason_raw': err[:255],
                     'last_sync_ns': self.get_time_ns(),
                 })
-                # We don't send feedback — the grid must not see a 0-fill retry
-                # (otherwise, the any_close-guard will break).
+                # No feedback — grid must not see a 0-fill retry,
+                # otherwise the any_close-guard breaks.
                 breaker = classify_breaker_reason(e)
                 if breaker:
                     try:
@@ -1105,7 +1166,7 @@ class SignalManager:
                     await asyncio.sleep(1.0)
                 continue
 
-            # We wait for a 'fill' via the existing event channel.
+            # Wait for fill via the existing event channel
             self.filled_event.clear()
             try:
                 await asyncio.wait_for(
@@ -1116,8 +1177,25 @@ class SignalManager:
                 row = self.current_order or row
 
             if row.exchange_state in TERMINAL_STATES:
-                await self.bot._send_feedback_for_row(row)
                 self.current_order = row
+
+                # --- NEW: re-probe the exchange, do NOT trust _total_filled ---
+                net_after = await self._probe_net_position()
+                if net_after is not None:
+                    if abs(net_after) <= max(1e-12, placed * 1e-9):
+                        await self.bot._send_feedback_for_row(row)
+                        self.logger.info(
+                            f"{self._log_prefix()} market-close: exchange "
+                            f"flat after attempt {attempt + 1} — done")
+                        return True
+                    # Still not flat — send partial feedback (if fill was
+                    # actually booked by the exchange), then retry.
+                    if float(row.amount_filled or 0) > 0:
+                        await self.bot._send_feedback_for_row(row)
+                    continue
+
+                # Probe failed — fall back to _total_filled (safest guess).
+                await self.bot._send_feedback_for_row(row)
                 new_total = self._total_filled()
                 if new_total >= placed * (1 - REL_TOL):
                     self.logger.info(
@@ -1139,8 +1217,7 @@ class SignalManager:
             self.current_order = row
             continue
 
-        # Exhausted attempts — force-complete: the grid will perform a reset,
-        # and the remainder will be absorbed upon the next signal 0.
+        # Exhausted attempts — force-complete so the grid can advance.
         self.logger.error(
             f"{self._log_prefix()} market-close: exhausted "
             f"{MAX_MARKET_CLOSE_ATTEMPTS} attempts — forcing feedback "
@@ -1839,7 +1916,7 @@ class SignalManager:
             self._cleanup()
             return
 
-        # 1. Canceling an active order with confirmation
+        # 1. Cancel active order with confirmation
         state = self.current_order.exchange_state
         if (self.active_order and not self.filled
                 and state not in TERMINAL_STATES):
@@ -1865,22 +1942,43 @@ class SignalManager:
                 self._cleanup()
                 return
 
-        # 2. Terminal state — just need to add the finishing touch (feedback)
+        # 2. Terminal state — finishing touch (feedback)
         state = self.current_order.exchange_state
         if state in TERMINAL_STATES:
-            # For a 'reduce-only' close that is only partially filled on the exchange —
-            # complete the position using a market order *before* the feedback reaches the grid. 
-            # Otherwise, the grid
-            # will get stuck indefinitely in the 'any_close-guard' state.
-            if (self.plan.get('reduce_only')
-                    and state in ('canceled', 'expired')
-                    and float(self.current_order.amount_filled or 0) > 0):
-                closed = await self._maybe_market_close_remainder()
-                if closed:
-                    self._cleanup()
-                    return
-                # closed=False only during shutdown — fall back to the standard behavior
-                # partial-forward remains as is
+            if self.plan.get('reduce_only') and not self.plan.get('is_panic'):
+                filled_amt = float(self.current_order.amount_filled or 0)
+                req_amt = float(self.plan.get('amount_requested') or 0.0)
+                placed = float(self.plan['amount_placed'] or 0.0)
+
+                # NEW: zero-fill canceled/expired reduce-only —
+                # probe the exchange; if flat, force-complete. Otherwise
+                # leave as zero-fill canceled so grid retries.
+                if state in ('canceled', 'expired') and filled_amt == 0:
+                    net = await self._probe_net_position()
+                    if (net is not None
+                            and abs(net) <= max(1e-12, placed * 1e-9)):
+                        self.logger.warning(
+                            f"{self._log_prefix()} zero-fill {state} "
+                            f"reduce-only, exchange flat — "
+                            f"force-complete feedback")
+                        await self._force_complete_feedback()
+                        self._cleanup()
+                        return
+
+                # Partial close: canceled/expired with fill OR
+                # 'filled' below request — Binance caps reduce-only to the
+                # real position size but still reports executedQty ==
+                # amount_placed.
+                partial_close = (
+                        state in ('canceled', 'expired')
+                        or (state == 'filled' and req_amt > 0
+                            and filled_amt < req_amt * (1 - REL_TOL)))
+                if partial_close and filled_amt > 0:
+                    closed = await self._maybe_market_close_remainder()
+                    if closed:
+                        self._cleanup()
+                        return
+
             if self.current_order.feedback_state != 'sent':
                 await self.bot._send_feedback_for_row(self.current_order)
             self._cleanup()
@@ -1893,13 +1991,13 @@ class SignalManager:
             threshold = placed * (1 - REL_TOL) if placed > 0 else 0
             result = 'filled' if total_filled >= threshold else 'partial'
 
-            # partial reduce-only — an attempt to close the remaining position via a market order.
-            if result == 'partial' and self.plan.get('reduce_only'):
+            if (result == 'partial'
+                    and self.plan.get('reduce_only')
+                    and not self.plan.get('is_panic')):
                 closed = await self._maybe_market_close_remainder()
                 if closed:
                     self._cleanup()
                     return
-                # closed=False → shutdown; keep 'partial' as is
 
             self.current_order.write({
                 'exchange_state': result,

@@ -422,12 +422,80 @@ class ExecutionBot(BaseBot):
             'signal_retry': int(getattr(row, 'signal_retry', 0) or 0),
         }
 
+    async def _build_feedback_payload_async(self, row) -> dict:
+        """Build the feedback payload, correcting reduce-only fills
+        against the actual exchange position.
+
+        Binance reports a reduce-only order as fully 'filled' even when
+        the real position was smaller than amount_placed (the excess
+        cannot be opened). In that case `order.filled` overstates the
+        true closed volume, and the feedback formula
+            real_vol_rate = signal_vol_rate * amount_filled / amount_requested
+        under-reports the close to the grid. Grid then keeps the -2 signal
+        alive waiting for a remainder that no longer exists.
+        """
+        payload = self._build_feedback_payload(row)
+        if DRY_RUN:
+            return payload
+        if not row.reduce_only or row.exchange_state != 'filled':
+            return payload
+        if not self.order_manager:
+            return payload
+
+        try:
+            positions = await self.order_manager.fetch_positions([row.symbol])
+        except Exception as e:
+            self.logger.warning(
+                f"feedback position probe for order {row.id}: {e}")
+            return payload
+
+        if positions is None:
+            self.logger.warning(
+                f"feedback position probe for order {row.id}: "
+                f"returned None — keep payload as is")
+            return payload
+
+        net = 0.0
+        nonzero = 0
+        for p in positions:
+            info = p.get('info') or {}
+            amt = info.get('positionAmt')
+            try:
+                if amt is not None:
+                    signed = float(amt)
+                else:
+                    c = float(p.get('contracts') or 0)
+                    if (p.get('side') or '').lower() == 'short':
+                        signed = -abs(c)
+                    else:
+                        signed = abs(c)
+            except (TypeError, ValueError):
+                continue
+
+            if abs(signed) > 1e-12:
+                nonzero += 1
+            net += signed
+
+        if nonzero > 1:
+            self.logger.warning(
+                f"feedback order {row.id}: multiple non-zero positions — "
+                f"ambiguous, keep payload as is")
+            return payload
+
+        if abs(net) < 1e-9:
+            payload['real_volume'] = float(row.signal_vol_rate or 0.0)
+            self.logger.info(
+                f"Feedback order {row.id} (pos={row.position_id} "
+                f"sig={row.signal_number}): exchange flat — "
+                f"overriding real_volume to {payload['real_volume']}")
+        return payload
+
     async def _send_feedback_for_row(self, row) -> bool:
         if not self.feedback_handle:
             return False
         if 'record_execution' not in (self.feedback_capabilities or {}):
             return False
-        payload = self._build_feedback_payload(row)
+        payload = await self._build_feedback_payload_async(row)
         for attempt in range(3):
             try:
                 await self.feedback_handle.set("record_execution", payload)
