@@ -23,7 +23,8 @@ from modules.broker.lib.exchange_directory import (
 from core import styles as ui_compact
 from core.graphics import db_fill_badge
 from .models import (ATTENTION_DOMAIN, ATTENTION_FIELDS, PRICE_MAX_ROWS,
-                    DEFAULT_MAX_ORDER_ROWS, STATS_SAMPLE_SIZE)
+                    DEFAULT_MAX_ORDER_ROWS, STATS_SAMPLE_SIZE,
+                    PANIC_SIGNAL_NUMBER_FALLBACK)
 
 MAX_LEVERAGE = 125
 MIN_POLL_INTERVAL = 50
@@ -78,18 +79,13 @@ def _rgba(hex_color, alpha):
     b = int(hex_color[5:7], 16)
     return f'rgba({r},{g},{b},{alpha})'
 
-
 def _semantic_color(signal_number, side):
-    """sn == -1 → BLACK; -2 → BLUE; -3 → ORANGE; 
-	sn == 0 → GREEN/RED; sn > 0 → MEDIUM_GREEN/MEDIUM_RED. 
-	For sn < 0, side is ignored."""
+    if signal_number == PANIC_SIGNAL_NUMBER_FALLBACK: return colors.ORANGE
     if signal_number == -1: return colors.BLACK
     if signal_number == -2: return colors.BLUE
-    if signal_number == -3: return colors.ORANGE
     if signal_number == 0:
         return colors.GREEN if side == 'buy' else colors.RED
     return colors.MEDIUM_GREEN if side == 'buy' else colors.MEDIUM_RED
-
 
 def _state_edge(exchange_state):
     """Stroke color. Width is fixed at 1. None / unknown → GRAY."""
@@ -119,7 +115,7 @@ _LEGEND_COLORS = {
     'Avg sell':     _semantic_color(1, 'sell'),
     'Close':        _semantic_color(-2, None),
     'Liquidation':  _semantic_color(-1, None),
-    'Panic':        _semantic_color(-3, None),
+    'Panic':        _semantic_color(PANIC_SIGNAL_NUMBER_FALLBACK, None),
 }
 
 
@@ -174,11 +170,11 @@ def execution_form(current_bot_id=None):
 
     return html.Div([
         dcc.Store(
-            id={"type": "execution-field", "field": "editing_flag"},
+            id={"type": "execution-meta", "name": "editing_flag"},
             data=bool(editing),
         ),
         html.Div(
-            id={"type": "execution-field", "field": "prefill_status"},
+            id={"type": "execution-meta", "name": "prefill_status"},
             style={"fontSize": "small", "color": colors.GRAY,
                    "marginBottom": "1px"},
         ),
@@ -231,6 +227,7 @@ def execution_form(current_bot_id=None):
             "Broker key", options=[],
             value=(cfg.get('broker_key_id') if editing else None),
             placeholder="Select a key from Broker",
+            clearable=False,
             inline=True,
         ),
         ui_compact.input_field(
@@ -359,13 +356,12 @@ def build_execution_figure(bot_id, config, relayout_store):
 def _render_orders(fig, df_o):
     """Shape by semantics, color by state; legend - semantics (dummy-trace)."""
     def _semantic(_sn, _side):
-        # Normalize 'side' so that 'shape' and 'color' are
-		# consistent when 'side' is NaN/None. If sn < 0, 'side' is irrelevant.
         if _side not in ('buy', 'sell'):
             _side = 'buy'
+        if _sn == PANIC_SIGNAL_NUMBER_FALLBACK:
+            return 'Panic', 'diamond', 10
         if _sn == -1: return 'Liquidation', 'star', 8
         if _sn == -2: return 'Close', 'x', 8
-        if _sn == -3: return 'Panic', 'diamond', 10
         if _sn == 0:
             return (f'Entry {_side}',
                     'triangle-up' if _side == 'buy' else 'triangle-down', 12)
@@ -388,13 +384,13 @@ def _render_orders(fig, df_o):
     df_o['_size'] = sizes
 
     base_color = pd.Series(index=df_o.index, dtype=object)
+    base_color[sn == PANIC_SIGNAL_NUMBER_FALLBACK] = colors.ORANGE
     base_color[sn == -1] = colors.BLACK
     base_color[sn == -2] = colors.BLUE
-    base_color[sn == -3] = colors.ORANGE
-    base_color[(sn == 0) & (side == 'buy')]  = colors.GREEN
+    base_color[(sn == 0) & (side == 'buy')] = colors.GREEN
     base_color[(sn == 0) & (side == 'sell')] = colors.RED
-    base_color[(sn >  0) & (side == 'buy')]  = colors.MEDIUM_GREEN
-    base_color[(sn >  0) & (side == 'sell')] = colors.MEDIUM_RED
+    base_color[(sn > 0) & (side == 'buy')] = colors.MEDIUM_GREEN
+    base_color[(sn > 0) & (side == 'sell')] = colors.MEDIUM_RED
     base_color = base_color.fillna(colors.GRAY)
 
     alpha = state.map(_state_opacity)
@@ -484,7 +480,7 @@ def _render_paused_badge(config):
                    'marginTop': '1px'}),
         html.Div(
             "Signals are ignored until the pause is lifted. "
-            "Panic close (-3) is always executed.",
+            "Panic close is always executed.",
             style={'fontSize': 'small', 'color': colors.DARK_GRAY,
                    'marginTop': '1px'}),
     ], style={
@@ -904,9 +900,9 @@ class ExecutionTypeMeta:
             Output({'type': 'execution-field', 'field': 'market_type'}, 'value'),
             Output({'type': 'execution-field', 'field': 'symbol'}, 'value'),
             Output({'type': 'execution-field', 'field': 'leverage'}, 'value'),  # NEW
-            Output({'type': 'execution-field', 'field': 'prefill_status'}, 'children'),
+            Output({'type': 'execution-meta', 'name': 'prefill_status'}, 'children'),
             Input({'type': 'execution-field', 'field': 'source_bot_id'}, 'value'),
-            State({'type': 'execution-field', 'field': 'editing_flag'}, 'data'),
+            State({'type': 'execution-meta', 'name': 'editing_flag'}, 'data'),
             prevent_initial_call=False,
         )
         def prefill_from_source(source_bot_id, editing):

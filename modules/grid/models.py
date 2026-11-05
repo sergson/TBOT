@@ -2383,8 +2383,9 @@ class GridBot(BaseBot):
     async def force_reset_position(self):
         """Panic close via execution + local reset.
 
-        Sends a special signal (-3) to the execution bot asking it to
-        cancel every open order on the exchange for this symbol and
+        Sends a special signal (PANIC_SIGNAL_NUMBER, default -999999) to the
+        execution bot asking it to cancel every open order
+        on the exchange for this symbol and
         market-close any non-zero position (reduce-only). Grid then
         waits up to FORCE_RESET_TIMEOUT_NS for feedback:
 
@@ -2404,7 +2405,7 @@ class GridBot(BaseBot):
         Single-bot mode (execution_timeout_sec == 0): no executor exists
         to receive a panic signal — reset locally and immediately.
 
-        Two-bot mode: send panic (-3) to executor, wait for feedback
+        Two-bot mode: send panic to executor, wait for feedback
         or timeout.
         """
         if self._close_in_progress:
@@ -2446,16 +2447,17 @@ class GridBot(BaseBot):
 
         if not created:
             self.logger.error(
-                "force_reset_position: _create_signal(-3) refused — "
+                "force_reset_position: _create_signal refused — "
                 "position already reset locally or reset pending")
             return
 
         self._force_reset_pending = True
         self._force_reset_deadline_ns = current_ts + FORCE_RESET_TIMEOUT_NS
         self.logger.warning(
-            f"force_reset_position: sent panic-close signal (-3) for "
-            f"pos={self._position_id}, waiting up to "
-            f"{FORCE_RESET_TIMEOUT_NS / 1e9:.0f}s for execution feedback")
+            f"force_reset_position: sent panic-close signal "
+            f"({PANIC_SIGNAL_NUMBER}) for pos={self._position_id}, "
+            f"waiting up to {FORCE_RESET_TIMEOUT_NS / 1e9:.0f}s "
+            f"for execution feedback")
 
     # ------------------------------------------------------------------
     # Helper methods (some converted)

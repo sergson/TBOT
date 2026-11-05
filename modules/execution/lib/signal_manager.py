@@ -13,12 +13,9 @@ MAX_CONSECUTIVE_FAILURES = 3
 
 TERMINAL_STATES = {'filled', 'canceled', 'rejected', 'expired', 'not_found'}
 
-# _plan_from_row — staticmethod, bot
-# inaccessible; comparison is performed against a fallback constant. This relies on
-# the current grid contract (panic == -999_999). If the signal_constants
-# diverge, is_panic will be incorrect during the recovery process.
-# It is recommended to synchronize changes to PANIC_SIGNAL_NUMBER across
-# both files or to pass the constant via the row object.
+# Fallback used only if bot._panic_signal_number is unavailable
+# (e.g. unit-test stub without bot). The live code reads
+# bot._panic_signal_number which is loaded from signal_constants at start().
 _PANIC_FALLBACK = -999_999
 
 # --- cancel-confirm invariant ---
@@ -185,7 +182,7 @@ class SignalManager:
         Does not create a new attempt. The `active_order` is NOT hydrated here —
         this is handled by the caller (`_recover_pair`) after `fetch_order`.
         """
-        plan = cls._plan_from_row(row)
+        plan = cls._plan_from_row(bot, row)
         mgr = cls(bot, plan, logger, time_provider)
         mgr.current_order = row
         if row.client_order_id:
@@ -193,8 +190,9 @@ class SignalManager:
         return mgr
 
     @staticmethod
-    def _plan_from_row(row):
+    def _plan_from_row(bot, row):
         sig_num = row.signal_number
+        panic_number = getattr(bot, '_panic_signal_number', _PANIC_FALLBACK)
         return {
             'position_id': row.position_id,
             'signal_number': sig_num,
@@ -210,7 +208,7 @@ class SignalManager:
             'amount_requested': row.amount_requested or 0.0,
             'amount_placed': row.amount_placed or 0.0,
             'is_panic': (isinstance(sig_num, int)
-                         and sig_num == _PANIC_FALLBACK),
+                         and sig_num == panic_number),
             'signal_smart': bool(getattr(row, 'signal_smart', False)),
             'signal_retry': int(getattr(row, 'signal_retry', 0) or 0),
         }
@@ -447,6 +445,12 @@ class SignalManager:
             return math.ceil(x / p) * p
 
         placed = _floor_step(raw_f, precision)
+        if self.plan.get('reduce_only'):
+            if placed <= 0:
+                return None
+            if min_amount and placed < min_amount:
+                return None
+            return float(placed)
 
         if min_amount and placed < min_amount:
             placed = min_amount
@@ -516,7 +520,11 @@ class SignalManager:
 
         if spend_cur == quote:
             if market_type == 'futures':
-                required = placed * ref_price / max(om.leverage, 1) + buffer_quote
+                if self.plan.get('reduce_only'):
+                    # Reduce-only close does not require additional margin.
+                    required = buffer_quote
+                else:
+                    required = placed * ref_price / max(om.leverage, 1) + buffer_quote
             else:
                 required = placed * ref_price + buffer_quote
         else:
@@ -547,7 +555,17 @@ class SignalManager:
 
             self._new_attempt()
 
-            # NEW: The position is already equal to the target — do not place an order;
+            if self.plan.get('_reconcile_refuse'):
+                self.current_order.write({
+                    'exchange_state': 'not_sent',
+                    'reject_reason': 'leftover_position_refused',
+                    'last_sync_ns': self.get_time_ns(),
+                })
+                await self.bot._send_feedback_for_row(self.current_order)
+                self._cleanup()
+                return
+
+            # The position is already equal to the target — do not place an order;
             # send a synthetic fill so that the grid can advance.
             if self.plan.get('_reconcile_skip_fill'):
                 self.current_order.write({
@@ -693,13 +711,10 @@ class SignalManager:
         pos_size = 0.0
         close_side = self.plan.get('side') or 'sell'
         for pos in self.plan['_panic_positions']:
-            try:
-                contracts = float(pos.get('contracts') or 0)
-            except (TypeError, ValueError):
-                contracts = 0.0
-            if abs(contracts) > 0:
-                pos_size = abs(contracts)
-                close_side = 'sell' if contracts > 0 else 'buy'
+            signed = self._signed_position(pos)
+            if abs(signed) > 0:
+                pos_size = abs(signed)
+                close_side = 'sell' if signed > 0 else 'buy'
                 break
         self.plan['side'] = close_side
         self.plan['amount_requested'] = pos_size
@@ -1136,29 +1151,19 @@ class SignalManager:
         return True
 
     async def _reconcile_entry_position(self):
-        """signal 0: account for the actual remaining position on the exchange.
+        """signal 0: align actual exchange position to target_signed.
 
-        Formula: order_delta = target_signed − current_signed,
-        where target_signed = entry_sign × signal_amount.
-
-          * same direction (leftover < target) → smaller order
-          * same direction (leftover > target) → order in the opposite
-            direction, to reach exactly the target
-          * opposite direction (flip)          → larger order
-
-        After a full fill, the position on the exchange becomes exactly target_signed,
-        and the feedback ratio real_vol_rate = signal_vol_rate remains 1:1
-        (amount_requested = amount_placed = |delta|).
-
-        Fail-safe: in the event of a fetch_positions error, return without
-        making changes and place the order as originally planned (any
-        mismatch will be flagged by a UI indicator).
+        - same direction, current > target -> reduce-only excess
+        - same direction, current < target -> normal entry for missing part
+        - opposite direction, small leftover -> flip in one order
+        - opposite direction, large leftover -> refuse
         """
         if DRY_RUN:
             return
-            
+
         if self.plan.get('signal_number') != 0:
             return
+
         try:
             positions = await self.bot.broker_handle.get(
                 "fetch_positions",
@@ -1170,48 +1175,72 @@ class SignalManager:
                 f"fetch_positions failed: {e} — proceeding as-is")
             return
 
-        current_signed = 0.0
+        nonzero = []
         for p in positions or []:
-            try:
-                c = float(p.get('contracts') or 0)
-            except (TypeError, ValueError):
-                c = 0.0
-            if abs(c) > 1e-12:
-                current_signed = c
-                break
+            s = self._signed_position(p)
+            if abs(s) > 1e-12:
+                nonzero.append(s)
 
+        if len(nonzero) > 1:
+            self.logger.error(
+                f"{self._log_prefix()} reconcile entry: multiple non-zero "
+                f"positions {nonzero} — hedge mode or ambiguous state; "
+                f"refusing reconcile")
+            self.plan['_reconcile_refuse'] = True
+            return
+
+        current_signed = nonzero[0] if nonzero else 0.0
         if abs(current_signed) < 1e-9:
-            return  # no remainder — standard flow
+            return
 
         entry_sign = 1 if self.plan['side'] == 'buy' else -1
         signal_amount = float(self.plan['amount_placed'] or 0.0)
         if signal_amount <= 0:
             return
+
         target_signed = entry_sign * signal_amount
         delta = target_signed - current_signed
 
         if abs(delta) < 1e-9:
-            # The position is already at the target — no order needed; synthetic fill.
             self.logger.info(
                 f"{self._log_prefix()} reconcile entry: position already "
                 f"at target ({target_signed:.8f}) — synthetic fill")
             self.plan['_reconcile_skip_fill'] = True
             return
 
-        new_side = 'buy' if delta > 0 else 'sell'
-        new_amount = abs(delta)
+        # Do not flip a large opposite leftover in one entry order.
+        if (current_signed * target_signed < 0
+                and abs(current_signed) > 2 * signal_amount):
+            self.logger.error(
+                f"{self._log_prefix()} reconcile entry: opposite leftover "
+                f"{current_signed:.8f} > 2x entry {signal_amount:.8f}; "
+                f"refusing — close it manually or via -2/-3")
+            self.plan['_reconcile_refuse'] = True
+            return
+
+        same_dir = current_signed * target_signed > 0
+
+        if same_dir and abs(current_signed) > abs(target_signed):
+            # Leftover is larger than target: reduce only the excess.
+            new_side = 'buy' if current_signed < 0 else 'sell'
+            new_amount = abs(current_signed) - abs(target_signed)
+            reduce_only = True
+        else:
+            # No position, leftover smaller than target, or small flip.
+            new_side = 'buy' if delta > 0 else 'sell'
+            new_amount = abs(delta)
+            reduce_only = False
 
         self.logger.warning(
             f"{self._log_prefix()} reconcile entry: current="
             f"{current_signed:.8f}, target={target_signed:.8f}, "
-            f"delta={delta:.8f} → {new_side} {new_amount:.8f}")
+            f"delta={delta:.8f} → {new_side} {new_amount:.8f} "
+            f"reduce_only={reduce_only}")
 
-        # amount_requested = amount_placed = |delta| - critical:
-        # feedback ratio will give real_vol_rate = signal_vol_rate
-        # when full (amount_filled/amount_requested == 1).
         self.plan['side'] = new_side
         self.plan['amount_placed'] = new_amount
         self.plan['amount_requested'] = new_amount
+        self.plan['reduce_only'] = reduce_only
 
     # ---------- limit ----------
 
@@ -1596,6 +1625,34 @@ class SignalManager:
 
         # Phase 2 — best, fallback to signal_price.
         return self._get_best_price() or signal_price
+
+    @staticmethod
+    def _signed_position(p):
+        """Return signed position size.
+
+        Binance USDT-M via ccxt may return contracts > 0 for both sides,
+        with direction in p['side']. Prefer info.positionAmt (signed),
+        fallback to side.
+        """
+        info = p.get('info') or {}
+        for key in ('positionAmt', 'positionAmtStr'):
+            if key in info:
+                try:
+                    return float(info[key])
+                except (TypeError, ValueError):
+                    pass
+
+        try:
+            c = float(p.get('contracts') or 0)
+        except (TypeError, ValueError):
+            c = 0.0
+
+        side = (p.get('side') or '').lower()
+        if side == 'short':
+            return -abs(c)
+        if side == 'long':
+            return abs(c)
+        return c
 
     def update_price(self, bid, ask, timestamp_ns):
         self.last_bid = bid

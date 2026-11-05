@@ -1327,17 +1327,22 @@ class ExecutionBot(BaseBot):
             bot_id=self.bot_id,
         )
 
-        # Register with broker for order updates
-        if DRY_RUN:
-            self.logger.warning(
-                "No real orders will be sent to the exchange. "
-                "All fills are emulated locally. ")
+        if not DRY_RUN and (self.config.get('market_type') or '').lower() == 'futures':
+            lev = int(self.config.get('leverage') or 0)
+            if lev > 0:
+                try:
+                    await self.order_manager.set_leverage(lev)
+                    self.logger.info(f"Leverage set to {lev}x on exchange")
+                except Exception as e:
+                    self.logger.error(f"set_leverage({lev}) failed: {e}")
+                    # fail-safe: local margin check must not assume exchange leverage
+                    self.order_manager.leverage = 1
 
         # Register with broker for order updates (skip in DRY_RUN:
         # no real orders means no updates to route)
         if DRY_RUN:
             self.logger.info(
-                "[DRY-RUN] skipping register_key_owner — no live orders")
+                "Skipping register_key_owner — no live orders")
         else:
             if not await self._register_with_broker():
                 self.logger.warning(
