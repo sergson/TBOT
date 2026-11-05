@@ -1,4 +1,4 @@
-# app.py (version 0.4.6)
+# app.py (version 0.5.0)
 # Copyright (c) 2026 sergson (https://github.com/sergson)
 # Licensed under GNU General Public License v3.0
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
@@ -505,11 +505,16 @@ def save_bot(n_clicks, bot_type, field_values, field_ids, trigger):
     if not n_clicks or not bot_type:
         return no_update, no_update
 
+    field_prefix = f"{bot_type}-field"
+    skip_fields = {'editing_flag', 'prefill_status'}
     config = {}
     for val, id_dict in zip(field_values, field_ids):
+        if id_dict.get('type') != field_prefix:
+            continue
         field = id_dict.get('field')
-        if field:
-            config[field] = val
+        if not field or field in skip_fields or val is None:
+            continue
+        config[field] = val
 
     _meta_cls = bot_registry.get_model(f"{bot_type}.type")
 
@@ -747,22 +752,26 @@ def enter_edit_mode(n_clicks_list, editing, prev_clicks):
     if not ctx.triggered:
         return no_update, no_update, no_update, no_update
 
-    current = [c if c is not None else 0 for c in (n_clicks_list or [])]
-    previous = [p if p is not None else 0 for p in (prev_clicks or [])]
+    triggered = ctx.triggered[0]
+    if not triggered.get('value'):
+        return no_update, n_clicks_list, no_update, no_update
 
-    if len(previous) != len(current):
-        return no_update, current, no_update, no_update
+    prop_id = triggered['prop_id'].split('.')[0]
+    try:
+        btn_id = json.loads(prop_id)
+    except (json.JSONDecodeError, TypeError):
+        return no_update, n_clicks_list, no_update, no_update
 
-    for i, (cur, prev) in enumerate(zip(current, previous)):
-        if cur > prev:
-            bots = get_all_bots()
-            if i < len(bots):
-                bot_id = str(bots[i]['id'])
-                editing = editing or {}
-                editing[bot_id] = True
-                return (editing, current,
-                        {'display': 'none'}, 0)
-    return no_update, current, no_update, no_update
+    if btn_id.get('type') != 'edit-btn':
+        return no_update, n_clicks_list, no_update, no_update
+
+    bot_id = btn_id.get('index')
+    if bot_id is None:
+        return no_update, n_clicks_list, no_update, no_update
+
+    # One edit form at a time: Dash does not allow duplicate pattern IDs.
+    editing = {str(bot_id): True}
+    return editing, n_clicks_list, {'display': 'none'}, 0
 
 @app.callback(
     [Output('editing-bots', 'data', allow_duplicate=True),
@@ -779,47 +788,80 @@ def save_editing(n_clicks_list, btn_ids, field_values, field_ids, editing, trigg
     ctx = callback_context
     if not ctx.triggered:
         return no_update, no_update
-    triggered = ctx.triggered[0]
-    dict_str = triggered['prop_id'].split('.')[0]
-    btn_id = json.loads(dict_str)
-    bot_id = btn_id['index']
 
-    idx = None
-    for i, id_dict in enumerate(btn_ids):
-        if id_dict['index'] == bot_id and n_clicks_list[i]:
-            idx = i
-            break
-    if idx is None:
+    triggered = ctx.triggered[0]
+    prop_id = triggered['prop_id'].split('.')[0]
+    try:
+        btn_id = json.loads(prop_id)
+    except (json.JSONDecodeError, TypeError):
         return no_update, no_update
 
-    new_fields = {}
-    for val, id_dict in zip(field_values, field_ids):
-        field = id_dict.get('field')
-        if field:
-            new_fields[field] = val
-    new_fields.pop('data_db_path', None)
+    if btn_id.get('type') != 'edit-save-btn':
+        return no_update, no_update
 
-    old_config = get_bot_config(bot_id) or {}
+    bot_id = btn_id.get('index')
+    if bot_id is None:
+        return no_update, no_update
+
+    # We confirm that a click actually occurred (n_clicks >= 1).
+    try:
+        idx = btn_ids.index(next(
+            d for d in btn_ids if d.get('index') == bot_id))
+    except (StopIteration, ValueError):
+        return no_update, no_update
+    if idx >= len(n_clicks_list) or not n_clicks_list[idx]:
+        return no_update, no_update
+
     bots = get_all_bots()
     bot = next((b for b in bots if b['id'] == bot_id), None)
     if not bot:
         return no_update, no_update
+
     bot_type = bot['type']
     _meta_cls = bot_registry.get_model(f"{bot_type}.type")
+    if not _meta_cls:
+        return no_update, no_update
+
+    # Collect only the fields for this specific bot_type.
+    # Store/Div now use 'name' instead of 'field' — they are not present in 'field_ids',
+    # and 'zip' has been aligned. SKIP_FIELDS serves as a safeguard against legacy forms.
+    field_prefix = f"{bot_type}-field"
+    skip_fields = {'editing_flag', 'prefill_status'}
+    # Fields for which None means "clear / use default".
+    clearable_fields = {'feedback_bot_id', 'collector_table'}
+
+    new_fields = {}
+    for val, id_dict in zip(field_values, field_ids):
+        if id_dict.get('type') != field_prefix:
+            continue
+        field = id_dict.get('field')
+        if not field or field in skip_fields:
+            continue
+        if val is None and field not in clearable_fields:
+            continue
+        new_fields[field] = val
+
+    old_config = get_bot_config(bot_id) or {}
+
+    # broker_key_id must not be lost due to an options update.
+    if (not new_fields.get('broker_key_id')
+            and old_config.get('broker_key_id')):
+        new_fields['broker_key_id'] = old_config['broker_key_id']
 
     try:
-        if _meta_cls and hasattr(_meta_cls, 'process_edit_save'):
+        if hasattr(_meta_cls, 'process_edit_save'):
             config = _meta_cls.process_edit_save(bot_id, new_fields, old_config)
         else:
             config = old_config.copy()
             config.update(new_fields)
     except ValueError as e:
-        # Strict validation ("hard guard") for immutable fields (exchange/market_type/symbol).
-        # The form remains open, the bot's status does not change, and no
-        # configuration files are written — the user is notified that the save
-        # operation was rejected (indicated by "mood=cancel" in the header).
-        # There is no need to update the bot.
         logger.warning(f"Edit rejected for bot {bot_id}: {e}")
+        perf_logger.set_mood('cancel')
+        return no_update, no_update
+    except Exception as e:
+        # TypeError / KeyError / AttributeError from process_edit_save
+        # Previously, these would occur without any diagnostic information — now we log them along with a traceback.
+        logger.error(f"Edit save crashed for bot {bot_id}: {e}", exc_info=True)
         perf_logger.set_mood('cancel')
         return no_update, no_update
 

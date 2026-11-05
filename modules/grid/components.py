@@ -15,6 +15,7 @@ from core import auto_reg, colors, styles, graphics
 from core import styles as ui_compact
 from core.styles import input_field, dropdown_field
 from core.database import get_all_bots, get_bot_config, DBSQLite3
+from .models import PANIC_SIGNAL_NUMBER
 from core.logger import perf_logger
 import time
 
@@ -48,19 +49,37 @@ def get_collector_tables(collector_bot_id: int) -> list:
 # ----------------------------------------------------------------------
 def prepare_config_for_save(raw_config: dict) -> dict:
     cleaned = raw_config.copy()
+
+    # RadioItems → int 0/1; legacy Checklist → list.
     if 'use_analyst_close' in cleaned:
         val = cleaned['use_analyst_close']
-        cleaned['use_analyst_close'] = 1 if (isinstance(val, list) and 1 in val) else 0
+        if isinstance(val, list):
+            cleaned['use_analyst_close'] = 1 if 1 in val else 0
+        else:
+            try:
+                cleaned['use_analyst_close'] = 1 if int(val or 0) else 0
+            except (TypeError, ValueError):
+                cleaned['use_analyst_close'] = 0
+
     numeric_fields = ['leverage', 'max_averaging_count', 'smart_averaging_count',
                       'poll_interval_sec', 'execution_timeout_sec', 'execution_reserve_sec']
     numeric_fields.extend(['history_days', 'history_positions_limit'])
     for f in numeric_fields:
-        if f in cleaned and cleaned[f] is not None:
-            cleaned[f] = int(cleaned[f])
-    if cleaned.get('smart_averaging_count') > cleaned.get('max_averaging_count'):
-        cleaned['smart_averaging_count'] = cleaned['max_averaging_count']
+        if f in cleaned and cleaned[f] not in (None, ''):
+            try:
+                cleaned[f] = int(float(cleaned[f]))
+            except (TypeError, ValueError):
+                # Keeping the original value is a better strategy
+                # than silently dropping the save.
+                pass
+
+    _sm = cleaned.get('smart_averaging_count')
+    _mx = cleaned.get('max_averaging_count')
+    if isinstance(_sm, int) and isinstance(_mx, int) and _sm > _mx:
+        cleaned['smart_averaging_count'] = _mx
+
     float_fields = {
-        'averaging_threshold_pnl': 20.0,
+        'averaging_threshold_pnl': 75.0,
         'breakeven_pnl': 4.0,
         'close_pnl': 50.0,
         'liquidation_pnl': 90.0,
@@ -70,6 +89,7 @@ def prepare_config_for_save(raw_config: dict) -> dict:
             cleaned[f] = default
         else:
             cleaned[f] = float(cleaned[f])
+
     try:
         cleaned['history_days'] = max(1, min(365,
                                              int(cleaned.get('history_days') or 7)))
@@ -82,22 +102,26 @@ def prepare_config_for_save(raw_config: dict) -> dict:
         cleaned['history_positions_limit'] = 100
 
     if 'execution_reserve_ratio' in cleaned:
-        ratio = float(cleaned.pop('execution_reserve_ratio'))
-        timeout = int(cleaned.get('execution_timeout_sec', 0))
+        try:
+            ratio = float(cleaned.pop('execution_reserve_ratio'))
+        except (TypeError, ValueError):
+            ratio = 1 / 3
+        try:
+            timeout = int(cleaned.get('execution_timeout_sec', 0) or 0)
+        except (TypeError, ValueError):
+            timeout = 0
         if timeout > 0:
-            # rounding to the nearest second
             cleaned['execution_reserve_sec'] = int(timeout * ratio)
         else:
             cleaned['execution_reserve_sec'] = 0
 
-    #Nnormalization of exchange_provider.
+    # Normalization of exchange_provider.
     provider = cleaned.get('exchange_provider', 'ccxt')
     if provider not in ('ccxt', 'tbotex'):
         provider = 'ccxt'
     cleaned['exchange_provider'] = provider
 
-    # Dust-threshold. Clamp to [0.001, 0.1] — a safeguard against typos
-	# (0.5, or 50%, would cause actual partial closes to "collapse").
+    # Dust-threshold. Clamp to [0.001, 0.1].
     try:
         v = float(cleaned.get('close_dust_fraction') or 0.02)
     except (TypeError, ValueError):
@@ -127,7 +151,7 @@ def form_component(current_bot_id=None):
     use_analyst_close = 0
     leverage = 10
     averaging_strategy = "sum_prev"
-    averaging_threshold_pnl = 70
+    averaging_threshold_pnl = 75
     max_averaging_count = 3
     smart_averaging_count = 2
     breakeven_pnl = 4.0
@@ -227,7 +251,7 @@ def form_component(current_bot_id=None):
         input_field(
             {"type": "grid-field", "field": "averaging_threshold_pnl"},
             "Averaging Threshold PNL (%)",
-            type="number", value=averaging_threshold_pnl, min=1, max=95, step=1, inline=True
+            type="number", value=averaging_threshold_pnl, min=1, step=1, inline=True
         ),
         input_field(
             {"type": "grid-field", "field": "max_averaging_count"},
@@ -548,6 +572,17 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict) -> go.Figure:
                                 hovertemplate='Liq PNL: %{customdata[0]:.2f}%<br>Real: %{customdata[1]:.2f}%<extra></extra>',
                                 customdata=[[row.signal_pnl, row.real_pnl] for _, row in liq_signals.iterrows()]
                             ))
+                        panic_signals = df_sig[
+                            df_sig['signal_number'] == PANIC_SIGNAL_NUMBER
+                            ]
+                        if not panic_signals.empty:
+                            fig.add_trace(graphics.markers_trace(
+                                panic_signals['datetime'],
+                                panic_signals['signal_price'],
+                                'Panic signal',
+                                colors.ORANGE, 'diamond', 8,
+                                hovertemplate='Panic: %{y:.2f}<extra></extra>'
+                            ))
 
         # Real execution markers (real_flag=1)
         real_exec_recs = levels_manager.search([
@@ -699,6 +734,7 @@ def build_history_figure(bot_id: int, config: dict, relayout_store: dict) -> go.
                 sell_sig = df[(df['signal_direction'] == 'sell') & (df['signal_number'] != 0)]
                 close_sig = df[df['signal_number'] == -2]
                 liq_sig = df[df['signal_number'] == -1]
+                panic_sig = df[df['signal_number'] == PANIC_SIGNAL_NUMBER]
 
                 if not buy_sig.empty:
                     fig.add_trace(graphics.markers_trace(
@@ -741,6 +777,12 @@ def build_history_figure(bot_id: int, config: dict, relayout_store: dict) -> go.
                         liq_sig['datetime'], liq_sig['signal_price'],
                         'Liquidation signal', colors.MEDIUM_GRAY, 'star', 4,
                         hovertemplate='Liquidation: %{y:.2f}<extra></extra>'
+                    ))
+                if not panic_sig.empty:
+                    fig.add_trace(graphics.markers_trace(
+                        panic_sig['datetime'], panic_sig['signal_price'],
+                        'Panic signal', colors.ORANGE, 'diamond', 8,
+                        hovertemplate='Panic: %{y:.2f}<extra></extra>'
                     ))
 
                 # Real executions
@@ -1241,6 +1283,11 @@ class GridTypeMeta:
                                 {
                                     "if": {"filter_query": "{signal_number} = -2 && {real_pnl} < 0"},
                                     "backgroundColor": colors.LIGHT_RED
+                                },
+                                {
+                                    "if": {"filter_query":
+                                               f"{{signal_number}} = {PANIC_SIGNAL_NUMBER}"},
+                                    "backgroundColor": colors.LIGHT_YELLOW
                                 },
                             ],
                         )

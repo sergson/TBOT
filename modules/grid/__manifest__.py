@@ -1,7 +1,7 @@
 # modules/grid/__manifest__.py
 {
     "name": "Grid Bot",
-    "version": "0.4.9",
+    "version": "0.5.0",
     "description": "Grid trading bot with averaging, smart averaging, liquidation, and take-profit.",
     "author": "sergson",
     "license": "GPL-3.0",
