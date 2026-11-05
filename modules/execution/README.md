@@ -31,7 +31,7 @@
 8. [Feedback to grid](#8-feedback-to-grid)
 9. [Breaker / PAUSED](#9-breaker--paused)
 10. [Recovery and Reconciler](#10-recovery-and-reconciler)
-11. [Panic close (-3)](#11-panic-close--3)
+11. [Panic close](#11-panic-close)
 12. [Position and unit_volume](#12-position-and-unit_volume)
 13. [Configuration](#13-configuration)
 14. [Environment variables](#14-environment-variables)
@@ -48,7 +48,7 @@
 Execution Bot is the **execution layer** between a Grid bot and an exchange:
 
 ```
-┌────────────┐    signal (0, 1..N, -1, -2, -3)   ┌────────────────┐
+┌────────────┐ signal (0, 1..N, -1, -2, -999999)┌────────────────┐
 │  Grid Bot  │ ───────────────────────────────► │  Execution Bot │
 │  (source)  │                                  │                │
 │            │ ◄───────── record_execution ──── │                │
@@ -73,7 +73,7 @@ Execution Bot is the **execution layer** between a Grid bot and an exchange:
 ```
 
 **What the bot does:**
-- Consumes signals from the source grid bot: entry (`0`), averaging (`1..N`), liquidation (`-1`), close (`-2`), panic (`-3`), smart reverse (`< -100`).
+- Consumes signals from the source grid bot: entry (`0`), averaging (`1..N`), liquidation (`-1`), close (`-2`), panic (`-999999`), smart reverse (`< -100`).
 - Places, cancels, and re-places orders according to a phase model (`phase1` / `phase2` / `phase3`).
 - Tracks execution state via broker's **order-update queue** and REST reconciliation.
 - Sends feedback to the grid (`record_execution`) with the actual fill and volume.
@@ -154,7 +154,7 @@ self._panic_signal_number                         # cached from grid constants
 {
     'position_id': str,                 # UUID
     'signal_number': int,               # 0=entry, 1..N=avg, -1=liq, -2=close,
-                                        # -3=panic, <SMART_REVERSE_BASE=smart reverse
+                                        # -999999=panic, <SMART_REVERSE_BASE=smart reverse
     'signal_direction': 'buy'|'sell'|'close'|'liquidation',
     'signal_order_type': 'limit'|'market',
     'signal_price': float,
@@ -375,12 +375,24 @@ Order:
    - `cancel_order` + `_await_terminal_state` (3 s, or 1 s if `_stopping`).
    - If not confirmed → `feedback_state='pending'`, `feedback_last_error='cancel_unconfirmed'`, cleanup, exit.
 2. If state is terminal:
-   - For `reduce_only` `canceled`/`expired` with `amount_filled > 0` — try `_maybe_market_close_remainder` (Patch C).
+   - **NEW (Patch C+):** for `reduce_only` and `not is_panic`:
+     - **Zero-fill canceled/expired** (`amount_filled == 0`):
+       `_probe_net_position()` → if flat → `_force_complete_feedback()` + cleanup.
+       Otherwise leave as zero-fill canceled so grid can retry.
+     - **Partial close** — `state in ('canceled','expired')` with `amount_filled > 0`,
+       **or** `state == 'filled'` with `amount_filled < amount_requested * (1−REL_TOL)`
+       (Binance caps reduce-only to the real position size but reports
+       `executedQty == amount_placed`):
+       → `_maybe_market_close_remainder()`; on success — cleanup.
+   - Panic rows (`is_panic=True`) **do not** re-enter `_maybe_market_close_remainder` —
+     `_execute_panic_close` already sent its own feedback.
    - If feedback not yet sent — send it.
    - Cleanup, exit.
+
 3. Otherwise — total across all attempts:
    - `total >= placed * (1 - REL_TOL)` → `'filled'`.
-   - `total > 0` and below → `'partial'`, with `_maybe_market_close_remainder` for reduce-only.
+   - `total > 0` and below → `'partial'`; for `reduce_only` **and not is_panic** —
+     `_maybe_market_close_remainder()`.
    - `total == 0` → `'canceled'` + `reject_reason='timeout'`.
 4. `_weighted_avg_fill_price` — weighted avg of the fill across all attempts.
 5. `_send_feedback_for_row` (await).
@@ -441,21 +453,46 @@ Dispatches by `status`:
 
 Terminal-state guard: if `row.id != current_order.id` and `row.exchange_state in TERMINAL_STATES` — ignore (protects against reorder race).
 
-### 5.12. Market-close remainder (Patch C) — `_maybe_market_close_remainder`
+### 5.12. Market-close remainder (Patch C+) — `_maybe_market_close_remainder`
 
-Only for `reduce_only=True` (negative signals).
+Only for `reduce_only=True` and **not `is_panic`** (panic already sent its
+own feedback — never re-enter).
 
-Let `placed = plan.amount_placed`, `remaining = placed - total_filled`, `threshold = placed * close_market_fraction` (default `0.15`, configurable via grid constants):
+`remaining` is derived from the **actual exchange position**, not from
+`_total_filled()`. The probe is `_probe_net_position()`:
+
+- `fetch_positions([symbol])` → signed net (`info.positionAmt`, fallback
+  `contracts` + `side`);
+- returns `None` on exception, `None` on `positions is None`, `None` on
+  hedge mode / multiple non-zero positions (ambiguous);
+- caller falls back to `_total_filled()` only when `None`.
+
+Let `placed = plan.amount_placed`, `threshold = placed * close_market_fraction`
+(default `0.15`, configurable via grid constants).
+
+Sign protection: for `side='sell'` the exchange position must be ≥ 0
+(long); for `side='buy'` — ≤ 0 (short). If the sign disagrees with the
+close side — `_force_complete_feedback()` without placing an order.
 
 | Case | Behavior |
 |---|---|
-| `remaining <= placed * 1e-9` | Already flat → success |
-| `remaining > threshold` | Force-complete feedback (grid absorbs at next `signal 0`) — no market order (too large) |
+| `abs(net) <= placed * 1e-9` | Already flat → `_force_complete_feedback()` |
+| `abs(net) > threshold` | Too large for market → `_force_complete_feedback()` (grid absorbs at next `signal 0`) |
 | `remaining <= threshold` | Up to `MAX_MARKET_CLOSE_ATTEMPTS = 3` market-close attempts, each with a new attempt row, `reduce_only=True`, wait `CLOSE_MARKET_WAIT_SEC = 10 s` |
 | `-2022` on reduce-only | `position_already_flat` (success) |
-| 3 failed attempts | Force-complete (`reject_reason='forced_complete_after_failure'`) |
+| Terminal after attempt, **re-probe flat** | `_send_feedback_for_row(row)` → success |
+| Terminal after attempt, **re-probe not flat** | Feedback only if `amount_filled > 0`; retry |
+| Terminal after attempt, **probe returned `None`** | Fall back to `_total_filled() >= placed * (1−REL_TOL)` |
+| 3 failed attempts | `_force_complete_feedback()` (`reject_reason='forced_complete_after_failure'`) |
 
-The `force_complete_feedback` writes a synthetic "filled" on the **current** plan row (`amount_filled = amount_requested`) so grid can reset; the actual exchange remainder is absorbed at the next `signal 0` via `_reconcile_entry_position`.
+The `_force_complete_feedback` writes a synthetic "filled" on the **current**
+plan row (`amount_filled = amount_requested`) so grid can reset; the
+actual exchange remainder is absorbed at the next `signal 0` via
+`_reconcile_entry_position`.
+
+**Key invariant:** after each market-close attempt the code re-probes the
+exchange. `_total_filled()` is only a book-keeping fallback when the
+probe is unavailable — it can over-report after a capped reduce-only fill.
 
 ### 5.13. `_reconcile_entry_position` (signal 0)
 
@@ -472,7 +509,29 @@ Otherwise the plan's `side`, `amount_placed`, `amount_requested` are rewritten t
 
 Fail-safe: if `fetch_positions` raises — return without modification (the order is placed as originally planned).
 
-### 5.14. Weighted average fill price
+### 5.14. `_probe_net_position` — exchange position probe
+
+Used by `_maybe_market_close_remainder` (both at entry and after each
+attempt) and by the zero-fill flat branch in `_finalize`.
+
+```python
+async def _probe_net_position(self) -> float | None:
+    positions = await broker_handle.get("fetch_positions", ...)
+    if positions is None: return None
+    net, nonzero = 0.0, 0
+    for p in positions:
+        s = self._signed_position(p)
+        if abs(s) > 1e-12: nonzero += 1
+        net += s
+    if nonzero > 1: return None   # hedge mode / ambiguous
+    return net
+```
+Returns:
+float — signed net position (0.0 == flat);
+None — probe failed, positions is None, or hedge mode
+(nonzero > 1). Caller must fall back to _total_filled().
+
+### 5.15. Weighted average fill price
 
 `_weighted_avg_fill_price` — computes `Σ(amount_filled_i * avg_fill_price_i) / Σ(amount_filled_i)` across all attempts for the same `(pos, sig)`. Used in `_finalize` so a reorder following a partial fill does not lose the average price.
 
@@ -595,6 +654,29 @@ Built by `_build_feedback_payload(row)`:
 
 `real_volume` — the filled volume expressed in signal-rate units (`signal_vol_rate` scale).
 
+### 8.1a. Async override — `_build_feedback_payload_async(row)`
+
+Before sending, `_send_feedback_for_row` calls
+`_build_feedback_payload_async(row)`, which wraps
+`_build_feedback_payload` and applies a **reduce-only flat-override**:
+
+1. `if not row.reduce_only or row.exchange_state != 'filled'` → return as-is.
+2. `fetch_positions([symbol])` via `order_manager`.
+   - Exception or `positions is None` → return as-is (safe).
+   - `nonzero > 1` (hedge mode) → return as-is (ambiguous).
+   - `abs(net) < 1e-9` (**exchange flat**) → override:
+     `payload['real_volume'] = float(row.signal_vol_rate or 0.0)`.
+
+Why: Exchange may report a reduce-only order as fully `filled` even when
+the real position was smaller than `amount_placed`. The formula
+`real_volume = signal_vol_rate * amount_filled / amount_requested`
+would under-report the close, and grid would wait forever for a
+remainder that no longer exists.
+
+This is a **second safety net**: even if `_finalize` skipped
+`_maybe_market_close_remainder` (e.g. `_stopping`), the feedback still
+reaches grid with the correct `real_volume`.
+
 ### 8.2. `feedback_state` lifecycle
 
 ```
@@ -614,6 +696,7 @@ none → pending → sent
 
 ### 8.3. `_send_feedback_for_row(row)`
 
+- Payload built via `await self._build_feedback_payload_async(row)` (see §8.1a).
 - Up to 3 attempts, backoff `0.1, 0.2, 0.4 s`.
 - On success → `feedback_state='sent'`, `feedback_attempts += 1`, `_bump_ui_event()`.
 - On failure → `feedback_state='pending'`, `feedback_last_error=str(e)[:255]`.
@@ -701,9 +784,9 @@ Called from `process_order_update` when `amount_filled > 0` and `not paused`: re
 
 ### 9.7. Behaviour while paused
 
-- `_poll_source` skips all signals except `-3` (panic).
+- `_poll_source` skips all signals except `-999999` (panic).
 - Skip logs are throttled to once per 60 s.
-- `-3` (panic close) **always executes**.
+- `-999999` (panic close) **always executes**.
 - Recovery on startup is skipped when paused.
 
 ---
@@ -758,13 +841,13 @@ Triggered when `sig_ts > last_row.signal_timestamp` and the old order is still a
 
 ---
 
-## 11. Panic close (-3)
+## 11. Panic close
 
 ### 11.1. Initiation
 
 Two paths:
 
-- User clicks **Force Reset** in the grid UI → grid emits `signal_number=-3`.
+- User clicks **Force Reset** in the grid UI → grid emits `signal_number=-999999`.
 - Grid has a stale entry (`signal 0` timeout) and calls `request_close_position` on its own — **in grid's single-bot mode**, this is a local reset (no signal).
 
 ### 11.2. `_prepare_panic_plan`
@@ -798,10 +881,13 @@ Dispatch:
 
 ### 11.4. Semantics for the grid
 
-Grid waits up to `FORCE_RESET_TIMEOUT_NS = 30 s` for feedback. On receipt — resets locally. On timeout — resets locally as-is, logs an error.
+Grid waits up to `FORCE_RESET_TIMEOUT_NS = 30 s` for feedback. On receipt —
+resets locally. On timeout — resets locally as-is, logs an error.
 
-If the exchange position was real and the executor is not running — only a manual check on the exchange can recover.
-
+**Patch C+ invariant:** panic rows (`plan.is_panic=True`) are excluded
+from `_maybe_market_close_remainder` by an explicit guard. `_execute_panic_close`
+already sends its own feedback — re-entering market-close for a panic
+row would produce duplicate feedback.
 ---
 
 ## 12. Position and unit_volume
@@ -957,7 +1043,7 @@ Changing env vars requires a process restart.
 |---|---|---|
 | `id` | INTEGER PK | |
 | `position_id` | CHAR | UUID (indexed) |
-| `signal_number` | INTEGER | 0..N / -1 / -2 / -3 / < -100 (indexed) |
+| `signal_number` | INTEGER | 0..N / -1 / -2 / -999999 / < -100 (indexed) |
 | `attempt_n` | INTEGER | |
 | `exchange_order_id` | CHAR (index) | |
 | `client_order_id` | CHAR | `make_client_order_id(...)` |
@@ -1127,6 +1213,20 @@ Reconciler every 5 s:
 - Rate-limited `restart_bot` and `force_restart_bot` at 10 s intervals.
 - While broker is down, `_poll_order_updates` doesn't advance `since_id` and re-registers on recovery.
 
+### 18.8. Capped reduce-only fill (Binance)
+
+A reduce-only order that closes a position smaller than `amount_placed`
+is reported by Binance as `filled` with `executedQty == amount_placed`.
+`order.filled` therefore overstates the true closed volume.
+
+Handled by three layers:
+1. `_finalize` treats `filled < amount_requested * (1−REL_TOL)` as
+   partial and calls `_maybe_market_close_remainder`;
+2. `_maybe_market_close_remainder` re-probes `fetch_positions` after
+   every attempt — `_total_filled` is only a fallback;
+3. `_build_feedback_payload_async` — second safety net that overrides
+   `real_volume = signal_vol_rate` when the probe confirms flat.
+
 ---
 
 ## 19. Limitations and warnings
@@ -1224,7 +1324,7 @@ source (grid)                                            execution
 ─────────────                                            ──────────
    signal ──► _poll_source
                     │
-                    ├─ paused? ── skip (except -3)
+                    ├─ paused? ── skip (except -999999)
                     ├─ stale? ── stale_row + fire-and-forget feedback
                     │             (+ blocked_positions + request_close for sig=0)
                     ├─ blocked? ── skip
