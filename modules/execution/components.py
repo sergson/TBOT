@@ -250,7 +250,10 @@ def execution_form(current_bot_id=None):
         ui_compact.input_field({"type": "execution-field", "field": "unit_volume"},
                     "Unit volume (per 1 signal unit)",
                     value=unit_volume, min=0, step=0.00000001,
-                    unit="base or quote — see next field", inline=True),
+                    unit="base or quote — see next field", inline=True,
+                    help_text=("In quote mode - cost of one quantum in quote currency; "
+                    "in base mode — the size of one quantum in base currency. "),
+        ),
         ui_compact.dropdown_field(
             {"type": "execution-field", "field": "unit_volume_mode"},
             "Unit volume currency",

@@ -7,6 +7,8 @@
 import json
 import os
 import concurrent.futures
+from math import trunc
+
 import pandas as pd
 import plotly.graph_objects as go
 import asyncio
@@ -308,11 +310,11 @@ def form_component(current_bot_id=None):
             "Interval between checks of signal generation conditions, main cycle pause (seconds)",
             type="number", value=poll_interval_sec, min=10, max=3600, inline=True
         ),
-        input_field(
-            {"type": "grid-field", "field": "execution_timeout_sec"},
-            "Signal lifetime; after this time unexecuted signal triggers recalculation strategy (seconds)",
-            type="number", value=execution_timeout_sec, min=0, max=3600, inline=True
-        ),
+        #Single mode
+        #input_field(
+        #    {"type": "grid-field", "field": "execution_timeout_sec"},
+        #    type="number", value=execution_timeout_sec, min=0, max=3600, inline=True
+        #),
         dropdown_field(
             {"type": "grid-field", "field": "recalc_strategy"},
             "Signal Recalc Strategy",
