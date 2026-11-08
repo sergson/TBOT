@@ -6,6 +6,7 @@
 import asyncio
 import math
 from .order_manager import make_client_order_id, DRY_RUN
+from core.database import update_bot_config
 
 REL_TOL = 1e-6
 STALE_PRICE_NS = 5_000_000_000   # 5s — for stale-price check
@@ -93,6 +94,18 @@ def classify_breaker_reason(exc: Exception) -> str:
                 'DDoSProtection', 'RateLimitExceeded'):
         return 'network'
     return ''
+
+def _floor_step(x, p):
+    """Round x down to a multiple of p. No-op when p is None/<=0."""
+    if not p or p <= 0:
+        return x
+    return math.floor(x / p) * p
+
+def _ceil_step(x, p):
+    """Round x up to a multiple of p. No-op when p is None/<=0."""
+    if not p or p <= 0:
+        return x
+    return math.ceil(x / p) * p
 
 
 class SignalManager:
@@ -360,8 +373,16 @@ class SignalManager:
                 'last_sync_ns': self.get_time_ns(),
             })
             return True
-        placed = await self._compute_auto_scale(self.plan['amount_requested'])
-        if placed is None:
+
+        rate = float(self.plan.get('signal_vol_rate') or 0.0)
+        uv_cfg = float(self.bot.config.get('unit_volume', 1.0) or 1.0)
+        uv_mode = self.bot.config.get('unit_volume_mode', 'quote')
+        max_scale = float(self.bot.config.get('max_scale', 0) or 0.0)
+
+        res = await self._compute_auto_scale(
+            rate=rate, unit_volume=uv_cfg,
+            unit_volume_mode=uv_mode, max_scale=max_scale)
+        if res is None:
             self.current_order.write({
                 'exchange_state': 'not_sent',
                 'reject_reason': 'scale_impossible',
@@ -371,8 +392,16 @@ class SignalManager:
             await self.bot._send_feedback_for_row(self.current_order)
             self._cleanup()
             return False
+
+        placed, raw_eff, _uv_eff = res
+
+        # IMPORTANT: `amount_requested` must equal the *effective* raw volume,
+        # otherwise the feedback ratio (amount_filled / amount_requested) would
+        # exceed 1 on a full fill and the grid would inflate real_position_volume.
+        self.plan['amount_requested'] = raw_eff
         self.plan['amount_placed'] = placed
         self.current_order.write({
+            'amount_requested': raw_eff,
             'amount_placed': placed,
             'last_sync_ns': self.get_time_ns(),
         })
@@ -384,7 +413,7 @@ class SignalManager:
                 'last_sync_ns': self.get_time_ns(),
             })
             await self.bot._send_feedback_for_row(self.current_order)
-            # Remove mgr from active_managers before the breaker,
+            # Remove the manager from active_managers before the breaker,
             # otherwise _enter_paused will finalize self and overwrite the reason.
             self._cleanup()
             try:
@@ -394,28 +423,57 @@ class SignalManager:
             return False
         return True
 
-    async def _compute_auto_scale(self, raw: float):
-        """Rounding based on precision.amount / limits.amount.min / limits.cost.min.
+    async def _compute_auto_scale(
+            self, rate: float, unit_volume: float, unit_volume_mode: str,
+            max_scale: float,
+    ) -> tuple[float, float, float] | None:
+        """Auto-scale unit_volume to satisfy exchange minimums.
 
-        If unit_volume_auto_scale=False, return the raw value without rounding.
+        Returns (placed, raw_eff, uv_eff) or None (reject).
+        Persists uv_eff into bot config if the value was bumped.
+
+        Contract:
+          - `unit_volume` is the cost of one quantum (quote-currency when
+            `unit_volume_mode == 'quote'`, base-currency otherwise).
+          - On entry (non reduce-only) `uv_eff` is raised until one quantum
+            covers BOTH the exchange min_cost and min_amount constraints.
+            The bumped value is persisted so the UI shows the effective number.
+          - On reduce_only the value is never bumped; if `placed` is below
+            the exchange minimum the call returns None (scale_impossible),
+            and the grid receives a zero-fill.
+          - `max_scale` guards against runaway: `uv_eff` (final, after the
+            precision bump) must not exceed `unit_volume * max_scale`.
+
+        Float-rounding note:
+          The uv_eff -> raw_eff -> placed round-trip can lose ULPs for pairs
+          where `rate * ref_price * precision` produces awkward non-integer
+          ratios. A bounded 3-iteration retry on integer `n_steps` absorbs
+          this without drifting (unlike the old `+= step_uv` loop).
         """
+        ref_price = self.plan.get('price') or self._get_best_price() or 0.0
+
+        # --- DRY_RUN: no exchange, but the math must be mode-aware ---
         if DRY_RUN:
-            try:
-                raw_f = float(raw)
-            except (TypeError, ValueError):
-                return None
-            return raw_f if raw_f > 0 else None
- 
-        try:
-            raw_f = float(raw)
-        except (TypeError, ValueError):
-            return None
-        if raw_f <= 0:
-            return None
+            if unit_volume_mode == 'quote':
+                if ref_price <= 0:
+                    return None
+                raw = rate * unit_volume / ref_price
+            else:
+                raw = rate * unit_volume
+            return (float(raw), float(raw), float(unit_volume))
 
+        # --- auto_scale=False: pass the raw value through, no floor, no bump ---
         if not self.bot.config.get('unit_volume_auto_scale', True):
-            return raw_f
+            if unit_volume_mode == 'quote':
+                if ref_price <= 0:
+                    # Cannot convert quote-per-quantum to base-amount without a price.
+                    return None
+                raw = rate * unit_volume / ref_price
+            else:
+                raw = rate * unit_volume
+            return (float(raw), float(raw), float(unit_volume))
 
+        # --- Fetch market limits ---
         try:
             market = await self.bot.broker_handle.get(
                 "get_market",
@@ -432,45 +490,98 @@ class SignalManager:
         min_amount = (limits.get('amount') or {}).get('min')
         min_cost = (limits.get('cost') or {}).get('min')
 
-        ref_price = self.plan.get('price') or self._get_best_price() or 0.0
+        if ref_price <= 0:
+            return None
 
-        def _floor_step(x, p):
-            if not p or p <= 0:
-                return x
-            return math.floor(x / p) * p
+        def _calc(uv: float) -> tuple[float, float]:
+            """Return (raw_eff, placed) for a given effective unit_volume."""
+            raw = (rate * uv / ref_price
+                   if unit_volume_mode == 'quote' else rate * uv)
+            placed = _floor_step(raw, precision)
+            return float(raw), float(placed)
 
-        def _ceil_step(x, p):
-            if not p or p <= 0:
-                return x
-            return math.ceil(x / p) * p
-
-        placed = _floor_step(raw_f, precision)
+        # --- reduce_only: no bump, reject if below the exchange minimum ---
         if self.plan.get('reduce_only'):
+            raw = (rate * unit_volume / ref_price
+                   if unit_volume_mode == 'quote' else rate * unit_volume)
+            placed = _floor_step(raw, precision)
             if placed <= 0:
                 return None
             if min_amount and placed < min_amount:
                 return None
-            return float(placed)
+            return (float(placed), float(raw), float(unit_volume))
 
-        if min_amount and placed < min_amount:
-            placed = min_amount
+        # --- entry: bump uv_eff up to exchange minimums ---
+        uv_eff = float(unit_volume)
+        if unit_volume_mode == 'quote':
+            if min_cost and uv_eff < min_cost:
+                uv_eff = float(min_cost)
+            if min_amount and uv_eff < min_amount * ref_price:
+                uv_eff = float(min_amount * ref_price)
+        else:
+            if min_amount and uv_eff < min_amount:
+                uv_eff = float(min_amount)
+            if min_cost and ref_price > 0 and uv_eff * ref_price < min_cost:
+                uv_eff = float(min_cost / ref_price)
 
-        if min_cost and ref_price > 0 and placed * ref_price < min_cost:
-            placed = _ceil_step(min_cost / ref_price, precision)
+        raw_eff, placed = _calc(uv_eff)
 
-        if precision:
-            placed = _ceil_step(placed, precision)
+        # --- precision-edge: after floor, `placed` may still be below the
+        # exchange minimum on either dimension (amount or cost). Bump up to a
+        # precision-multiple target that satisfies both, using integer n_steps
+        # so the retry does not accumulate float drift.
+        if precision and rate > 0:
+            target_placed = float(placed)
+            if min_amount is not None and target_placed < min_amount:
+                target_placed = float(min_amount)
+            if min_cost is not None and target_placed * ref_price < min_cost:
+                target_placed = float(min_cost) / ref_price
+            if target_placed > placed:
+                n_steps = int(math.ceil(target_placed / precision))
+                # Bounded retry absorbs float-rounding in the
+                # uv_eff -> raw_eff -> placed round-trip. Typically exits on
+                # the first iteration; integer n_steps prevent drift.
+                for _ in range(3):
+                    uv_eff = (n_steps * precision * ref_price / rate
+                              if unit_volume_mode == 'quote'
+                              else n_steps * precision / rate)
+                    raw_eff, placed = _calc(uv_eff)
+                    if ((min_amount is None or placed >= min_amount) and
+                            (min_cost is None
+                             or placed * ref_price >= min_cost)):
+                        break
+                    n_steps += 1
 
+        # --- max_scale: checked on the FINAL uv_eff (after precision bump) ---
+        if max_scale > 0 and unit_volume > 0 and uv_eff > unit_volume * max_scale:
+            self.logger.warning(
+                f"{self._log_prefix()} auto-scale rejected: "
+                f"uv_eff={uv_eff:.8g} > unit_volume={unit_volume} "
+                f"* max_scale={max_scale}")
+            return None
+
+        # --- Final sanity checks ---
         if placed <= 0:
             return None
         if min_amount and placed < min_amount:
             return None
-        #max_scale
-        max_scale = float(self.bot.config.get('max_scale', 0) or 0)
-        if max_scale > 0 and placed > raw_f * max_scale:
+        if min_cost and placed * ref_price < min_cost:
             return None
 
-        return float(placed)
+        # --- Persist bump (only when the value actually changed) ---
+        if abs(uv_eff - float(unit_volume)) > 1e-12:
+            try:
+                self.bot.config['unit_volume'] = uv_eff
+                update_bot_config(self.bot.bot_id, {'unit_volume': uv_eff})
+                self.logger.info(
+                    f"{self._log_prefix()} unit_volume auto-scaled: "
+                    f"{unit_volume} → {uv_eff:.8g} "
+                    f"(min_cost={min_cost}, min_amount={min_amount}, "
+                    f"ref_price={ref_price}, rate={rate})")
+            except Exception as e:
+                self.logger.warning(f"persist unit_volume: {e}")
+
+        return (placed, raw_eff, uv_eff)
 
     @staticmethod
     def _split_symbol(symbol: str):

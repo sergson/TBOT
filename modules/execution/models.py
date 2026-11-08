@@ -1772,6 +1772,18 @@ class ExecutionBot(BaseBot):
                     ok = await self._rebuild_pair(last_row[0], sig_ts)
                     if not ok:
                         continue
+                # unit_volume in config is always the *effective* value. Auto-scale in
+                # SignalManager._apply_preflight bumps it upward when one quantum would
+                # otherwise cost less than the exchange min_cost / min_amount, and
+                # persists the bumped value back into bot_settings.
+                #
+                # Do NOT assume config['unit_volume'] equals the user's original input —
+                # it may have grown over time ("ratchet up"). Shrinking is a manual
+                # action only.
+                #
+                # `plan['amount_requested']` below is the *pre-scaling* value; the row
+                # is overwritten in _apply_preflight (amount_requested = raw_eff), which
+                # keeps the feedback ratio amount_filled / amount_requested in [0, 1].
                 unit_volume = float(self.config.get('unit_volume', 1.0) or 1.0)
                 mode = self.config.get('unit_volume_mode', 'quote')
                 rate = float(sig.get('signal_vol_rate') or 0.0)

@@ -48,11 +48,11 @@
 Execution Bot is the **execution layer** between a Grid bot and an exchange:
 
 ```
-┌────────────┐ signal (0, 1..N, -1, -2, -999999)┌────────────────┐
-│  Grid Bot  │ ───────────────────────────────► │  Execution Bot │
+┌──────────────────────── signal (0, 1..N, -1, -2, -999999)────────────────────────┐
+│  Grid Bot  │ ──────────────────────────────────────────────────▶ │  Execution Bot │
 │  (source)  │                                  │                │
-│            │ ◄───────── record_execution ──── │                │
-└────────────┘        (feedback)                └───────┬────────┘
+│            │ ◀──────────────── record_execution ──────────────── │                │
+└────────────────────────┘        (feedback)                └────────────────┘
                                                         │
                                                         │ capabilities:
                                                         │ get_latest_price,
@@ -61,15 +61,15 @@ Execution Bot is the **execution layer** between a Grid bot and an exchange:
                                                         │ get_order_updates,
                                                         │ register_key_owner
                                                         ▼
-                                                 ┌──────────────┐
-                                                 │    Broker    │
-                                                 │  (ccxt/WS)   │
-                                                 └──────┬───────┘
+                                                 ┌─────────────────┐
+                                                 │    Broker       │
+                                                 │  (ccxt/WS)      │
+                                                 └────────┬────────┘
                                                         │
                                                         ▼
-                                                  ┌──────────┐
-                                                  │ Exchange │
-                                                  └──────────┘
+                                                  ┌─────────────┐
+                                                  │ Exchange    │
+                                                  └─────────────┘
 ```
 
 **What the bot does:**
@@ -220,7 +220,7 @@ If `now_ns >= deadline_ns`:
 ### 3.5. Volume computation (`unit_volume`)
 
 ```python
-unit_volume = config['unit_volume']       # default 1.0
+unit_volume = config['unit_volume']       # default 1.0, effective (see §12.4)
 mode        = config['unit_volume_mode']  # 'quote' | 'base'
 rate        = signal_vol_rate
 
@@ -231,7 +231,7 @@ else:  # 'base'
     raw = rate * unit_volume
 ```
 
-Further rounding — in `SignalManager._compute_auto_scale` (see §5).
+This is the **pre-scaling** volume. The effective volume (`raw_eff`, `placed`) is produced in `SignalManager._compute_auto_scale` (see §5.3 and §12.4).
 
 ---
 
@@ -242,7 +242,7 @@ Windows are anchored at `signal_timestamp` (TBOT UTC) and end at `deadline_ns`.
 ```
 t = signal_timestamp                                    deadline_ns
 │                                                              │
-├──── phase1 ────┼─────────── phase2 ───────────┼── phase3 ────┤
+├──── phase1 ────┤────────────── phase2 ──────────────┤── phase3 ──┤
 │                │                                │             │
 │  set signal    │  reorder every N ms            │  grace      │
 │  price only    │  by best price                 │  + finalize │
@@ -298,9 +298,9 @@ phase2_interval_ns = max(phase2_dur_ns // divisor, 50e6)
 ### 5.1. Lifecycle
 
 ```
-                      ┌─────── run() ───────┐
+                      ┌────── run() ──────┐
                       │                     │
-   ┌──────────────────┴──────────────────┐  │
+   ┌──────────────────────────────────────┤──────────────────────────────────┐  │
    │  is_panic? → _prepare_panic_plan    │  │
    │  sig==0?  → _reconcile_entry_position│  │
    │  _new_attempt()                     │  │
@@ -309,21 +309,21 @@ phase2_interval_ns = max(phase2_dur_ns // divisor, 50e6)
    │  is_panic → _execute_panic_close    │  │
    │  market   → _execute_market         │  │
    │  limit    → _execute_limit          │  │
-   └──────────────────┬──────────────────┘  │
+   └───────────────────────────────────┘  │
                       │                     │
                       ▼                     │
-              finally: _finalize() ◄───────┘
+              finally: _finalize() ◀───────┘
 
-                      ┌── resume_from_row() ──┐
+                      ┌──── resume_from_row() ────┐
                       │                       │
-   ┌──────────────────┴────────────────────┐  │
+   ┌──────────────────────────────────────┤────────────────────────────────────┐  │
    │  is_panic? → finalize (no re-execution)│  │
    │  market   → _reconcile_market_order   │  │
    │  limit    → _execute_limit            │  │
-   └──────────────────┬────────────────────┘  │
+   └───────────────────────────────────┘  │
                       │                       │
                       ▼                       │
-              finally: _finalize() ◄─────────┘
+              finally: _finalize() ◀─────────┘
 ```
 
 ### 5.2. `_new_attempt(amount_placed=None)`
@@ -335,20 +335,48 @@ phase2_interval_ns = max(phase2_dur_ns // divisor, 50e6)
 5. Generates `client_order_id = make_client_order_id(bot_id, pos, sig, attempt_n)`.
 6. Registers in `cid_to_row` and in `bot.order_id_index`.
 
+`amount_requested` is taken from `plan['amount_requested']`. On the **first** attempt this is the pre-scaling `raw` (see §3.5). After `_apply_preflight`, `plan['amount_requested']` is overwritten with `raw_eff` (and the row is rewritten), so any subsequent `_new_attempt` on the reorder path (`_place_or_replace_order`, `_maybe_market_close_remainder`) already receives the effective value. This guarantees the feedback ratio `amount_filled / amount_requested ∈ [0, 1]` (see §8.1).
+
 ### 5.3. Pre-flight (`_apply_preflight`)
 
-1. **`_compute_auto_scale(raw)`**:
-   - If `unit_volume_auto_scale=False` — returns `raw` untouched.
-   - Otherwise, using `market.precision.amount`, `limits.amount.min`, `limits.cost.min`:
-     - `floor_step(raw, precision)`
-     - if `placed < min_amount` → `placed = min_amount`
-     - if `min_cost` and `placed * ref_price < min_cost` → pull up
-     - `ceil_step(placed, precision)`
-   - Rejects (returns `None`) if: `placed <= 0`, `placed < min_amount`, or `max_scale > 0 and placed > raw * max_scale`.
-   - `None` → reject with `scale_impossible` + feedback + cleanup.
-2. **`_check_balance(placed)`** — see §12.4.
-   - Insufficient funds → reject with `insufficient_funds` + feedback + cleanup + `_register_breaker_failure('funds')`.
-   - **Fail-open** on `fetch_balance` exception: returns True (the actual error will surface in `create_order`).
+The pre-flight stage computes the effective volume and verifies funds.
+
+**1. `_compute_auto_scale(rate, unit_volume, unit_volume_mode, max_scale)` → `(placed, raw_eff, uv_eff) | None`**
+
+Contract:
+- `unit_volume` is the cost of one quantum (quote-currency when `unit_volume_mode == 'quote'`, base-currency otherwise).
+- On entry (non-reduce-only) `uv_eff` is raised until one quantum covers **both** exchange minimums (`min_cost` and `min_amount`). The bumped value is **persisted** into `bot_settings.unit_volume`, so the UI shows the effective number.
+- On `reduce_only` the value is never bumped; if `placed` is below the exchange minimum the call returns `None` (`scale_impossible`), and the grid receives a zero-fill.
+- `max_scale` guards against runaway: final `uv_eff` (after the precision bump) must not exceed `unit_volume × max_scale`.
+
+Algorithm:
+
+1. `ref_price = plan['price'] or best_price`. In `quote` mode, `ref_price <= 0` → `None` (cannot convert quote-per-quantum to base amount without a price). In `base` mode `ref_price` is not required.
+2. If `unit_volume_auto_scale = False` — return `(raw, raw, unit_volume)` untouched (no floor, no bump, no persist). This is the user's explicit choice; conformance with exchange minimums becomes the user's responsibility.
+3. Fetch `precision.amount`, `limits.amount.min`, `limits.cost.min` via broker `get_market`. Failure → `None`.
+4. **`reduce_only` path**:
+   - `raw = rate × unit_volume / ref_price` (quote) or `rate × unit_volume` (base);
+   - `placed = floor_step(raw, precision)`;
+   - reject (`None`) if `placed <= 0` or `placed < min_amount`.
+5. **Entry path — bump `uv_eff`**:
+   - quote: `uv_eff = max(uv, min_cost, min_amount × ref_price)`;
+   - base:  `uv_eff = max(uv, min_amount, min_cost / ref_price)`.
+6. `raw_eff = rate × uv_eff / ref_price` (quote) or `rate × uv_eff` (base); `placed = floor_step(raw_eff, precision)`.
+7. **Precision bump.** After floor, `placed` may still be below `min_amount` or `placed × ref_price` below `min_cost`. If so:
+   - `target_placed = max(placed, min_amount, min_cost / ref_price)`;
+   - `n_steps = ceil(target_placed / precision)` — **integer**;
+   - **bounded-retry loop (3 iterations)**: `uv_eff = n_steps × precision × ref_price / rate` (quote) or `n_steps × precision / rate` (base); recompute `raw_eff, placed = _calc(uv_eff)`; exit when both `placed >= min_amount` and `placed × ref_price >= min_cost`; else `n_steps += 1` (integer step — no float drift). The retry absorbs ULP loss in the `uv_eff → raw_eff → placed` round-trip for awkward ratios like `rate × ref_price × precision`.
+8. **`max_scale` on the FINAL `uv_eff`** (after the precision bump): `uv_eff > unit_volume × max_scale` → `None` (`scale_impossible`). The bumped value is not persisted.
+9. **Sanity**: `placed <= 0`, `placed < min_amount`, `placed × ref_price < min_cost` → `None`.
+10. **Persist**: if `abs(uv_eff − unit_volume) > 1e-12` — write `uv_eff` into `bot_settings.unit_volume` and update `self.bot.config['unit_volume']` in memory. The in-memory update is **critical**: `_check_balance` (step 2 below) reads the buffer from the effective value, not the original input.
+
+On `None` → write `exchange_state='not_sent'`, `reject_reason='scale_impossible'`, `amount_placed=0`; send feedback; cleanup.
+
+**2. `_check_balance(placed)`** — see §12.5.
+- Insufficient funds → reject with `insufficient_funds` + feedback + cleanup + `_register_breaker_failure('funds')`. `_cleanup()` runs **before** `_register_breaker_failure` — otherwise `_enter_paused` would finalize the manager and overwrite the reject reason.
+- **Fail-open** on `fetch_balance` exception: returns True (the actual error will surface in `create_order`).
+
+**3. Write `amount_requested = raw_eff`** into `plan['amount_requested']` **and** into `current_order.amount_requested`. This is the invariant that keeps the feedback ratio in `[0, 1]` on a full fill (see §8.1).
 
 ### 5.4. `_execute_market()`
 
@@ -380,7 +408,7 @@ Order:
        `_probe_net_position()` → if flat → `_force_complete_feedback()` + cleanup.
        Otherwise leave as zero-fill canceled so grid can retry.
      - **Partial close** — `state in ('canceled','expired')` with `amount_filled > 0`,
-       **or** `state == 'filled'` with `amount_filled < amount_requested * (1−REL_TOL)`
+       **or** `state == 'filled'` with `amount_filled < amount_requested × (1−REL_TOL)`
        (Binance caps reduce-only to the real position size but reports
        `executedQty == amount_placed`):
        → `_maybe_market_close_remainder()`; on success — cleanup.
@@ -390,7 +418,7 @@ Order:
    - Cleanup, exit.
 
 3. Otherwise — total across all attempts:
-   - `total >= placed * (1 - REL_TOL)` → `'filled'`.
+   - `total >= placed × (1 - REL_TOL)` → `'filled'`.
    - `total > 0` and below → `'partial'`; for `reduce_only` **and not is_panic** —
      `_maybe_market_close_remainder()`.
    - `total == 0` → `'canceled'` + `reject_reason='timeout'`.
@@ -420,7 +448,7 @@ Idempotent (guard `_cleaned`):
 ### 5.9. Order watchdog (`_order_watchdog_loop`)
 
 - Every `reorder_interval / 2` (min 0.05 s).
-- If `silent_ns < 2 * reorder_interval` — skip.
+- If `silent_ns < 2 × reorder_interval` — skip.
 - Otherwise `fetch_order` to verify state.
 - After 3 consecutive failures — exit (hand control back to `_finalize`).
 
@@ -467,7 +495,7 @@ own feedback — never re-enter).
   hedge mode / multiple non-zero positions (ambiguous);
 - caller falls back to `_total_filled()` only when `None`.
 
-Let `placed = plan.amount_placed`, `threshold = placed * close_market_fraction`
+Let `placed = plan.amount_placed`, `threshold = placed × close_market_fraction`
 (default `0.15`, configurable via grid constants).
 
 Sign protection: for `side='sell'` the exchange position must be ≥ 0
@@ -476,13 +504,13 @@ close side — `_force_complete_feedback()` without placing an order.
 
 | Case | Behavior |
 |---|---|
-| `abs(net) <= placed * 1e-9` | Already flat → `_force_complete_feedback()` |
+| `abs(net) <= placed × 1e-9` | Already flat → `_force_complete_feedback()` |
 | `abs(net) > threshold` | Too large for market → `_force_complete_feedback()` (grid absorbs at next `signal 0`) |
 | `remaining <= threshold` | Up to `MAX_MARKET_CLOSE_ATTEMPTS = 3` market-close attempts, each with a new attempt row, `reduce_only=True`, wait `CLOSE_MARKET_WAIT_SEC = 10 s` |
 | `-2022` on reduce-only | `position_already_flat` (success) |
 | Terminal after attempt, **re-probe flat** | `_send_feedback_for_row(row)` → success |
 | Terminal after attempt, **re-probe not flat** | Feedback only if `amount_filled > 0`; retry |
-| Terminal after attempt, **probe returned `None`** | Fall back to `_total_filled() >= placed * (1−REL_TOL)` |
+| Terminal after attempt, **probe returned `None`** | Fall back to `_total_filled() >= placed × (1−REL_TOL)` |
 | 3 failed attempts | `_force_complete_feedback()` (`reject_reason='forced_complete_after_failure'`) |
 
 The `_force_complete_feedback` writes a synthetic "filled" on the **current**
@@ -533,7 +561,7 @@ None — probe failed, positions is None, or hedge mode
 
 ### 5.15. Weighted average fill price
 
-`_weighted_avg_fill_price` — computes `Σ(amount_filled_i * avg_fill_price_i) / Σ(amount_filled_i)` across all attempts for the same `(pos, sig)`. Used in `_finalize` so a reorder following a partial fill does not lose the average price.
+`_weighted_avg_fill_price` — computes `Σ(amount_filled_i × avg_fill_price_i) / Σ(amount_filled_i)` across all attempts for the same `(pos, sig)`. Used in `_finalize` so a reorder following a partial fill does not lose the average price.
 
 ---
 
@@ -653,6 +681,8 @@ Built by `_build_feedback_payload(row)`:
 ```
 
 `real_volume` — the filled volume expressed in signal-rate units (`signal_vol_rate` scale).
+
+**Invariant.** `amount_requested` is the **effective** volume `raw_eff` (see §5.3), so `amount_filled / amount_requested ∈ [0, 1]` for all states, including a full fill with an auto-scale bump. A full fill yields `real_volume = signal_vol_rate` — no "quantum inflation" in `real_position_volume` on the grid side.
 
 ### 8.1a. Async override — `_build_feedback_payload_async(row)`
 
@@ -888,6 +918,7 @@ resets locally. On timeout — resets locally as-is, logs an error.
 from `_maybe_market_close_remainder` by an explicit guard. `_execute_panic_close`
 already sends its own feedback — re-entering market-close for a panic
 row would produce duplicate feedback.
+
 ---
 
 ## 12. Position and unit_volume
@@ -904,20 +935,32 @@ Relative volume: `1.0` for entry, then depends on the strategy (`sum_prev`: 2, 4
 
 ### 12.3. `unit_volume`
 
-| `unit_volume_mode` | Formula |
+| `unit_volume_mode` | Pre-scaling formula |
 |---|---|
-| `quote` | `amount = rate * unit_volume / ref_price` |
-| `base` | `amount = rate * unit_volume` |
+| `quote` | `raw = rate × unit_volume / ref_price` |
+| `base` | `raw = rate × unit_volume` |
 
 `ref_price = signal_price` or, if absent, the freshest `price_buffer` entry.
 
-### 12.4. Auto-scale
+This formula produces the **pre-scaling** volume. The **effective** volume (`raw_eff`, `placed`) is produced by `_compute_auto_scale` (see §12.4). When `auto_scale=True`, `unit_volume` in the config may be larger than the user's original input (see the "ratchet" note in §12.4).
 
-`_compute_auto_scale` rounds by `precision.amount`, `min_amount`, `min_cost` (all from `market` retrieved via broker's `get_market`).
+### 12.4. Auto-scale — `unit_volume` = effective, persisted
 
-Disable via `unit_volume_auto_scale = False`.
+**Contract.** The config always stores the **effective** `unit_volume`. The user edits the field in the form, but with `auto_scale=True` the bot raises it on the first entry signal to cover exchange minimums, persists the bumped value, and the UI then shows the effective number.
 
-Over-volume protection: `max_scale` (`0` = unlimited). If `placed > raw * max_scale` → reject `scale_impossible`.
+**Bump rule** (entry, `reduce_only=False`):
+- quote: `uv_eff = max(uv, min_cost, min_amount × ref_price)`
+- base:  `uv_eff = max(uv, min_amount, min_cost / ref_price)`
+
+Then a **precision bump** may be required if, after `floor_step`, `placed` is still below `min_amount` or `placed × ref_price` is below `min_cost`. The bump computes `target_placed = max(placed, min_amount, min_cost / ref_price)`, `n_steps = ceil(target_placed / precision)` (integer), and enters a bounded 3-iteration retry: `uv_eff = n_steps × precision × ref_price / rate` (quote) or `n_steps × precision / rate` (base), recompute `placed`, exit when both minimums are satisfied, else `n_steps += 1`. The integer `n_steps` avoids float drift; the 3-iteration retry absorbs ULP loss in the `uv_eff → raw_eff → placed` round-trip for awkward ratios (e.g. `0.7 × 3.0 × 0.0001`).
+
+**Guard rails.**
+
+- **`max_scale`** (`0` = unlimited) is checked on the **final** `uv_eff` (after the precision bump): `uv_eff > unit_volume × max_scale` → reject `scale_impossible`, **not persisted**.
+- **`reduce_only`** is never bumped and never persisted. If `placed < min_amount` → `scale_impossible`, the grid receives a zero-fill.
+- **`unit_volume_auto_scale = False`** disables bump and persist entirely; the order is submitted as-is, and conformance with exchange minimums becomes the user's responsibility. In `quote` mode with no available `ref_price` the order is rejected `scale_impossible` (the base amount cannot be computed without a price).
+
+**Ratchet.** `unit_volume` only moves **upward** with exchange minimum changes. It is **not** automatically reduced — reduction is a manual edit in the UI. This is deliberate: automatic downward adjustment could slide the value below real strategy needs on a temporary `min_cost` drop (e.g. after switching to another symbol) and stop covering the strategy's actual volume. To lower the value, edit it manually; the bot will re-bump on the next entry signal if the new value is below the exchange minimum.
 
 ### 12.5. Balance check — `_check_balance`
 
@@ -935,6 +978,8 @@ Buffer (always in quote, converted to base when needed):
 buffer_quote = margin_buffer_ratio * unit_volume_quote
 unit_volume_quote = unit_volume * (1 if mode=='quote' else ref_price)
 ```
+
+`unit_volume` here is the **effective** value — `_compute_auto_scale` persists it and updates `self.bot.config['unit_volume']` in memory **before** `_check_balance` runs (see §5.3), so the buffer is computed from the scaled volume, not from the user's original input.
 
 Required:
 
@@ -975,10 +1020,10 @@ Defaults below reflect the **create/edit form** (`components.py`). Programmatic 
 
 | Key | Default | Notes |
 |---|---|---|
-| `unit_volume` | `1.0` | Positive float |
+| `unit_volume` | `1.0` | Positive float. **Effective value** — auto-scale bumps it up and persists the result. |
 | `unit_volume_mode` | `quote` | `quote` \| `base` |
-| `unit_volume_auto_scale` | `True` | Rounding by exchange precision |
-| `max_scale` | `0` | `0` = unlimited; otherwise `placed <= raw * max_scale` |
+| `unit_volume_auto_scale` | `True` | Raise `unit_volume` to exchange `min_cost` / `min_amount`; persists the bumped value. Reduce-only orders are never bumped. |
+| `max_scale` | `0` | `0` = unlimited; otherwise `uv_eff` (final, after precision bump) ≤ `unit_volume × max_scale`. |
 | `margin_buffer_ratio` | `0.05` | Clamped `[0, 1]` |
 
 ### 13.3. Timing
@@ -1051,7 +1096,7 @@ Changing env vars requires a process restart.
 | `side` | SELECT | `buy` / `sell` |
 | `order_type` | SELECT | `limit` / `market` |
 | `reduce_only` | BOOL | |
-| `price_requested` / `amount_requested` / `amount_placed` / `amount_filled` / `avg_fill_price` / `fee` | FLOAT | |
+| `price_requested` / `amount_requested` / `amount_placed` / `amount_filled` / `avg_fill_price` / `fee` | FLOAT | `amount_requested` = `raw_eff` after pre-flight (see §5.3) |
 | `signal_vol_rate` | FLOAT | |
 | `signal_timestamp_scale` | CHAR | default `'tbot_utc_ns'` |
 | `signal_smart` | BOOL | |
@@ -1104,7 +1149,7 @@ Runs every 100 poll iterations with a 60 s TTL guard.
 |---|---|
 | `timeout` | Limit did not fill during phase2; finalize reports `canceled` |
 | `stale_signal` | Deadline passed before the signal could be processed |
-| `scale_impossible` | Auto-scale returned `None` (min/cost/max_scale) |
+| `scale_impossible` | Auto-scale returned `None`: `placed <= 0`, `placed < min_amount`, `placed × ref_price < min_cost`, `uv_eff > unit_volume × max_scale`, or `unit_volume_auto_scale=False` in quote mode with no reference price |
 | `insufficient_funds` | Balance below `required + buffer` |
 | `order_rejected` | Exchange returned generic reject |
 | `order_expired` | Exchange returned `expired` |
@@ -1148,7 +1193,7 @@ Reads as: *"any row needing manual attention that the user has not yet dismissed
 ### 17.3. UI indicators
 
 - **Paused badge** — reason, age since pause, countdown until next check, attempt number.
-- **Account card** — `balance_snapshot` (free balances per currency, `unit_volume`, buffer, age).
+- **Account card** — `balance_snapshot` (free balances per currency, `unit_volume`, buffer, age). The `unit_volume` shown here is the **effective** value (may differ from the user's original input after the first auto-scale bump — see §12.4).
 - **DB fill badge** — orders/prices/stats counts.
 - **Attention list** — rows needing attention with a **Close** button per row.
 - **Latency aggregation** — `latency_stats` in config, updated every 5 min from the last 200 samples (count, mean, stdev, p95).
@@ -1176,7 +1221,7 @@ pos=<pos> sig=<sig> attempt=<att>
 
 ### 18.2. Stuck order
 
-- Order watchdog: if `silent_ns > 2 * reorder_interval` — `fetch_order`.
+- Order watchdog: if `silent_ns > 2 × reorder_interval` — `fetch_order`.
 - 3 consecutive failures — watchdog exits, control to `_finalize`.
 
 ### 18.3. Cancel not confirmed
@@ -1220,7 +1265,7 @@ is reported by Binance as `filled` with `executedQty == amount_placed`.
 `order.filled` therefore overstates the true closed volume.
 
 Handled by three layers:
-1. `_finalize` treats `filled < amount_requested * (1−REL_TOL)` as
+1. `_finalize` treats `filled < amount_requested × (1−REL_TOL)` as
    partial and calls `_maybe_market_close_remainder`;
 2. `_maybe_market_close_remainder` re-probes `fetch_positions` after
    every attempt — `_total_filled` is only a fallback;
@@ -1261,6 +1306,7 @@ If grid generates a signal after its deadline:
 
 - All negative signals (`signal_number < 0`) are sent with `reduce_only=True`.
 - `-2022` / `ReduceOnly rejected` → `position_already_flat` (not an error).
+- Auto-scale never bumps `unit_volume` for reduce-only orders.
 
 ### 19.7. Panic close
 
@@ -1298,6 +1344,10 @@ If grid generates a signal after its deadline:
 
 Execution does **not** call an analyst bot — the analyst gate lives in grid.
 
+### 19.14. `unit_volume` ratchet
+
+Auto-scale only bumps `unit_volume` **upward**. Automatic downward adjustment is deliberately disabled to prevent the bot from sliding below real strategy needs on a temporary `min_cost` drop (e.g. after switching to another symbol). To reduce `unit_volume` — edit it manually in the UI; the bot will re-bump on the next entry signal if the new value is below the exchange minimum. See §12.4.
+
 ---
 
 ## Appendix A. Phase timing diagram
@@ -1306,12 +1356,12 @@ Execution does **not** call an analyst bot — the analyst gate lives in grid.
 Time →
 signal_timestamp                                                deadline_ns
 │                                                                       │
-├─────────────── phase1 ───────────────┼───────── phase2 ──────────┼── p3 ┤
+├─────────────── phase1 ───────────────┤─────────── phase2 ───────────┤── p3 ┤
 │                                       │                          │      │
 │  Price = min/max(signal, best)        │  Reorder every N ms      │ grace│
 │  One POST create_order                │  Cancel + Replace        │      │
 │                                       │                          │      │
-└───────────────────────────────────────┴──────────────────────────┴──────┘
+└──────────────────────────────────────────────────────────────────────┤──────────────┤──────┘
        execution_reserve_sec                 phase2_dur_ns          phase3_ns
        (capped at 70% phase2)                / poll_divisor         10% total
                                                                    clamp 2–3 s
@@ -1321,8 +1371,8 @@ signal_timestamp                                                deadline_ns
 
 ```
 source (grid)                                            execution
-─────────────                                            ──────────
-   signal ──► _poll_source
+────────────                                            ──────────
+   signal ──║ _poll_source
                     │
                     ├─ paused? ── skip (except -999999)
                     ├─ stale? ── stale_row + fire-and-forget feedback
@@ -1333,17 +1383,17 @@ source (grid)                                            execution
                     ▼
               _decide_on_signal
                     │
-              ┌─────┼─────┬─────┐
+              ┌─────┴─────┬─────┐
               ▼     ▼     ▼     ▼
             skip  noop rebuild new
                         │     │
-                        ▼     │
+                        └     │
               _rebuild_pair   │
                               ▼
                      SignalManager(plan)
                               │
                               ▼
-                        mgr.run() ────┐
+                        mgr.run() ─────┐
                               │      │
                               ▼      │
                         _new_attempt │
@@ -1355,10 +1405,10 @@ source (grid)                                            execution
                         _execute_*   │
                               │      │
                               ▼      │
-                        _finalize ◄──┘
+                        _finalize ◀───┘
                               │
                               ▼
-                        feedback ──► grid
+                        feedback ──║ grid
 ```
 
 ## Appendix C. PAUSED state machine
@@ -1375,7 +1425,7 @@ source (grid)                                            execution
               │
               ▼
        ┌──────────────┐
-       │   PAUSED     │◄──────────┐
+       │   PAUSED     │◀──────────┐
        └──────┬───────┘           │
               │                   │
               ▼                   │
@@ -1385,7 +1435,7 @@ source (grid)                                            execution
        _can_unpause?              │
        (fetch_balance probe)      │
               │                   │
-       ┌──────┴──────┐            │
+       ┌──────┤──────┐            │
        ▼             ▼            │
       True         False ─────────┘
        │
@@ -1435,5 +1485,3 @@ core/                            (registry, base_bot, database, exchange, graphi
 **This is a demonstration / educational version, not a finished product.**
 
 **Trading cryptocurrencies involves significant risk and may result in the loss of your entire invested capital.** This module is provided "as is", without warranty of any kind, for educational and research purposes only. The author assumes no responsibility or liability for any financial loss incurred through the use of this code. **Test on testnet and with minimal capital first. Use at your own risk.**
-
----
