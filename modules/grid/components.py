@@ -313,6 +313,7 @@ def form_component(current_bot_id=None):
         #Single mode
         #input_field(
         #    {"type": "grid-field", "field": "execution_timeout_sec"},
+        #    "Signal lifetime; after this time unexecuted signal triggers recalculation strategy (seconds)",
         #    type="number", value=execution_timeout_sec, min=0, max=3600, inline=True
         #),
         dropdown_field(

@@ -4,22 +4,61 @@
 # DISCLAIMER: Trading cryptocurrencies involves significant risk.
 # This software is for educational purposes only. Use at your own risk.
 
-import asyncio
 import pandas as pd
-import plotly.graph_objects as go
+from dash import dcc, html, Output, Input, State, MATCH, no_update
 from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 from core import auto_reg, colors, styles, graphics
 from core import styles as ui_compact
 from core.styles import dropdown_field
 from core.database import get_bot_config, get_all_bots, DBSQLite3
 from core.logger import perf_logger
-from dash import dcc, html, Output, Input, State, MATCH, no_update
-from modules.broker.lib.exchange_directory import (EXCHANGES, MARKETS, get_exchange_options, get_default_exchange_value)
+from modules.broker.lib.exchange_directory import (
+    EXCHANGES, MARKETS, get_exchange_options, get_default_exchange_value,
+)
 from .lib.utils import safe_table_name
+from .models import (
+    FAST_MODE_AVAILABLE, FAST_TIMEFRAMES, SLOW_TIMEFRAMES,
+)
 
 logger = perf_logger.get_logger('collector_module', 'collector')
 
-COLLECTOR_FIELDS = ['exchange', 'market_type', 'symbol', 'timeframe', 'candles_limit']
+COLLECTOR_FIELDS = ['exchange', 'market_type', 'symbol', 'timeframe',
+                    'candles_limit']
+
+# TF < 1s excluded (write amplification on SQLite is unsustainable).
+_TF_LABELS = {
+    '1s': '1 sec',
+    '5s': '5 sec',
+    '15s': '15 sec',
+    '30s': '30 sec',
+    '1m': '1 minute',
+    '5m': '5 minutes',
+    '15m': '15 minutes',
+    '30m': '30 minutes',
+    '1h': '1 hour',
+    '2h': '2 hours',
+    '4h': '4 hours',
+    '1d': '1 day',
+}
+
+
+def _timeframe_options():
+    """Build the timeframe dropdown options respecting
+    FAST_MODE_AVAILABLE.
+
+    No callback is needed: the constant is read once at form render.
+    """
+    seq = list(FAST_TIMEFRAMES) if FAST_MODE_AVAILABLE else []
+    seq += list(SLOW_TIMEFRAMES)
+    seen, out = set(), []
+    for v in seq:
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append({'label': _TF_LABELS.get(v, v), 'value': v})
+    return out
+
 
 # ---------- Add/Edit form ----------
 def collector_form(current_bot_id=None):
@@ -46,12 +85,15 @@ def collector_form(current_bot_id=None):
             timeframe = cfg.get('timeframe', timeframe)
             candles_limit = cfg.get('candles_limit', candles_limit)
 
-    # If an exchange from the config is missing from the list (for example, it was removed from ccxt), use the default value
+    # If an exchange from the config is missing from the list (for
+    # example, it was removed from ccxt), use the default value
     if exchange not in [opt['value'] for opt in exchange_options]:
         exchange = default_exchange
 
-    # Default values ​​for market_type and symbol are taken from the selected exchange's static record, if available
-    exchange_entry = next((item for item in EXCHANGES if item.get('value') == exchange), {})
+    # Default values for market_type and symbol are taken from the
+    # selected exchange's static record, if available
+    exchange_entry = next(
+        (item for item in EXCHANGES if item.get('value') == exchange), {})
     defaults = exchange_entry.get('defaults') or {}
     if market_type is None:
         market_type = defaults.get('market')
@@ -70,7 +112,8 @@ def collector_form(current_bot_id=None):
         dropdown_field(
             {'type': 'collector-field', 'field': 'market_type'},
             "Market type",
-            options=MARKETS,  # static list; will be updated via a callback when the exchange changes
+            # Static list; updated via a callback when the exchange changes
+            options=MARKETS,
             value=market_type, inline=True,
         ),
         dropdown_field(
@@ -84,16 +127,7 @@ def collector_form(current_bot_id=None):
         dropdown_field(
             {'type': 'collector-field', 'field': 'timeframe'},
             "Timeframe",
-            options=[
-                {'label': '1 minute', 'value': '1m'},
-                {'label': '5 minutes', 'value': '5m'},
-                {'label': '15 minutes', 'value': '15m'},
-                {'label': '30 minutes', 'value': '30m'},
-                {'label': '1 hour', 'value': '1h'},
-                {'label': '2 hours', 'value': '2h'},
-                {'label': '4 hours', 'value': '4h'},
-                {'label': '1 day', 'value': '1d'}
-            ],
+            options=_timeframe_options(),
             value=timeframe,
             inline=True,
         ),
@@ -154,7 +188,8 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict):
     fig.add_trace(graphics.candlestick_trace(df), row=1, col=1)
 
     # Volume bars (row 2)
-    fig.add_trace(graphics.volume_bar_trace(df, color=colors.BLUE), row=2, col=1)
+    fig.add_trace(graphics.volume_bar_trace(df, color=colors.BLUE),
+                  row=2, col=1)
 
     # Apply universal compact layout
     graphics.apply_layout(
@@ -164,7 +199,8 @@ def build_figure(bot_id: int, config: dict, relayout_store: dict):
         compact=True,
     )
 
-    # Explicitly clear secondary axes (compact=True does not reset the title for subplots)
+    # Explicitly clear secondary axes (compact=True does not reset the
+    # title for subplots)
     fig.update_xaxes(title_text="", row=1, col=1)
     fig.update_xaxes(title_text="", row=2, col=1)
     fig.update_yaxes(title_text="", row=1, col=1)
@@ -217,6 +253,7 @@ def _format_candles_age(bot_id):
         return f"{age_sec}s ago"
     return f"⚠ stale ({age_sec}s)"
 
+
 def _render_collector_info_panel(bot_id, config):
     return graphics.info_panel([
         ("Exchange",
@@ -229,7 +266,8 @@ def _render_collector_info_panel(bot_id, config):
     ])
 
 
-def render_collector_block(bot_id: int, config: dict, relayout_store: dict):
+def render_collector_block(bot_id: int, config: dict,
+                            relayout_store: dict):
     graph_id = {'type': 'collector-graph', 'index': bot_id}
     status_button_id = {'type': 'status-btn', 'index': bot_id}
     delete_btn_id = {'type': 'delete', 'index': bot_id}
@@ -244,7 +282,9 @@ def render_collector_block(bot_id: int, config: dict, relayout_store: dict):
         style={'height': '300px', "marginTop": styles.MARGIN_ZERO}
     )
 
-    title_text = f"#{bot_id} Collector Bot  ←  {config['exchange']} {config['symbol']} ({config['market_type']})"
+    title_text = (f"#{bot_id} Collector Bot  ←  "
+                  f"{config['exchange']} {config['symbol']} "
+                  f"({config['market_type']})")
 
     return html.Details([
         html.Summary(
@@ -257,8 +297,9 @@ def render_collector_block(bot_id: int, config: dict, relayout_store: dict):
                 children=_render_collector_info_panel(bot_id, config),
             ),
             html.Div([
-                html.Button("Stop" if config.get('status') == 'running' else "Start",
-                            id=status_button_id, n_clicks=0),
+                html.Button(
+                    "Stop" if config.get('status') == 'running' else "Start",
+                    id=status_button_id, n_clicks=0),
                 html.Button("Edit", id=edit_btn_id, n_clicks=0),
                 html.Button("Delete", id=delete_btn_id, n_clicks=0),
             ], style=styles.STYLE_BUTTON_ROW),
@@ -273,10 +314,7 @@ logger.debug(f"Functions defined, about to define CollectorTypeMeta")
 
 
 def collector_prepare_new_config(raw_config: dict) -> dict:
-    """normalization of the collector config upon creation.
-    Ensures:
-      * symbol is set (default: BTC/USDT);
-    """
+    """Normalization of the collector config upon creation/edit."""
     config = raw_config.copy()
     if not config.get('symbol'):
         config['symbol'] = 'BTC/USDT'
@@ -287,9 +325,15 @@ def collector_prepare_new_config(raw_config: dict) -> dict:
     if v not in (100, 500, 1000, 2000):
         v = min((100, 500, 1000, 2000), key=lambda x: abs(x - v))
     config['candles_limit'] = v
+
+    # Timeframe validation — respects FAST_MODE_AVAILABLE.
     tf = config.get('timeframe')
-    if tf not in ('1m', '5m', '15m', '30m', '1h', '2h', '4h', '1d'):
+    valid = set(SLOW_TIMEFRAMES)
+    if FAST_MODE_AVAILABLE:
+        valid |= set(FAST_TIMEFRAMES)
+    if tf not in valid:
         config['timeframe'] = '1m'
+
     mt = config.get('market_type')
     if mt not in ('spot', 'futures'):
         config['market_type'] = 'spot'
@@ -312,14 +356,14 @@ class CollectorTypeMeta:
         return collector_prepare_new_config(raw_config)
 
     @staticmethod
-    def register_callbacks(app, bot_manager, loop): # noqa: ARG003
+    def register_callbacks(app, bot_manager, loop):  # noqa: ARG003
         @app.callback(
             Output({'type': 'collector-graph', 'index': MATCH}, 'figure'),
             Input('global-interval', 'n_intervals'),
             State({'type': 'collector-graph', 'index': MATCH}, 'id'),
             State('relayout-store', 'data')
         )
-        def update_collector_graph(n, graph_id, relayout_store): # noqa: ARG001
+        def update_collector_graph(n, graph_id, relayout_store):  # noqa: ARG001
             bot_id = graph_id['index']
             bots = get_all_bots()
             bot = next((b for b in bots if b['id'] == bot_id), None)
@@ -335,7 +379,7 @@ class CollectorTypeMeta:
             Input('global-interval', 'n_intervals'),
             State({'type': 'collector-bot-header', 'index': MATCH}, 'id')
         )
-        def update_header_style(n, header_id): # noqa: ARG001
+        def update_header_style(n, header_id):  # noqa: ARG001
             bot_id = header_id['index']
             bots = get_all_bots()
             bot = next((b for b in bots if b['id'] == bot_id), None)
@@ -439,7 +483,8 @@ class CollectorTypeMeta:
     @staticmethod
     def process_edit_save(bot_id, new_fields, old_config):
         new_fields.pop('data_db_path', None)
-        config = {k: v for k, v in old_config.items() if k in COLLECTOR_FIELDS}
+        config = {k: v for k, v in old_config.items()
+                  if k in COLLECTOR_FIELDS}
         config.update(new_fields)
         if not config.get('symbol'):
             config['symbol'] = 'BTC/USDT'
@@ -447,5 +492,6 @@ class CollectorTypeMeta:
             config['data_db_path'] = f"data/bot_{bot_id}.db"
         config.pop('bot_type', None)
         return collector_prepare_new_config(config)
+
 
 logger.debug(f"CollectorTypeMeta defined")

@@ -34,6 +34,8 @@ Fully ported to the `core.database` ORM layer — there are no raw SQL queries i
 - Consistent UI styling (`ui_compact`, `info_panel`, `candlestick_trace`).
 - Extension via `_inherit` without touching the source files.
 
+**Planned (not implemented in this version):** a *fast mode* capable of aggregating sub-minute candles from raw WS trades streamed by Broker (`get_trades` capability). The current reference implementation is REST-only; the architecture is designed so that fast mode can be added without breaking the current API or the Grid Bot. Everything below describes the **current REST mode**.
+
 ---
 
 ## Role in the system
@@ -57,7 +59,9 @@ Fully ported to the `core.database` ORM layer — there are no raw SQL queries i
 - **Collector** — caches candles in a local SQLite database and exposes them to other bots via the `ohlcv_data` capability.
 - **Grid** — a consumer of candles: `await self._collector_handle.get("candles", limit=N)`.
 
-**Dependency in `__manifest__.py`** — `"depends": []`. This is a historical entry: the runtime dependency on Broker is not declared in the manifest; instead it is resolved at start via a capability lookup (`_find_broker_id`).
+**Dependency in `__manifest__.py`** — `"depends": ["broker"]`. The runtime dependency on Broker is also resolved dynamically at `start()` via a capability lookup (`_find_broker_id`), so the manifest entry is documentation, not a load-order requirement.
+
+**Planned fast-mode data flow (not active):** `Broker.get_trades(...)` → raw trades in `Collector` → local aggregation into TF buckets → same `ohlcv_data` capability to Grid. Grid does not change.
 
 ---
 
@@ -102,20 +106,25 @@ The bot's logic lives in `modules/collector/models.py` (the `CollectorBot` class
    - Exceptions in `_ensure_broker` — throttled warning, loop resumes after a 5-second pause.
    - Exceptions in `_upsert_candles` — logged with `exc_info=True`; the next iteration retries.
 
+6. **Gap rule (Rule G)**
+   - Missing candles returned by `get_ohlcv` → **no row is written**. The DB stores only what the exchange actually returned. A gap in the local table means "no data over this period", not "price was 0".
+   - The collector **never** fabricates zero rows, never fills gaps with the previous `close`, never extrapolates. Consumers (Grid, Execution) must handle sparse `ohlcv_data` gracefully.
+
 ### `timeframe_to_seconds(tf)`
 
-Supported suffixes: `m` (minutes), `h` (hours), `d` (days). Example: `'1m'` → 60, `'4h'` → 14400, `'1d'` → 86400. Unknown suffix — `ValueError`.
+Supported suffixes: `m` (minutes), `h` (hours), `d` (days). Example: `'1m'` → 60, `'4h'` → 14400, `'1d'` → 86400. Unknown suffix — `ValueError`. Sub-second suffixes (`ms`, `s`) are reserved for the planned fast mode and are **not** valid in the current REST loop.
 
 ### `on_config_updated()` (runtime reconfiguration)
 
 Called from `_run` when `self.config_dirty == True` (set after a successful edit-save via `save_editing` in `app.py`):
 
 1. Saves `old_symbol` and `old_table`.
-2. Re-reads the config from the DB.
+2. Re-reads the config from the DB. If the read fails, the current config is kept (contract: never raises).
 3. Re-resolves `_provider_factory`.
-4. Resets `initial_load_done = False` — the next cycle does a full reload.
+4. Resets `initial_load_done = False` if the reload is actually warranted (`symbol` changed, `timeframe` changed, or `candles_limit` grew).
 5. If `safe_table_name(new_symbol) != old_table` — calls `self.env.drop_table(old_table)`.
 6. Updates `self._candle_table_name`.
+7. If `timeframe` changed — logs a warning and stops the bot; a manual restart is required. Cross-mode (when fast mode is later enabled) and intra-mode changes are handled the same way: **stop + restart**, no live switching.
 
 ---
 
@@ -131,13 +140,15 @@ The `bots` and `settings` tables are described in the main T.B.O.T README. For a
 
 | Key            | Description                                                                    |
 |----------------|--------------------------------------------------------------------------------|
-| `exchange`     | Exchange name (`binance`, `kucoin`, `mexc`, `okx`, `bybit`, ...)              |
+| `exchange`     | Exchange name (`binance`, `kucoin`, `mexc`, `okx`, `bybit`, ...)               |
 | `market_type`  | `spot` or `futures`                                                            |
 | `symbol`       | Trading pair, e.g. `BTC/USDT`                                                  |
 | `timeframe`    | `1m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `1d`                               |
 | `candles_limit`| Number of candles to retain (100 / 500 / 1000 / 2000)                          |
 | `data_db_path` | Path to the SQLite file (equal to `data/bot_<id>.db`)                          |
 | `bot_type`     | `"collector"` (added by the system)                                            |
+| `_last_run_mode` | Internal. `'slow'` in the current version; `'fast'` reserved for the planned fast mode. Used to detect mode transitions on restart. |
+| `_last_run_tf`   | Internal. Last timeframe the bot actually ran with. Used to decide table drop/aggregate on restart. |
 
 **Note:** the `exchange_provider` field is **not created** and **not normalized** by `prepare_new_config` in collector. It may be set manually and `_resolve_exchange_provider()` will read it, but it has no effect on the current data path — candles are always fetched via Broker.
 
@@ -162,6 +173,7 @@ class Candle(Model):
 - **`timestamp`** — Unix open time of the candle in **nanoseconds** (int64). PK.
 - **`tbot_utc_stamp_ns`** — TBOT UTC of the row-write moment (indexed). Used by the UI's "last write age" indicator.
 - **All prices/volumes are `REAL`.**
+- **Sparse by design.** Missing rows mean the exchange returned no candle for that period (Rule G). Never assume the table is contiguous.
 - The table is created automatically by the ORM on first access via `env.get_model_manager('collector.candle', table_name)`.
 
 #### Multiple symbols
@@ -209,6 +221,8 @@ Broker returns a list of dicts:
 }
 ```
 
+**Planned for fast mode:** an additional capability `get_trades` (raw trade buffer, both `exchange_ts_ns` and `tbot_utc_ns`) will be consumed instead of `get_ohlcv` for sub-minute timeframes. Broker already exposes it; the collector side is not implemented in this version.
+
 ### Providing data (Collector → Grid / others)
 
 `CollectorBot.get_capabilities()`:
@@ -242,7 +256,7 @@ def get_capabilities(self):
 }
 ```
 
-This eliminates unit ambiguity for the consumer. The Grid bot uses `timestamp_scale='exchange_ns'` for exchange alignment and `tbot_utc_stamp_ns` for internal bookkeeping.
+This eliminates unit ambiguity for the consumer. The Grid bot uses `timestamp_scale='exchange_ns'` for exchange alignment and `tbot_utc_stamp_ns` for internal bookkeeping. The response may be **sparse** — gaps are legal and expected (Rule G).
 
 **`_get_symbol()`** — current trading pair (string).
 
@@ -299,6 +313,8 @@ Cannot be changed after creation:
 
 `exchange` and `market_type` can be changed via the edit form (but on exchange change the old table persists until the next `on_config_updated()`).
 
+`timeframe` can be changed in the form; the bot then stops itself and requires a manual restart to apply the change. On restart the candle table is handled per the TF-change policy: drop for cross-mode/intra-slow; aggregate for fast-coarser; drop for fast-finer; drop for intra-slow. In the current (REST-only) version every change is effectively a `DROP + full REST reload`.
+
 ### Retention
 
 - **Candle table:** `candles_limit` (via the prune logic with 10% over-trigger).
@@ -318,7 +334,7 @@ Fields:
 | Exchange        | Dropdown   | `get_exchange_options()` — ccxt + static EXCHANGES          |
 | Market type     | Dropdown   | Updated by a callback on exchange change (via Broker)       |
 | Symbol          | Dropdown   | Updated by a callback on exchange/market_type change (via Broker). Disabled in edit. |
-| Timeframe       | Dropdown   | Fixed list                                                  |
+| Timeframe       | Dropdown   | Fixed list. Sub-minute options will appear only when the planned fast mode is enabled. |
 | Candles limit   | Dropdown   | Fixed list                                                  |
 
 **Callbacks:**
@@ -350,7 +366,7 @@ Both callbacks use `_run_broker_cap` — the same `run_coroutine_threadsafe` mec
     - `< 90s` → `"Xs ago"`
     - `≥ 90s` → `"⚠ stale (Xs)"`
     - No data / error → `"no data"` / `"—"`
-- **Chart (`collector-graph`)** — `make_subplots(2, 1)` with candlestick (row 1) and volume (row 2). Refreshed every 5 s **only if** `bot['status'] == 'running'`.
+- **Chart (`collector-graph`)** — `make_subplots(2, 1)` with candlestick (row 1) and volume (row 2). Refreshed every 5 s **only if** `bot['status'] == 'running'`. Sparse data is plotted as-is (gaps remain gaps).
 - **Buttons** — Start/Stop (standard `status-btn` from `app.py`), Edit, Delete.
 
 ### Relayout persistence
@@ -404,6 +420,8 @@ Logger name: `collector_<bot_id>` (module_type `'collector'`).
 | Collector cannot find the pair after a symbol change | Old table dropped, new one created on the first `_upsert_candles` | Wait for the first `_run` cycle |
 | `last write: ⚠ stale` | Collector is not updating candles | Check `status` in `bots`, `fetch_interval`, and Broker status |
 | `Symbol not set` in `_get_candle_manager` | Config with an empty `symbol` | Fix the config via the UI or `update_bot_config` |
+| Gaps in the chart / sparse data | Exchange genuinely has no trades over those periods | Expected behaviour — Rule G. Do not "fix" by filling zeros. |
+| `Timeframe 'Xs' is not supported — coercing to '1m'` | A stale sub-minute TF in `bot_settings` (from a planned-fast-mode config) | Update the config via the UI or leave it — the bot coerces automatically |
 
 ### Diagnostic commands
 
@@ -455,7 +473,7 @@ Deep diagnostics: set `collector` to `DEBUG` in the settings panel.
 ```
 modules/collector/
 ├── __init__.py        # from . import models, components
-├── __manifest__.py    # name, version, depends=[], bot_model, type_model
+├── __manifest__.py    # name, version, depends=["broker"], bot_model, type_model
 ├── models.py          # CollectorBot, Candle (dynamic model)
 ├── components.py      # UI: form, candlestick chart, callbacks, CollectorTypeMeta
 └── lib/
@@ -471,6 +489,13 @@ modules/broker/                            (capabilities: get_ohlcv, get_symbols
 core/                                      (registry, base_bot, database, exchange, graphics, styles, colors, logger)
 ```
 
+**Planned dependencies (fast mode):**
+
+```
+modules/broker/                            (additional capability: get_trades —
+                                            raw trade buffer with both exchange_ts_ns and tbot_utc_ns)
+```
+
 ---
 
 ## ⚠️ Disclaimer (repeat)
@@ -478,5 +503,3 @@ core/                                      (registry, base_bot, database, exchan
 **This is a demonstration / educational version, not a finished product.**
 
 **Trading cryptocurrencies involves significant risk and may result in the loss of your entire invested capital.** This module is provided "as is", without warranty of any kind, for educational and research purposes only. The author assumes no responsibility or liability for any financial loss incurred through the use of this code. **Test on testnet and with minimal capital first. Use at your own risk.**
-
----

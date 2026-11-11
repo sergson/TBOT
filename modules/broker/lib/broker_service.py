@@ -14,7 +14,9 @@ Contract (plan v8 §3.1):
     — no dedup (cid already idempotent on exchange).
   * REST worker: priority cancel(0) > place(1) > fetch(2), event-driven.
   * WS price: per (exchange, market_type, symbol) loop on shared client,
-    fanout to _price_cache + _price_subs.
+    fanout to _price_cache.
+  * WS trades: per (exchange, market_type, symbol) loop, raw deque with
+    both clocks (exchange_ts_ns, tbot_utc_ns), no aggregation.
   * WS orders: per key_id loop, push to OrderUpdateQueue[owner_bot_id].
 """
 
@@ -22,6 +24,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
+from collections import deque
 
 from .exchange_directory import (
     get_ccxt_market_type,
@@ -47,6 +50,11 @@ WS_RETRY_SLEEP_SEC = 1.0
 
 MAX_PRICE_AGE_IN_WS = 30_000_000_000
 MAX_ORDER_AGE_IN_WS = 60_000_000_000
+
+# Trades deque — raw feed, no aggregation in broker.
+TRADES_DEQUE_MAXLEN = 200_000           # emergency cap (very high-volume pairs)
+TRADES_HISTORY_NS   = 60_000_000_000    # 60 s — time-based eviction
+WS_TRADES_TIMEOUT_SEC = 15.0
 
 _CLOCK_ERROR_MARKERS = (
     '-1021', 'InvalidNonce', 'Timestamp for this request',
@@ -87,7 +95,7 @@ async def close_tbot_client(client, logger=None):
 class ConnectionKey:
     exchange: str
     market_type: str
-    kind: str  # 'rest' | 'ws_price' | 'ws_orders'
+    kind: str  # 'rest' | 'ws_data' | 'ws_orders'
     provider: str = 'ccxt'
 
 
@@ -108,6 +116,7 @@ class RESTResponse:
     result: Any = None
     error: Optional[Exception] = None
     ts_ns: int = 0
+
 
 class ConnectionCarousel:
     def __init__(self, logger, time_provider):
@@ -130,7 +139,8 @@ class ConnectionCarousel:
                 self._creating_conn[cache_key] = fut
                 is_creator = True
                 if info is None:
-                    info = ConnectionInfo(key=key, key_id=key_id, created_ns=self.get_time_ns())
+                    info = ConnectionInfo(key=key, key_id=key_id,
+                                          created_ns=self.get_time_ns())
                     self._conns[cache_key] = info
             else:
                 is_creator = False
@@ -239,17 +249,15 @@ class RequestCarousel:
     async def _get_or_create_client(self, key, key_id, owner="unknown"):
         cache_key = (key, key_id)
 
-       # Fast path — lock-free
+        # Fast path — lock-free
         client = self._clients.get(cache_key)
         if client is not None:
             return client
 
         async with self._client_lock:
-            # Double-check after a waiting period
             client = self._clients.get(cache_key)
             if client is not None:
                 return client
-            # Someone is already building it — we look forward to what they bring to the future
             fut = self._creating.get(cache_key)
             if fut is None:
                 fut = asyncio.get_running_loop().create_future()
@@ -387,10 +395,17 @@ class BrokerService:
         self._price_workers: Dict[Tuple, asyncio.Task] = {}
         self._orders_workers: Dict[Tuple, asyncio.Task] = {}
         self._price_cache: Dict[Tuple, dict] = {}
+        self._trades: Dict[Tuple, "deque"] = {}
+        self._trades_workers: Dict[Tuple, asyncio.Task] = {}
+        self._trades_seen: Dict[Tuple, set] = {}
+        self._trades_last_tick_ns: Dict[Tuple, int] = {}
+        self._first_trade_exchange_ns: Dict[Tuple, int] = {}
+        self._first_trade_tbot_ns: Dict[Tuple, int] = {}
+        self._worker_started_tbot_ns: Dict[Tuple, int] = {}
         self._key_to_owner: Dict[str, int] = {}
         self._running = False
-        self._orders_last_activity_ns = 0  # last actual order
-        self._orders_last_tick_ns = 0  # final return for watch_orders (event OR idle timeout)
+        self._orders_last_activity_ns = 0
+        self._orders_last_tick_ns = 0
         self._clock_task: Optional[asyncio.Task] = None
 
         self._provider = (broker_bot.config or {}).get('default_provider', 'ccxt')
@@ -400,7 +415,8 @@ class BrokerService:
             return
         self._running = True
         self.requests.start()
-        self._clock_task = asyncio.create_task(self._clock_resync_loop(), name="broker_clock_resync")
+        self._clock_task = asyncio.create_task(
+            self._clock_resync_loop(), name="broker_clock_resync")
         self.logger.info("BrokerService started")
 
     async def stop(self):
@@ -409,12 +425,22 @@ class BrokerService:
             t.cancel()
         for t in list(self._orders_workers.values()):
             t.cancel()
+        for t in list(self._trades_workers.values()):
+            t.cancel()
         await asyncio.gather(
             *self._price_workers.values(),
             *self._orders_workers.values(),
+            *self._trades_workers.values(),
             return_exceptions=True)
         self._price_workers.clear()
         self._orders_workers.clear()
+        self._trades_workers.clear()
+        self._trades.clear()
+        self._trades_seen.clear()
+        self._trades_last_tick_ns.clear()
+        self._first_trade_exchange_ns.clear()
+        self._first_trade_tbot_ns.clear()
+        self._worker_started_tbot_ns.clear()
         await self.requests.stop()
         if self._clock_task:
             self._clock_task.cancel()
@@ -507,6 +533,7 @@ class BrokerService:
         await asyncio.wait_for(client.load_markets(),
                                 timeout=FETCH_TIMEOUT_SEC)
         return client
+
     # ---------- REST wrapper ----------
 
     async def rest_call(self, exchange, market_type, method, params,
@@ -538,6 +565,69 @@ class BrokerService:
                 'ts_ns': cached['ts_ns'],
                 'stale': stale, 'source': 'broker'}
 
+    # ---------- public trades ----------
+
+    async def get_trades(
+        self, exchange, market_type, symbol,
+        from_ns: int = 0,
+        to_ns: int = 0,                     # 0 = until now
+        time_scale: str = 'exchange',       # 'exchange' | 'tbot'
+    ) -> dict:
+        """Return a COPY of raw trades in [from_ns, to_ns) on the
+        selected time scale.
+
+        Each returned trade always carries BOTH timestamps:
+          exchange_ts_ns — trade timestamp from exchange feed
+          tbot_utc_ns    — moment of receipt, TBOT UTC
+
+        time_scale selects which timestamp the [from_ns, to_ns) filter
+        and the sort key use. Consumers that need gap-free candles
+        should filter on 'exchange' (market time); consumers debugging
+        WS lag should filter on 'tbot'.
+
+        Lazy-spawns the per-symbol trades worker on first call.
+        """
+        cache_key = (exchange, market_type, symbol)
+        if cache_key not in self._trades_workers:
+            self._trades_workers[cache_key] = asyncio.create_task(
+                self._ws_trades_loop(exchange, market_type, symbol),
+                name=f"ws_trades_{exchange}_{market_type}_{symbol}")
+            await asyncio.sleep(0)
+
+        dq = self._trades.get(cache_key)
+        if not dq:
+            return {
+                'trades': [],
+                'first_trade_exchange_ts_ns': 0,
+                'first_trade_tbot_utc_ns': 0,
+                'oldest_exchange_ts_ns': 0,
+                'oldest_tbot_utc_ns': 0,
+                'worker_started_at_tbot_utc_ns':
+                    self._worker_started_tbot_ns.get(cache_key, 0),
+            }
+
+        scale_key = ('exchange_ts_ns' if time_scale == 'exchange'
+                     else 'tbot_utc_ns')
+        upper = to_ns if to_ns > 0 else self.get_time_ns()
+
+        copied = [
+            dict(t) for t in dq
+            if from_ns <= t[scale_key] < upper
+        ]
+        copied.sort(key=lambda t: t[scale_key])
+
+        return {
+            'trades': copied,
+            'first_trade_exchange_ts_ns':
+                self._first_trade_exchange_ns.get(cache_key, 0),
+            'first_trade_tbot_utc_ns':
+                self._first_trade_tbot_ns.get(cache_key, 0),
+            'oldest_exchange_ts_ns': dq[0]['exchange_ts_ns'],
+            'oldest_tbot_utc_ns':    dq[0]['tbot_utc_ns'],
+            'worker_started_at_tbot_utc_ns':
+                self._worker_started_tbot_ns.get(cache_key, 0),
+        }
+
     async def _ensure_price_worker(self, exchange, market_type, symbol):
         cache_key = (exchange, market_type, symbol)
         if cache_key in self._price_workers:
@@ -548,11 +638,13 @@ class BrokerService:
         self._price_workers[cache_key] = task
 
     async def _ws_price_loop(self, exchange, market_type, symbol):
-        key = ConnectionKey(exchange, market_type, 'ws_price', self._provider)
+        # Unified kind: shares ccxt.pro client with _ws_trades_loop.
+        key = ConnectionKey(exchange, market_type, 'ws_data', self._provider)
         ws_key = (exchange, market_type)
         method = get_price_stream_method(exchange, market_type)
         failures = 0
         while self._running:
+            client = None
             try:
                 client = self._ws_clients.get(ws_key)
                 if client is None:
@@ -603,7 +695,8 @@ class BrokerService:
                         self.logger.error(
                             f"ws_price: clock error from exchange — "
                             f"TBOT time drifted beyond recvWindow. "
-                            f"Signed requests will keep failing until time_sync recovers. "
+                            f"Signed requests will keep failing until "
+                            f"time_sync recovers. "
                             f"Error: {type(e).__name__}: {e!r}")
                     else:
                         self.logger.debug(
@@ -615,7 +708,172 @@ class BrokerService:
                         f"{type(e).__name__}: {e!r}")
                 if failures >= WS_FAILURES_BEFORE_RESET:
                     await self.carousel.release(key, None)
-                    self._ws_clients.pop(ws_key, None)
+                    # Only pop the cache entry if it still points to
+                    # the client we were using. Another worker may have
+                    # already created a fresh one.
+                    if client is not None and self._ws_clients.get(ws_key) is client:
+                        self._ws_clients.pop(ws_key, None)
+                    failures = 0
+                    sleep_sec = WS_RESET_SLEEP_SEC
+                else:
+                    sleep_sec = WS_RETRY_SLEEP_SEC
+                try:
+                    await asyncio.sleep(sleep_sec)
+                except asyncio.CancelledError:
+                    break
+
+    async def _ws_trades_loop(self, exchange, market_type, symbol):
+        """WS trades → raw deque.
+
+        Filter: px <= 0 or amt <= 0 or ex_ts <= 0 discarded.
+        Both clocks stored: exchange_ts_ns (market), tbot_utc_ns (receipt).
+
+        Dedup: keyed by (exchange_ts_ns, trade_id) when trade_id is
+        present. ccxt.pro adapters may replay recent trades on reconnect
+        or first-subscribe; without dedup every reconnect doubles volume
+        in the collector's aggregated candles.
+
+        Eviction: time-based (tbot_utc_ns < now - TRADES_HISTORY_NS),
+        robust to exchange-clock drift. `maxlen` is an emergency cap.
+
+        Session bounds (first_trade_*) are monotone — never reset across
+        reconnect. worker_started_tbot_ns is diagnostic only.
+
+        Known limitation (documented): after reconnect, if the adapter's
+        replay does NOT cover the entire gap, `first_trade_exchange_ns`
+        still reflects the very first trade ever seen in this session.
+        Windows starting after `first_trade_exchange_ns` are treated as
+        complete even if the replay missed some trades — consumer must
+        tolerate occasional brief gaps at this boundary.
+
+        Shared client, shared fate on reset: releasing the SHARED
+        ws_data connection drops the socket under _ws_price_loop as
+        well. _ws_price_loop will observe the failure on its next
+        `watch_*` call and recreate a fresh client immediately thanks
+        to the `is client` guard on `_ws_clients.pop`.
+        """
+        key = ConnectionKey(exchange, market_type, 'ws_data', self._provider)
+        ws_key = (exchange, market_type)
+        cache_key = (exchange, market_type, symbol)
+        failures = 0
+
+        dq = self._trades.get(cache_key)
+        if dq is None:
+            dq = deque(maxlen=TRADES_DEQUE_MAXLEN)
+            self._trades[cache_key] = dq
+        seen = self._trades_seen.get(cache_key)
+        if seen is None:
+            seen = set()
+            self._trades_seen[cache_key] = seen
+
+        self._worker_started_tbot_ns[cache_key] = self.get_time_ns()
+
+        while self._running:
+            client = None
+            try:
+                client = self._ws_clients.get(ws_key)
+                if client is None:
+                    info = await self.carousel.get_or_create(
+                        key, None, self._make_ws_client)
+                    client = info.client
+                    self._ws_clients[ws_key] = client
+
+                # Idle timeout — not an error. No trades in the window
+                # is normal for low-liquidity symbols. Mirrors
+                # _ws_orders_loop.
+                try:
+                    trades = await asyncio.wait_for(
+                        client.watch_trades(symbol),
+                        timeout=WS_TRADES_TIMEOUT_SEC)
+                except asyncio.TimeoutError:
+                    failures = 0
+                    self._trades_last_tick_ns[cache_key] = self.get_time_ns()
+                    continue
+
+                now_tbot_ns = self.get_time_ns()
+
+                if trades:
+                    for t in trades:
+                        ts_ms = t.get('timestamp')
+                        price = t.get('price')
+                        if ts_ms is None or price is None:
+                            continue
+                        try:
+                            ex_ts_ns = int(ts_ms) * 1_000_000
+                            px = float(price)
+                            amt = float(t.get('amount') or 0.0)
+                        except (TypeError, ValueError):
+                            continue
+                        if px <= 0 or amt <= 0 or ex_ts_ns <= 0:
+                            continue
+
+                        trade_id = str(t.get('id') or '')
+                        # Dedup only when trade_id is present. ccxt.pro
+                        # adapters replay recent trades on reconnect;
+                        # without this filter volume doubles.
+                        if trade_id:
+                            dk = (ex_ts_ns, trade_id)
+                            if dk in seen:
+                                continue
+                            seen.add(dk)
+
+                        dq.append({
+                            'exchange_ts_ns': ex_ts_ns,
+                            'tbot_utc_ns':    now_tbot_ns,
+                            'price':          px,
+                            'amount':         amt,
+                            'side':           t.get('side'),
+                            'trade_id':       trade_id,
+                        })
+
+                        # Monotone session bounds — never reset.
+                        cur = self._first_trade_exchange_ns.get(cache_key, 0)
+                        if cur == 0 or ex_ts_ns < cur:
+                            self._first_trade_exchange_ns[cache_key] = ex_ts_ns
+                        cur = self._first_trade_tbot_ns.get(cache_key, 0)
+                        if cur == 0 or now_tbot_ns < cur:
+                            self._first_trade_tbot_ns[cache_key] = now_tbot_ns
+
+                    # Rebuild dedup set when it grows beyond 2× deque
+                    # capacity (bounded memory; rebuilt from what's
+                    # actually in dq).
+                    if len(seen) > TRADES_DEQUE_MAXLEN * 2:
+                        seen.clear()
+                        for e in dq:
+                            tid = e['trade_id']
+                            if tid:
+                                seen.add((e['exchange_ts_ns'], tid))
+
+                    # Time-based eviction (tbot clock, monotone).
+                    cutoff_tbot = now_tbot_ns - TRADES_HISTORY_NS
+                    while dq and dq[0]['tbot_utc_ns'] < cutoff_tbot:
+                        dq.popleft()
+
+                self._trades_last_tick_ns[cache_key] = now_tbot_ns
+                failures = 0
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                failures += 1
+                if _is_clock_error(e):
+                    if failures == 1:
+                        self.logger.error(
+                            f"ws_trades {exchange}/{market_type}/{symbol}: "
+                            f"clock error — {type(e).__name__}: {e!r}")
+                    else:
+                        self.logger.debug(
+                            f"ws_trades: clock error #{failures}")
+                else:
+                    self.logger.warning(
+                        f"ws_trades {exchange}/{market_type}/{symbol} "
+                        f"failed ({failures}): {type(e).__name__}: {e!r}")
+                if failures >= WS_FAILURES_BEFORE_RESET:
+                    await self.carousel.release(key, None)
+                    if client is not None and self._ws_clients.get(ws_key) is client:
+                        self._ws_clients.pop(ws_key, None)
+                    # dq and _first_trade_* are NOT reset — session history
+                    # survives reconnect. Only diagnostic marker updates.
+                    self._worker_started_tbot_ns[cache_key] = self.get_time_ns()
                     failures = 0
                     sleep_sec = WS_RESET_SLEEP_SEC
                 else:
@@ -679,10 +937,11 @@ class BrokerService:
                         client.watch_orders(),
                         timeout=WS_ORDERS_TIMEOUT_SEC)
                 except asyncio.TimeoutError:
-                    # Idle stream: no order updates for WS_ORDERS_TIMEOUT_SEC.
-                    # ccxt.pro keeps the socket alive internally; watch_orders
-                    # returns only on updates. NOT a failure — BUT this proves
-                    # the socket is alive, so update the liveness tick.
+                    # Idle stream: no order updates for
+                    # WS_ORDERS_TIMEOUT_SEC. ccxt.pro keeps the socket
+                    # alive internally; watch_orders returns only on
+                    # updates. NOT a failure — BUT this proves the
+                    # socket is alive, so update the liveness tick.
                     self._orders_last_tick_ns = self.get_time_ns()
                     self.logger.debug(
                         f"ws_orders {key_id}: idle "
@@ -690,8 +949,8 @@ class BrokerService:
                     failures = 0
                     continue
                 failures = 0
-                self._orders_last_tick_ns = self.get_time_ns()  # ← liveness
-                self._orders_last_activity_ns = self.get_time_ns()  # ← real event
+                self._orders_last_tick_ns = self.get_time_ns()  # liveness
+                self._orders_last_activity_ns = self.get_time_ns()  # event
                 owner = self._key_to_owner.get(key_id)
                 if owner is not None:
                     for order in orders:
@@ -701,8 +960,9 @@ class BrokerService:
                                 await self.order_updates.push(
                                     owner, cid, order)
                             except Exception as push_err:
-                                # Push is defensive (deque ops under async lock);
-                                # if it throws, don't kill the whole WS loop.
+                                # Push is defensive (deque ops under
+                                # async lock); if it throws, don't kill
+                                # the whole WS loop.
                                 self.logger.debug(
                                     f"ws_orders {key_id}: push failed: "
                                     f"{type(push_err).__name__}: {push_err}")
@@ -715,7 +975,8 @@ class BrokerService:
                         self.logger.error(
                             f"ws_orders {key_id}: clock error from exchange — "
                             f"TBOT time drifted beyond recvWindow. "
-                            f"Signed requests will keep failing until time_sync recovers. "
+                            f"Signed requests will keep failing until "
+                            f"time_sync recovers. "
                             f"Error: {type(e).__name__}: {e!r}")
                     else:
                         self.logger.debug(
@@ -767,24 +1028,25 @@ class BrokerService:
         orders_clients = len(self._ws_order_clients)
 
         max_tick_age_ns = (
-                                  WS_ORDERS_TIMEOUT_SEC + WS_RETRY_SLEEP_SEC * WS_FAILURES_BEFORE_RESET
-                          ) * 1_000_000_000
+            WS_ORDERS_TIMEOUT_SEC + WS_RETRY_SLEEP_SEC * WS_FAILURES_BEFORE_RESET
+        ) * 1_000_000_000
 
         if orders_workers == 0:
             ws_orders_state = 'off'
             ws_orders_healthy = None
         elif orders_clients < orders_workers:
-            # at least one worker is in a retry state — the client has not yet been created
+            # at least one worker is in a retry state — the client
+            # has not yet been created
             ws_orders_state = 'connecting'
             ws_orders_healthy = False
         elif self._orders_last_tick_ns == 0:
-            ws_orders_state = 'connected'  # client exists, but no tick has occurred yet
+            ws_orders_state = 'connected'  # client exists, no tick yet
             ws_orders_healthy = True
         elif now_ns - self._orders_last_tick_ns > max_tick_age_ns:
             ws_orders_state = 'stalled'
             ws_orders_healthy = False
         elif self._orders_last_activity_ns == 0:
-            ws_orders_state = 'idle'  # WS is alive; there were no orders
+            ws_orders_state = 'idle'  # WS is alive; no orders yet
             ws_orders_healthy = True
         else:
             ws_orders_state = 'active'
@@ -799,6 +1061,38 @@ class BrokerService:
                 label += "(private)"
             owner = self.requests._client_owners.get(k, "?")
             rest_client_info.append(f"{label} — {owner}")
+
+        # ---------- TRADES ----------
+        trades_workers = len(self._trades_workers)
+        trades_symbols = len(self._trades)
+
+        if trades_workers == 0:
+            trades_state = 'off'
+            trades_healthy = None
+        elif not self._trades:
+            trades_state = 'connecting'
+            trades_healthy = False
+        else:
+            last_tick = max(self._trades_last_tick_ns.values(), default=0)
+            max_tick_age_ns = (
+                WS_TRADES_TIMEOUT_SEC
+                + WS_RETRY_SLEEP_SEC * WS_FAILURES_BEFORE_RESET
+            ) * 1_000_000_000
+            if last_tick == 0:
+                trades_state = 'connecting'
+                trades_healthy = False
+            elif (now_ns - last_tick) < max_tick_age_ns:
+                trades_state = 'active'
+                trades_healthy = True
+            else:
+                trades_state = 'stalled'
+                trades_healthy = False
+
+        last_trade_tick_ns = max(
+            self._trades_last_tick_ns.values(), default=0)
+        last_trade_age_ns = (
+            (now_ns - last_trade_tick_ns)
+            if last_trade_tick_ns else 0)
 
         return {
             'running': self._running,
@@ -816,6 +1110,12 @@ class BrokerService:
             'orders_with_events': orders_with_events,
             'orders_state': ws_orders_state,
             'ws_orders_healthy': ws_orders_healthy,
+            'trades_workers': trades_workers,
+            'trades_symbols': trades_symbols,
+            'trades_state': trades_state,
+            'ws_trades_healthy': trades_healthy,
+            'last_trade_tick_ns': last_trade_tick_ns,
+            'last_trade_age_ns': last_trade_age_ns,
         }
 
     async def _clock_resync_loop(self):
@@ -846,7 +1146,8 @@ class BrokerService:
                         await asyncio.wait_for(
                             client.load_time_difference(), timeout=5.0)
                     except Exception as e:
-                        self.logger.debug(f"clock resync WS orders {key_id[:8]}: {e}")
+                        self.logger.debug(
+                            f"clock resync WS orders {key_id[:8]}: {e}")
 
             except asyncio.CancelledError:
                 return

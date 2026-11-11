@@ -145,6 +145,8 @@ def broker_form(current_bot_id=None):
 
 # ---------- health panel ----------
 
+# ---------- health panel ----------
+
 def _render_health_panel_from_status(bot_id, st):
     def _fmt_age(ns):
         if not ns:
@@ -183,7 +185,7 @@ def _render_health_panel_from_status(bot_id, st):
         f"{st.get('keys_count', 0)} keys"
     )
 
-    #categorizing REST clients by owner
+    # Categorizing REST clients by owner
     rest_info = st.get('rest_client_keys') or []
     rest_children = []
     if rest_info:
@@ -195,14 +197,29 @@ def _render_health_panel_from_status(bot_id, st):
         rest_children.append(html.Span("—",
             style={"color": "gray"}))
 
-    price_state = st.get('price_state', '—')
-    price_children = [
-        f"{st.get('price_workers', 0)} price worker · "
+    # --- Order book stream (price feed; source of get_latest_price) ---
+    # Field names in get_status() still use the `price_*` prefix for
+    # backward compatibility with older state dumps; the UI labels it
+    # "order book" because the WS payload is a depth/ticker/bids_asks
+    # stream, not a single price.
+    ob_state = st.get('price_state', '—')
+    ob_children = [
+        f"{st.get('price_workers', 0)} order book worker · "
         f"{st.get('price_symbols', 0)} symbol · "
         f"last {_fmt_age(st.get('last_price_age_ns', 0))} · "
-        f"WS {_state_text(price_state)}",
+        f"WS {_state_text(ob_state)}",
     ]
 
+    # --- Trades stream (raw feed for collector fast-mode) ---
+    trades_state = st.get('trades_state', '—')
+    trades_children = [
+        f"{st.get('trades_workers', 0)} trades worker · "
+        f"{st.get('trades_symbols', 0)} symbol · "
+        f"last {_fmt_age(st.get('last_trade_age_ns', 0))} · "
+        f"WS {_state_text(trades_state)}",
+    ]
+
+    # --- Orders stream (private; per key_id) ---
     order_state = st.get('orders_state', '—')
     orders_children = [
         f"{st.get('orders_workers', 0)} order worker · "
@@ -215,7 +232,8 @@ def _render_health_panel_from_status(bot_id, st):
         ("State", html.Span(state_children)),
         ("Connections", conn_line),
         ("REST clients", html.Span(rest_children)),
-        ("Price", html.Span(price_children)),
+        ("Order book", html.Span(ob_children)),
+        ("Trades", html.Span(trades_children)),
         ("Orders", html.Span(orders_children)),
     ])
 
