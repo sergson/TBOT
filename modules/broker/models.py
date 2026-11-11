@@ -78,6 +78,9 @@ class BrokerBot(BaseBot):
             "get_latest_price": {
                 "keywords": ["latest_price", "current_price", "price"],
                 "getter": self._cap_get_latest_price, "setter": None},
+            "get_trades": {
+                "keywords": ["trades", "recent_trades", "raw_trades"],
+                "getter": self._cap_get_trades, "setter": None},
             "get_markets": {
                 "keywords": ["markets"], "getter": self._cap_get_markets,
                 "setter": None},
@@ -172,13 +175,36 @@ class BrokerBot(BaseBot):
             {'timestamp': int(row[0]) * 1_000_000,
              'open': row[1], 'high': row[2], 'low': row[3],
              'close': row[4], 'volume': row[5],
-             'timestamp_scale': 'exchange_ns'} #ms to ns convert mean as ns is main time unit
+             'timestamp_scale': 'exchange_ns'}
             for row in (r.result or [])
         ]
 
     async def _cap_get_latest_price(self, exchange, market_type, symbol):
         return await self._service.get_latest_price(
             exchange, market_type, symbol)
+
+    async def _cap_get_trades(self, exchange, market_type, symbol,
+                              from_ns=0, to_ns=0, time_scale='exchange'):
+        """Return a COPY of raw trades from the broker's deque.
+
+        Response schema:
+          {
+            'trades': [
+              {'exchange_ts_ns', 'tbot_utc_ns',
+               'price', 'amount', 'side', 'trade_id'}, ...
+            ],
+            'first_trade_exchange_ts_ns': int,     # 0 if none yet (session)
+            'first_trade_tbot_utc_ns':    int,
+            'oldest_exchange_ts_ns':      int,     # 0 if deque empty
+            'oldest_tbot_utc_ns':         int,
+            'worker_started_at_tbot_utc_ns': int,
+          }
+
+        time_scale ∈ {'exchange', 'tbot'} — selects filter/sort clock.
+        """
+        return await self._service.get_trades(
+            exchange, market_type, symbol,
+            from_ns=from_ns, to_ns=to_ns, time_scale=time_scale)
 
     async def _cap_get_markets(self, exchange, market_type):
         key = self._key_for(exchange, market_type, 'rest')
@@ -243,7 +269,8 @@ class BrokerBot(BaseBot):
         return {'ok': True}
 
     async def _cap_unregister_key_owner(self, data):
-        self._service.unregister_key_owner(data['key_id'], caller_id=data.get('owner_bot_id'))
+        self._service.unregister_key_owner(
+            data['key_id'], caller_id=data.get('owner_bot_id'))
         return {'ok': True}
 
     # --- private getters ---
@@ -251,7 +278,7 @@ class BrokerBot(BaseBot):
     async def _cap_create_market_order(self, key_id, symbol, side, amount,
                                         position_id, signal_number,
                                         attempt_n, reduce_only=False,
-                                       cid: str | None = None):
+                                        cid: str | None = None):
         info = await self._vault.get_key_info(key_id)
         if not info:
             raise ValueError(f"Unknown broker key_id: {key_id}")

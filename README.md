@@ -1,4 +1,4 @@
-# T.B.O.T — Trading Bot Open Toolkit
+T.B.O.T — Trading Bot Open Toolkit
 
 > ## ⚠️ DEMONSTRATION / EDUCATIONAL VERSION
 >
@@ -36,6 +36,8 @@ The **core** (`core/`) provides foundational services — ORM-level database acc
 - **Dynamic Inter-Bot Communication** — bots declare their data capabilities and get data from other bots via the exchange mechanism, without direct imports or hard coupling.
 - **Opt-in Native Providers** — for specific `(exchange, market_type)` pairs you can register a native provider (a replacement for ccxt) without changing the calling code.
 - **Broker as Infrastructure** — all exchange operations pass through a single **Broker** bot. Consumers (collector, grid, execution) never talk to an exchange directly; they call broker capabilities.
+- **Broker is a feed; Collector is an aggregator** — Broker exposes raw market data (candles from REST, latest price, raw trades with both `exchange_ts_ns` and `tbot_utc_ns`). Broker does **not** aggregate trades into candles. That responsibility belongs to the Collector (and only the Collector). Grid and Execution consume aggregated series or scalar prices, never raw trade streams.
+- **Sparse historical data is legal (Rule G)** — the Collector never fabricates zero rows, never fills gaps with the previous `close`, never extrapolates. A gap in `ohlcv_data` means "no trades/no data over that period", not "price was 0". Consumers must handle sparse series. Zero-candles corrupt downstream PnL/level computations and are forbidden across the whole stack.
 
 ## Project Structure
 
@@ -73,7 +75,7 @@ tbot/
 │   │   ├── models.py          # BrokerBot (inherits BaseBot)
 │   │   ├── components.py      # UI: keys form, health panel, type metadata
 │   │   └── lib/
-│   │       ├── broker_service.py   # connection carousel, REST+WS workers
+│   │       ├── broker_service.py   # connection carousel, REST+WS workers (price / trades / orders)
 │   │       ├── exchange_directory.py # per-exchange UI + workarounds + cid params
 │   │       ├── clock.py            # ccxt/ccxt.pro TBOT-clock override
 │   │       ├── key_vault.py        # encrypted key storage
@@ -118,18 +120,27 @@ The exchange-infrastructure bot. Exactly **one** broker per T.B.O.T installation
 
 - **Key vault** — encrypted API-key storage (Fernet / PBKDF2-SHA256, per-key salt). Storage modes: `plain` and `encrypted`. `TBOT_KEY_PASSWORD` (env) or the UI password unlocks the vault.
 - **Connection carousel + RequestCarousel** — long-lived ccxt / ccxt.pro clients per `(exchange, market_type, kind)`, plus a priority REST queue (`cancel > place > fetch`), per-exchange rate-limits, and `fetch_*`-only dedup (5 s TTL).
-- **WS price stream** — one loop per `(exchange, market_type, symbol)` with per-exchange workarounds (`price_stream: watch_bids_asks | watch_order_book | watch_ticker | rest_poll`).
+- **WS price stream** — one loop per `(exchange, market_type, symbol)` with per-exchange workarounds (`price_stream: watch_bids_asks | watch_order_book | watch_ticker | rest_poll`). Serves `get_latest_price`.
+- **WS trades stream** — one loop per `(exchange, market_type, symbol)`, **sharing the same ccxt.pro client with the price stream** (unified `ConnectionKey.kind='ws_data'`). Maintains a bounded `deque` of raw trades with **both clocks** (`exchange_ts_ns` from the exchange feed, `tbot_utc_ns` from TBOT on receipt), a 60-second time-based eviction (monotone, immune to exchange clock drift), and a `(exchange_ts_ns, trade_id)` dedup guard against ccxt.pro replay-on-reconnect. Serves `get_trades`. **No aggregation in broker** — raw trades only; candles are the Collector's job.
 - **WS orders stream** — one loop per `key_id`; pushes updates into `OrderUpdateQueue[owner_bot_id]`, consumed by execution bots via `get_order_updates`.
 - **Exchange directory** — single source of truth: UI dropdown data, `build_client_id_params(exchange, op, cid)`, `get_ccxt_market_type`, `resolve_ccxt_exchange_id`, per-exchange `balance_type`/`price_stream` workarounds.
-- **Capabilities** — `get_ohlcv`, `get_latest_price`, `get_markets/symbols`, `create_*_order`, `cancel_order`, `fetch_*`, `set_leverage`, `panic_close`, `get_order_updates`, `register_key_owner`, plus key-CRUD and health.
+- **Capabilities** — `get_ohlcv`, `get_latest_price`, `get_trades`, `get_markets/symbols`, `create_*_order`, `cancel_order`, `fetch_*`, `set_leverage`, `panic_close`, `get_order_updates`, `register_key_owner`, plus key-CRUD and health.
+- **Health panel** exposes three independent stream states: **Order book** (price feed, backed by `price_*` fields in `get_status()` for backward compat), **Trades**, **Orders** — each with its own worker count, symbol count, last-tick age and WS state.
 
 ### Collector (`modules/collector/`)
 
 OHLCV collector. Consumes broker's `get_ohlcv` capability and stores candles in per-symbol dynamic tables (`collector.candle`, `_dynamic = True`) inside its own DB.
 
 - Capabilities: `ohlcv_data` (serves candles with explicit `timestamp_scale='exchange_ns'`), `symbol`.
+- **Rule G** is enforced structurally: only rows actually returned by `get_ohlcv` are written. No zero rows, no gap-fill, no extrapolation. `ohlcv_data` can legitimately return a sparse series.
 - Historical bootstrap on first run; incremental tail fetches afterwards; pruning to `candles_limit` (with 10% over-trigger).
 - On symbol change the old dynamic table is dropped; the new one is created on the next write.
+- **TF-change handling**: changing `timeframe` via the form stops the bot (manual restart required). On restart the collector decides the table disposition using persisted `_last_run_mode` / `_last_run_tf` in `bot_settings`:
+  - cross-mode (fast ↔ slow, or slow intra-mode) → drop table + full REST reload;
+  - fast → fast coarser → aggregate existing rows;
+  - fast → fast finer → drop (fine data unrecoverable, PK collision otherwise).
+  In the **current REST-only version** every change is effectively drop + full reload.
+- **Planned (not implemented)**: a *fast mode* that consumes broker's `get_trades`, aggregates raw trades into sub-minute TF buckets locally, and writes via REPLACE (idempotent). Grid/Execution interfaces will not change; the `ohlcv_data` capability keeps the same shape. The broker side (`get_trades`, dedup, both clocks) is already in place; only the collector aggregator loop is pending. Until then, the form only exposes slow timeframes (`1m`..`1d`) and any stale sub-minute TF in config is coerced to `1m` at start.
 - UI: candlestick + volume chart, compact info panel with "last write age" indicator.
 
 ### Grid (`modules/grid/`)
@@ -141,6 +152,7 @@ Grid-averaging bot. Builds a price grid, emits signals, processes fills, manages
 - Emits signal types `0` (entry), `1..N` (averaging), `-1` (liquidation), `-2` (close), `-3` (panic — handled by execution).
 - Capabilities for execution: `signal`, `record_execution`, `get_position_id`, `timeout`, `execution_reserve_sec`, `request_close_position`, `constants` (panic number, close-market fraction, etc.).
 - Sanity checks on history transfer, `skipped_position_ids` for manual review, `close_dust_fraction` for precision-remainder handling.
+- **Consumes `ohlcv_data` as sparse** — Rule G applies. Missing candles in the historical window are treated as "no data", not as zero-price ticks.
 - UI: live grid chart + history chart + deals table with Prev/Next navigation, "Close Position" and "Force Reset" buttons.
 
 ### Execution (`modules/execution/`)
@@ -153,6 +165,7 @@ Trade-execution bot. Receives signals from a Grid bot, executes through the Brok
 - **Breaker / PAUSED**: `auth`, `funds`, `invalid_order`, `network` counters → pause with cooldown and probe-based unpause. `-3` (panic) always executes.
 - **Recovery & reconciler**: `open`/`partial`/`not_sent` recovered on start; orphaned rows reconciled on a 5 s loop; feedback retried with 24 h cutoff.
 - **Precision-dust handling**: `close_dust_fraction` (in grid constants) vs `close_market_fraction` — small remainders collapsed by grid, medium remainders market-closed by execution, large remainders force-completed so grid can advance.
+- Uses `get_latest_price` (price feed) for the trading anchor; **does not** consume `get_trades` (raw stream is not its concern).
 - UI: orders chart (per-semantics shapes/colors), pause badge, account card, attention list with "Close" button.
 
 ### Module dependencies
@@ -161,8 +174,8 @@ Trade-execution bot. Receives signals from a Grid bot, executes through the Brok
 
 | Module | `depends` |
 |---|---|
-| broker | `["collector"]` (historical; at runtime broker is infrastructure with no consumer dependency) |
-| collector | `[]` (uses broker at runtime via capabilities) |
+| broker | `[]` (infrastructure — no consumer dependency) |
+| collector | `["broker"]` |
 | grid | `["collector"]` |
 | execution | `["grid"]` (also uses broker at runtime) |
 
@@ -224,6 +237,22 @@ price = await broker.get("get_latest_price",
 
 Exchange names, ccxt market-type translation, client-order-id parameters, and per-exchange quirks all live in `modules/broker/lib/exchange_directory.py`. Rule: **never write `if exchange == 'mexc' and market_type == 'futures'` outside that file** — add an entry to `EXCHANGE_WORKAROUNDS` instead.
 
+### Broker feed vs aggregation
+
+Broker deliberately exposes **raw** market data at three levels of granularity:
+
+| Capability | Data | Timestamps |
+|---|---|---|
+| `get_ohlcv` | Exchange-aggregated candles (REST) | `exchange_ns` (candle open time) |
+| `get_latest_price` | Best bid/ask snapshot from WS | `ts_ns` (WS tick) |
+| `get_trades` | Raw trades from WS | **Both** `exchange_ts_ns` and `tbot_utc_ns` |
+
+Any component that needs **aggregated** data from raw trades (e.g. sub-minute candles) must do the aggregation itself. The Collector is the only reference consumer that does this (planned fast mode). Broker does not know about timeframe windows, does not know which consumer is asking, and does not cache anything but raw data.
+
+The dual-clock contract is important for anyone writing a raw-trade consumer:
+- `exchange_ts_ns` — market clock; drives TF-window bucketing.
+- `tbot_utc_ns` — receipt clock; drives deque eviction (robust to exchange clock drift) and lets you measure WS lag.
+
 ## Time Synchronization Service
 
 `core/time_sync.py` — adaptive NTP service. Thread-safe singleton, started once in `app.py` before any bot logic. Gives lock-free UTC to every module.
@@ -280,6 +309,18 @@ Per-bot configuration is not stored in a separate table; it lives as JSON key-va
   - broker — `broker_keys` (created on demand).
 
 Path to the DB is in the config under `data_db_path`.
+
+**Internal state keys** (not user-facing, managed by the bot itself):
+
+| Bot | Key | Purpose |
+|---|---|---|
+| collector | `_last_run_mode` | Last mode the bot actually ran (`'slow'`; `'fast'` reserved for planned fast mode). Used on restart to decide drop/aggregate. |
+| collector | `_last_run_tf` | Last timeframe the bot actually ran with. Used on restart to decide drop/aggregate. |
+| grid | `current_position_id` | Active position UUID. |
+| grid | `max_averaging_count` | Current (possibly incremented by smart-averaging) cap. |
+| execution | `execution_paused` | Breaker state. |
+| execution | `balance_snapshot` | Latest account snapshot for the UI. |
+| execution | `latency_stats` | Aggregated latency telemetry. |
 
 ## How to Add a New Bot Type
 
@@ -394,6 +435,7 @@ On bot stop/removal, `BotManager` clears references to it from the `dynamics` of
 | Consumer | Provider | Capability (keyword group) |
 |---|---|---|
 | collector | broker | `get_ohlcv` (`candles`, `ohlcv`), `get_symbols`, `get_markets`, `get_supported_market_types`, `get_broker_status` |
+| collector (planned) | broker | `get_trades` (`trades`, `raw_trades`) — raw trade buffer for future fast mode; not consumed by any reference module yet |
 | grid | collector | `candles` (`ohlcv`) |
 | grid | analyst (optional) | `signal` (`close`, `direction`) |
 | execution | grid | `signal`, `timeout`, `execution_reserve_sec`, `request_close_position`, `constants` |
@@ -486,8 +528,12 @@ Collector-specific:
 | Key                | Description                                                       |
 |--------------------|-------------------------------------------------------------------|
 | `collector_table`  | Optional override of the per-symbol dynamic table name           |
-| `timeframe`        | `1m` / `5m` / `15m` / `30m` / `1h` / `2h` / `4h` / `1d`          |
+| `timeframe`        | `1m` / `5m` / `15m` / `30m` / `1h` / `2h` / `4h` / `1d` (slow mode, current) |
 | `candles_limit`    | Retention of the per-symbol table                                 |
+| `_last_run_mode`   | Internal. Set on every successful `start()`. Drives table disposition on restart. |
+| `_last_run_tf`     | Internal. Set on every successful `start()`. Drives table disposition on restart. |
+
+**Planned for the fast mode** (not active in the current version): sub-minute timeframes (`1s`, `5s`, `15s`, `30s`) served from broker's `get_trades`; the same `bot_settings` keys `_last_run_mode` / `_last_run_tf` will govern fast↔slow and intra-fast table transitions.
 
 Grid-specific:
 
@@ -631,5 +677,3 @@ Created and maintained by [sergson](https://github.com/sergson)
 ## License
 
 GNU General Public License v3.0
-
----
