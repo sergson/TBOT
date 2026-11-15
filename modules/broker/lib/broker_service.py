@@ -55,6 +55,10 @@ MAX_ORDER_AGE_IN_WS = 60_000_000_000
 TRADES_DEQUE_MAXLEN = 200_000           # emergency cap (very high-volume pairs)
 TRADES_HISTORY_NS   = 60_000_000_000    # 60 s — time-based eviction
 WS_TRADES_TIMEOUT_SEC = 15.0
+# If a previously active pair sees no trades for this long, treat as a
+# stall (not idle) and force-release the shared ws_data client. Catches
+# dead sockets that ccxt.pro does not detect — see _ws_trades_loop.
+WS_TRADES_STALL_NS = 60_000_000_000
 
 _CLOCK_ERROR_MARKERS = (
     '-1021', 'InvalidNonce', 'Timestamp for this request',
@@ -153,14 +157,14 @@ class ConnectionCarousel:
         try:
             info.client = await make_client(key, key_id)
             info.healthy = True
-        except Exception as e:
+        except BaseException as e:
             async with self._lock:
                 self._conns.pop(cache_key, None)
                 self._creating_conn.pop(cache_key, None)
             if not fut.done():
                 fut.set_exception(e)
                 try:
-                    fut.exception()  # retrieve → no warning
+                    fut.exception()
                 except Exception:
                     pass
             raise
@@ -271,7 +275,7 @@ class RequestCarousel:
 
         try:
             client = await self.make_client(key, key_id)
-        except Exception as e:
+        except BaseException as e:
             async with self._client_lock:
                 self._creating.pop(cache_key, None)
             if not fut.done():
@@ -399,6 +403,7 @@ class BrokerService:
         self._trades_workers: Dict[Tuple, asyncio.Task] = {}
         self._trades_seen: Dict[Tuple, set] = {}
         self._trades_last_tick_ns: Dict[Tuple, int] = {}
+        self._trades_last_data_ns: Dict[Tuple, int] = {}
         self._first_trade_exchange_ns: Dict[Tuple, int] = {}
         self._first_trade_tbot_ns: Dict[Tuple, int] = {}
         self._worker_started_tbot_ns: Dict[Tuple, int] = {}
@@ -409,6 +414,7 @@ class BrokerService:
         self._clock_task: Optional[asyncio.Task] = None
 
         self._provider = (broker_bot.config or {}).get('default_provider', 'ccxt')
+        self._orders_restart_throttle: Dict[str, int] = {}
 
     async def start(self):
         if self._running:
@@ -421,16 +427,20 @@ class BrokerService:
 
     async def stop(self):
         self._running = False
-        for t in list(self._price_workers.values()):
+        # Snapshot before cancel — the done callbacks attached to each
+        # worker pop entries from these dicts as tasks finish, so
+        # iterating after cancel() would miss tasks.
+        price_tasks = list(self._price_workers.values())
+        order_tasks = list(self._orders_workers.values())
+        trade_tasks = list(self._trades_workers.values())
+        for t in price_tasks:
             t.cancel()
-        for t in list(self._orders_workers.values()):
+        for t in order_tasks:
             t.cancel()
-        for t in list(self._trades_workers.values()):
+        for t in trade_tasks:
             t.cancel()
         await asyncio.gather(
-            *self._price_workers.values(),
-            *self._orders_workers.values(),
-            *self._trades_workers.values(),
+            *price_tasks, *order_tasks, *trade_tasks,
             return_exceptions=True)
         self._price_workers.clear()
         self._orders_workers.clear()
@@ -438,9 +448,11 @@ class BrokerService:
         self._trades.clear()
         self._trades_seen.clear()
         self._trades_last_tick_ns.clear()
+        self._trades_last_data_ns.clear()
         self._first_trade_exchange_ns.clear()
         self._first_trade_tbot_ns.clear()
         self._worker_started_tbot_ns.clear()
+        self._orders_restart_throttle.clear()
         await self.requests.stop()
         if self._clock_task:
             self._clock_task.cancel()
@@ -479,21 +491,44 @@ class BrokerService:
             cfg['apiKey'] = ak
             cfg['secret'] = sk
         ccxt_id = resolve_ccxt_exchange_id(key.exchange, key.market_type)
-        client = getattr(ccxt_async, ccxt_id)(cfg)
-        use_mono = (self.bot.config or {}).get('use_monotonic_nonce', False)
-        install_exchange_clock(client, logger=self.logger, monotonic=use_mono)
-        if session is not None:
-            client._tbot_session = session
+
+        # Wrap post-creation in try/except BaseException: any failure
+        # AFTER `client = getattr(...)` (load_time_difference is caught,
+        # but load_markets or a CancelledError during shutdown is not)
+        # would otherwise leak both the ccxt client and the aiohttp
+        # session. ccxt logs "requires to release all resources with
+        # an explicit call to .close()" and aiohttp logs "Unclosed
+        # client session" on garbage collection. BaseException is
+        # required because CancelledError does not inherit Exception
+        # in Python 3.8+.
+        client = None
         try:
-            await asyncio.wait_for(
-                client.load_time_difference(), timeout=5.0)
-        except Exception as e:
-            self.logger.debug(
-                f"load_time_difference failed for {key.exchange}/"
-                f"{key.market_type}: {e}")
-        await asyncio.wait_for(client.load_markets(),
-                                timeout=FETCH_TIMEOUT_SEC)
-        return client
+            client = getattr(ccxt_async, ccxt_id)(cfg)
+            use_mono = (self.bot.config or {}).get('use_monotonic_nonce', False)
+            install_exchange_clock(client, logger=self.logger, monotonic=use_mono)
+            if session is not None:
+                client._tbot_session = session
+            try:
+                await asyncio.wait_for(
+                    client.load_time_difference(), timeout=5.0)
+            except Exception as e:
+                self.logger.debug(
+                    f"load_time_difference failed for {key.exchange}/"
+                    f"{key.market_type}: {e}")
+            await asyncio.wait_for(client.load_markets(),
+                                   timeout=FETCH_TIMEOUT_SEC)
+            return client
+        except BaseException:
+            if client is not None:
+                await close_tbot_client(client, self.logger)
+            elif session is not None:
+                # client creation itself failed (getattr raised) —
+                # session is orphaned, close it directly.
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+            raise
 
     async def _make_ws_client(self, key: ConnectionKey, key_id):
         import ccxt.pro as ccxtpro
@@ -517,22 +552,38 @@ class BrokerService:
             cfg['apiKey'] = ak
             cfg['secret'] = sk
         ccxt_id = resolve_ccxt_exchange_id(key.exchange, key.market_type)
-        client = getattr(ccxtpro, ccxt_id)(cfg)
-        use_mono = (self.bot.config or {}).get('use_monotonic_nonce', False)
-        install_exchange_clock(client, logger=self.logger, monotonic=use_mono)
-        if session is not None:
-            client._tbot_session = session
-        if key_id:
-            try:
-                await asyncio.wait_for(
-                    client.load_time_difference(), timeout=5.0)
-            except Exception as e:
-                self.logger.debug(
-                    f"load_time_difference (ws) failed for "
-                    f"{key.exchange}/{key.market_type}: {e}")
-        await asyncio.wait_for(client.load_markets(),
-                                timeout=FETCH_TIMEOUT_SEC)
-        return client
+
+        # Same rationale as _make_rest_client. ws_price / ws_trades /
+        # ws_orders all call this factory; each retry that fails in
+        # load_markets would leak a ccxt.pro client + its aiohttp
+        # session if we did not close it here.
+        client = None
+        try:
+            client = getattr(ccxtpro, ccxt_id)(cfg)
+            use_mono = (self.bot.config or {}).get('use_monotonic_nonce', False)
+            install_exchange_clock(client, logger=self.logger, monotonic=use_mono)
+            if session is not None:
+                client._tbot_session = session
+            if key_id:
+                try:
+                    await asyncio.wait_for(
+                        client.load_time_difference(), timeout=5.0)
+                except Exception as e:
+                    self.logger.debug(
+                        f"load_time_difference (ws) failed for "
+                        f"{key.exchange}/{key.market_type}: {e}")
+            await asyncio.wait_for(client.load_markets(),
+                                    timeout=FETCH_TIMEOUT_SEC)
+            return client
+        except BaseException:
+            if client is not None:
+                await close_tbot_client(client, self.logger)
+            elif session is not None:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+            raise
 
     # ---------- REST wrapper ----------
 
@@ -588,10 +639,15 @@ class BrokerService:
         Lazy-spawns the per-symbol trades worker on first call.
         """
         cache_key = (exchange, market_type, symbol)
-        if cache_key not in self._trades_workers:
-            self._trades_workers[cache_key] = asyncio.create_task(
+        existing = self._trades_workers.get(cache_key)
+        if existing is None or existing.done():
+            task = asyncio.create_task(
                 self._ws_trades_loop(exchange, market_type, symbol),
                 name=f"ws_trades_{exchange}_{market_type}_{symbol}")
+            self._trades_workers[cache_key] = task
+            task.add_done_callback(
+                lambda t, k=cache_key: self._on_worker_done(
+                    self._trades_workers, k, t, "ws_trades"))
             await asyncio.sleep(0)
 
         dq = self._trades.get(cache_key)
@@ -630,12 +686,16 @@ class BrokerService:
 
     async def _ensure_price_worker(self, exchange, market_type, symbol):
         cache_key = (exchange, market_type, symbol)
-        if cache_key in self._price_workers:
+        existing = self._price_workers.get(cache_key)
+        if existing is not None and not existing.done():
             return
         task = asyncio.create_task(
             self._ws_price_loop(exchange, market_type, symbol),
             name=f"ws_price_{exchange}_{market_type}_{symbol}")
         self._price_workers[cache_key] = task
+        task.add_done_callback(
+            lambda t, k=cache_key: self._on_worker_done(
+                self._price_workers, k, t, "ws_price"))
 
     async def _ws_price_loop(self, exchange, market_type, symbol):
         # Unified kind: shares ccxt.pro client with _ws_trades_loop.
@@ -687,7 +747,31 @@ class BrokerService:
                     }
                     failures = 0
             except asyncio.CancelledError:
-                break
+                # Distinguish task cancellation (service stop) from
+                # CancelledError raised by client.close() called from a
+                # PEER worker (ws_trades / ws_orders releasing the shared
+                # ws_data client). The latter is NOT a shutdown signal —
+                # we must retry, otherwise the price task dies silently
+                # and get_status() keeps reporting "1 order book worker"
+                # for a dead task forever.
+                if not self._running:
+                    break
+                failures += 1
+                self.logger.warning(
+                    f"ws_price: CancelledError with running=True "
+                    f"(shared client closed by peer) — "
+                    f"failures={failures}")
+                if client is not None and self._ws_clients.get(ws_key) is client:
+                    self._ws_clients.pop(ws_key, None)
+                if failures >= WS_FAILURES_BEFORE_RESET:
+                    failures = 0
+                    sleep_sec = WS_RESET_SLEEP_SEC
+                else:
+                    sleep_sec = WS_RETRY_SLEEP_SEC
+                try:
+                    await asyncio.sleep(sleep_sec)
+                except asyncio.CancelledError:
+                    break
             except Exception as e:
                 failures += 1
                 if _is_clock_error(e):
@@ -778,21 +862,55 @@ class BrokerService:
                     client = info.client
                     self._ws_clients[ws_key] = client
 
-                # Idle timeout — not an error. No trades in the window
-                # is normal for low-liquidity symbols. Mirrors
-                # _ws_orders_loop.
+                # Idle timeout — not necessarily an error. A quiet pair
+                # legitimately produces no trades. BUT ccxt.pro's
+                # watch_trades does NOT raise on a dead socket: it just
+                # hangs until our wait_for fires. Without extra
+                # detection, `failures=0` keeps us stuck on the same
+                # dead client forever (observed after binance network
+                # outages: ws_price recovers via watch_order_book
+                # exceptions, ws_trades silently stalls).
+                #
+                # Fix: track `_trades_last_data_ns` (only updates on
+                # actual data). On timeout, if the pair was previously
+                # active and is now silent > WS_TRADES_STALL_NS — treat
+                # as a stall and force-reset the shared ws_data client.
                 try:
                     trades = await asyncio.wait_for(
                         client.watch_trades(symbol),
                         timeout=WS_TRADES_TIMEOUT_SEC)
                 except asyncio.TimeoutError:
-                    failures = 0
                     self._trades_last_tick_ns[cache_key] = self.get_time_ns()
+                    last_data = self._trades_last_data_ns.get(cache_key, 0)
+                    now = self.get_time_ns()
+                    if last_data > 0 and (now - last_data) > WS_TRADES_STALL_NS:
+                        self.logger.warning(
+                            f"ws_trades {exchange}/{market_type}/{symbol}: "
+                            f"no data for {(now - last_data) / 1e9:.0f}s "
+                            f"(threshold {WS_TRADES_STALL_NS / 1e9:.0f}s) — "
+                            f"forcing client reset")
+                        await self.carousel.release(key, None)
+                        if (client is not None
+                                and self._ws_clients.get(ws_key) is client):
+                            self._ws_clients.pop(ws_key, None)
+                        self._worker_started_tbot_ns[cache_key] = (
+                            self.get_time_ns())
+                        failures = 0
+                        try:
+                            await asyncio.sleep(WS_RETRY_SLEEP_SEC)
+                        except asyncio.CancelledError:
+                            break
+                        continue
+                    failures = 0
                     continue
 
                 now_tbot_ns = self.get_time_ns()
 
                 if trades:
+                    # Data arrived — clear stall detection. This is the
+                    # ONLY place _trades_last_data_ns updates; timeouts
+                    # do not count as "data".
+                    self._trades_last_data_ns[cache_key] = now_tbot_ns
                     for t in trades:
                         ts_ms = t.get('timestamp')
                         price = t.get('price')
@@ -852,7 +970,27 @@ class BrokerService:
                 self._trades_last_tick_ns[cache_key] = now_tbot_ns
                 failures = 0
             except asyncio.CancelledError:
-                break
+                # Same reasoning as _ws_price_loop: peer close vs stop.
+                if not self._running:
+                    break
+                failures += 1
+                self.logger.warning(
+                    f"ws_trades {exchange}/{market_type}/{symbol}: "
+                    f"CancelledError with running=True "
+                    f"(shared client closed by peer) — "
+                    f"failures={failures}")
+                if client is not None and self._ws_clients.get(ws_key) is client:
+                    self._ws_clients.pop(ws_key, None)
+                if failures >= WS_FAILURES_BEFORE_RESET:
+                    self._worker_started_tbot_ns[cache_key] = self.get_time_ns()
+                    failures = 0
+                    sleep_sec = WS_RESET_SLEEP_SEC
+                else:
+                    sleep_sec = WS_RETRY_SLEEP_SEC
+                try:
+                    await asyncio.sleep(sleep_sec)
+                except asyncio.CancelledError:
+                    break
             except Exception as e:
                 failures += 1
                 if _is_clock_error(e):
@@ -896,9 +1034,12 @@ class BrokerService:
         cache_key = ('orders', key_id)
         existing_task = self._orders_workers.get(cache_key)
         if existing_task is None or existing_task.done():
-            self._orders_workers[cache_key] = asyncio.create_task(
+            task = asyncio.create_task(
                 self._ws_orders_loop(key_id),
                 name=f"ws_orders_{key_id}")
+            self._orders_workers[cache_key] = task
+            task.add_done_callback(
+                lambda t, k=key_id: self._on_orders_worker_done(k, t))
 
     def unregister_key_owner(self, key_id, caller_id=None):
         existing = self._key_to_owner.get(key_id)
@@ -932,6 +1073,12 @@ class BrokerService:
                     key, key_id, self._make_ws_client)
                 client = info.client
                 self._ws_order_clients[key_id] = client
+                # Liveness marker: client is up. Without this, if the
+                # bot reconnects after a long outage, _orders_last_tick_ns
+                # remains stale from before the outage and the UI shows
+                # "stalled / WS down" for up to 305s until the first
+                # watch_orders() return (event or 300s idle timeout).
+                self._orders_last_tick_ns = self.get_time_ns()
                 try:
                     orders = await asyncio.wait_for(
                         client.watch_orders(),
@@ -967,7 +1114,27 @@ class BrokerService:
                                     f"ws_orders {key_id}: push failed: "
                                     f"{type(push_err).__name__}: {push_err}")
             except asyncio.CancelledError:
-                break
+                # Only real task cancellation (stop / unregister) should
+                # exit; a CancelledError while self._running is True is
+                # unexpected (orders has no shared client, so this is
+                # rare — likely a corrupted WS state).
+                if not self._running:
+                    break
+                failures += 1
+                self.logger.warning(
+                    f"ws_orders {key_id[:8]}: CancelledError with "
+                    f"running=True — failures={failures}")
+                if failures >= WS_FAILURES_BEFORE_RESET:
+                    await self.carousel.release(key, key_id)
+                    self._ws_order_clients.pop(key_id, None)
+                    failures = 0
+                    sleep_sec = WS_RESET_SLEEP_SEC
+                else:
+                    sleep_sec = WS_RETRY_SLEEP_SEC
+                try:
+                    await asyncio.sleep(sleep_sec)
+                except asyncio.CancelledError:
+                    break
             except Exception as e:
                 failures += 1
                 if _is_clock_error(e):
@@ -999,6 +1166,79 @@ class BrokerService:
                     break
 
     # ---------- status ----------
+
+    def _on_worker_done(self, workers_dict, cache_key, task, label):
+        """Log + cleanup when a public worker (ws_price / ws_trades)
+        finishes.
+
+        Normal exits (service stop → self._running False) are silent.
+        Unexpected exits (task raised, or exited while self._running
+        True) are logged so silent deaths do not go unnoticed. The
+        entry is popped so the next call to _ensure_* / get_trades
+        recreates the task with `.done()`-guard.
+        """
+        if workers_dict.get(cache_key) is task:
+            workers_dict.pop(cache_key, None)
+        try:
+            exc = task.exception()
+        except (asyncio.CancelledError, Exception):
+            exc = None
+        if exc is not None:
+            self.logger.error(
+                f"{label} worker crashed (key={cache_key!r}): "
+                f"{type(exc).__name__}: {exc}",
+                exc_info=exc)
+        elif self._running:
+            self.logger.warning(
+                f"{label} worker exited unexpectedly while service "
+                f"is running (key={cache_key!r}) — will be recreated "
+                f"on next capability call")
+
+    def _on_orders_worker_done(self, key_id, task):
+        """Auto-restart ws_orders when the worker dies while the key
+        is still owned and the service is running.
+
+        Orders has no peer-triggered cancellation, so an unexpected
+        death (bug, corrupted WS state, CancelledError with
+        running=True) leaves the key unmonitored until broker restart
+        without this callback.
+        """
+        cache_key = ('orders', key_id)
+        if self._orders_workers.get(cache_key) is task:
+            self._orders_workers.pop(cache_key, None)
+        try:
+            exc = task.exception()
+        except (asyncio.CancelledError, Exception):
+            exc = None
+        if exc is not None:
+            self.logger.error(
+                f"ws_orders {key_id[:8]} worker crashed: "
+                f"{type(exc).__name__}: {exc}",
+                exc_info=exc)
+        if not self._running:
+            return
+        if key_id not in self._key_to_owner:
+            return
+        if cache_key in self._orders_workers:
+            return  # already restarted by someone else
+        now = self.get_time_ns()
+        last = self._orders_restart_throttle.get(key_id, 0)
+        if now - last < WS_RETRY_SLEEP_SEC * 1_000_000_000:
+            self.logger.warning(
+                f"ws_orders {key_id[:8]}: auto-restart throttled "
+                f"(worker crashed again within {WS_RETRY_SLEEP_SEC:.1f}s) — "
+                f"worker is now inactive until manual restart")
+            return
+        self._orders_restart_throttle[key_id] = now
+        self.logger.critical(
+            f"ws_orders {key_id[:8]} worker exited unexpectedly "
+            f"while service is running — auto-restarting")
+        new_task = asyncio.create_task(
+            self._ws_orders_loop(key_id),
+            name=f"ws_orders_{key_id}")
+        self._orders_workers[cache_key] = new_task
+        new_task.add_done_callback(
+            lambda t, k=key_id: self._on_orders_worker_done(k, t))
 
     def get_status(self) -> dict:
         now_ns = self.get_time_ns()
@@ -1066,33 +1306,33 @@ class BrokerService:
         trades_workers = len(self._trades_workers)
         trades_symbols = len(self._trades)
 
+        # Use _trades_last_data_ns for state (actual data arrival), not
+        # _trades_last_tick_ns (updated on idle timeouts too — that would
+        # mask stalls caused by dead sockets).
+        last_data = max(self._trades_last_data_ns.values(), default=0)
+
         if trades_workers == 0:
             trades_state = 'off'
             trades_healthy = None
         elif not self._trades:
             trades_state = 'connecting'
             trades_healthy = False
+        elif last_data == 0:
+            # No data yet — cold start or genuinely quiet pair
+            trades_state = 'connecting'
+            trades_healthy = False
+        elif (now_ns - last_data) < WS_TRADES_STALL_NS:
+            trades_state = 'active'
+            trades_healthy = True
         else:
-            last_tick = max(self._trades_last_tick_ns.values(), default=0)
-            max_tick_age_ns = (
-                WS_TRADES_TIMEOUT_SEC
-                + WS_RETRY_SLEEP_SEC * WS_FAILURES_BEFORE_RESET
-            ) * 1_000_000_000
-            if last_tick == 0:
-                trades_state = 'connecting'
-                trades_healthy = False
-            elif (now_ns - last_tick) < max_tick_age_ns:
-                trades_state = 'active'
-                trades_healthy = True
-            else:
-                trades_state = 'stalled'
-                trades_healthy = False
+            trades_state = 'stalled'
+            trades_healthy = False
 
-        last_trade_tick_ns = max(
-            self._trades_last_tick_ns.values(), default=0)
-        last_trade_age_ns = (
-            (now_ns - last_trade_tick_ns)
-            if last_trade_tick_ns else 0)
+        # last_trade_tick_ns / last_trade_age_ns now reflect data
+        # freshness (not worker liveness) — matches what users expect
+        # from a "last trade" indicator.
+        last_trade_tick_ns = last_data
+        last_trade_age_ns = (now_ns - last_data) if last_data else 0
 
         return {
             'running': self._running,

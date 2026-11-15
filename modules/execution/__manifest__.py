@@ -1,7 +1,7 @@
 # modules/execution/__manifest__.py
 {
     "name": "Execution bot",
-    "version": "0.5.2",
+    "version": "0.5.5",
     "description": "Grid trading signal execution bot.",
     "author": "sergson",
     "license": "GPL-3.0",

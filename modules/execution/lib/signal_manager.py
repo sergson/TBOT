@@ -31,6 +31,7 @@ PHASE3_OVERFLOW_RATIO = 0.15
 PHASE1_FALLBACK_RATIO = 0.2
 PHASE1_MAX_SHARE_OF_PHASE2 = 0.7
 PHASE2_MIN_INTERVAL_NS = 50_000_000
+PHASE1_MULTIPLIER = 2
 
 # --- market-close remainder (Patch C) ---
 MAX_MARKET_CLOSE_ATTEMPTS = 3
@@ -171,7 +172,7 @@ class SignalManager:
         self.phase2_end_ns = deadline_ns - phase3_ns
 
         reserve_sec = float(getattr(self.bot, 'execution_reserve_sec', 0.0) or 0.0)
-        phase1_end_ns = sig_ts + int(reserve_sec * 1e9)
+        phase1_end_ns = sig_ts + int(reserve_sec * 1e9 * PHASE1_MULTIPLIER)
         max_phase1_ns = int((self.phase2_end_ns - sig_ts)
                             * PHASE1_MAX_SHARE_OF_PHASE2)
         if phase1_end_ns > sig_ts + max_phase1_ns:

@@ -2060,7 +2060,30 @@ class GridBot(BaseBot):
         parent_number = original_level.signal_number
         parent_direction = original_level.signal_direction
         parent_real_price = original_level.real_price
+
+        # Guard: NULL volume on legacy rows. `real_flag=True` parents
+        # should have signal_vol_rate set, but fall back to the actual
+        # fill volume, then refuse if still invalid.
         parent_vol = original_level.signal_vol_rate
+        if parent_vol is None:
+            parent_vol = original_level.real_vol_rate
+        try:
+            parent_vol = float(parent_vol or 0.0)
+        except (TypeError, ValueError):
+            parent_vol = 0.0
+        if parent_vol <= 0:
+            self.logger.warning(
+                f"_create_smart_reverse: parent #{parent_number} has "
+                f"vol={parent_vol} — refusing to create smart reverse")
+            return
+
+        # Defensive: caller (`_check_smart_averaging`) already skips
+        # parents with real_price=None, but keep the guard local.
+        if parent_real_price is None:
+            self.logger.warning(
+                f"_create_smart_reverse: parent #{parent_number} has no "
+                f"real_price — refusing to create smart reverse")
+            return
 
         reverse_dir = 'sell' if parent_direction == 'buy' else 'buy'
         if reverse_dir == 'sell':
@@ -2102,7 +2125,8 @@ class GridBot(BaseBot):
             old_vol = prev[0].real_position_volume if prev and prev[0].real_position_volume is not None else 0.0
             old_avg = prev[0].real_avg_entry_price if prev and prev[0].real_avg_entry_price is not None else 0.0
 
-            new_avg, new_vol, _ = self._apply_trade_to_position(old_vol, old_avg, reverse_dir, reverse_price, parent_vol, sign)
+            new_avg, new_vol, _ = self._apply_trade_to_position(old_vol, old_avg, reverse_dir, reverse_price,
+                                                                parent_vol, sign)
             lev = self.config['leverage']
             if new_vol > 1e-12:
                 total_pnl = sign * (reverse_price / new_avg - 1) * lev * 100
@@ -2121,6 +2145,7 @@ class GridBot(BaseBot):
                 'real_position_volume': new_vol,
                 'real_avg_entry_price': new_avg if new_vol > 1e-12 else 0.0,
             })
+
         # mark parent as waiting for smart execution
         parent_rec = level.search([
             ('position_id', '=', self._position_id),
@@ -2129,7 +2154,28 @@ class GridBot(BaseBot):
         ], limit=1)
         if parent_rec:
             parent_rec[0].write({'signal_smart_reversed': -1})
-        self.logger.info(f"Smart reverse created for level #{parent_number} at {reverse_price}")
+
+        # `vals` is always non-empty — dead check removed.
+        # Wrap create: on exception or empty recordset, the parent stays
+        # at -1 and `_reset_lost_smart_parents` recovers it on the next
+        # tick (no children exist → parent reset to 0).
+        try:
+            created = level.create([vals])
+        except Exception as e:
+            self.logger.error(
+                f"Smart reverse create failed for parent "
+                f"#{parent_number}: {e!r}", exc_info=True)
+            return
+        if not created:
+            self.logger.error(
+                f"Smart reverse create returned empty for parent "
+                f"#{parent_number} — parent left at -1, will be reset "
+                f"by _reset_lost_smart_parents on next tick")
+            return
+
+        self.logger.info(
+            f"Smart reverse created for level #{parent_number} "
+            f"at {reverse_price}")
 
     # ------------------------------------------------------------------
     # Close position and move to history (converted)

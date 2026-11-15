@@ -1,7 +1,7 @@
 # modules/broker/__manifest__.py
 {
     "name": "Broker bot",
-    "version": "0.5.3",
+    "version": "0.5.4",
     "description": "A layer between CCXT (and other) exchange protocols and the bots.",
     "author": "sergson",
     "license": "GPL-3.0",

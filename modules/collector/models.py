@@ -14,7 +14,7 @@ from core.database import (
 from core.logger import perf_logger
 from .lib.utils import safe_table_name
 
-FAST_MODE_AVAILABLE = True
+FAST_MODE_AVAILABLE = False
 
 # TF < 1s excluded: SQLite write amplification at 10ms/50ms/100ms/
 # 500ms exceeds the sustainable rate (~10k-20k writes/sec kills WAL).
