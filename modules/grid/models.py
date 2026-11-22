@@ -399,6 +399,14 @@ class GridBot(BaseBot):
                     f"Feedback pos={fb_position_id} sig={signal_number}: "
                     f"entry/averaging already real — ignored")
                 return
+            # NEW: smart reverse никогда не должен обрабатываться повторно —
+            # это одноразовый buy/sell, а не partial close с возможными
+            # несколькими market-close attempt'ами.
+            if getattr(record[0], 'signal_smart', False):
+                self.logger.debug(
+                    f"Feedback pos={fb_position_id} sig={signal_number}: "
+                    f"smart reverse already real — ignored")
+                return
             prev_vol = float(record[0].real_position_volume or 0.0)
             plan_vol = float(record[0].signal_vol_rate or 0.0)
             eps = float(self.config.get(
